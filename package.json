@@ -1,0 +1,21 @@
+{
+  "name": "pi-sherpa",
+  "version": "0.1.0",
+  "description": "A Pi sidecar for read-side context retrieval, scratchpad access, taxonomy-aware memory routing, and Archivist handoff.",
+  "type": "module",
+  "license": "MIT",
+  "author": "k1000",
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension", "context-engineering", "retrieval", "taxonomy"],
+  "repository": { "type": "git", "url": "git+https://github.com/k1000/pi-sherpa.git" },
+  "bugs": { "url": "https://github.com/k1000/pi-sherpa/issues" },
+  "homepage": "https://github.com/k1000/pi-sherpa#readme",
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  }
+}

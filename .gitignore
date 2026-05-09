@@ -1,0 +1,9 @@
+node_modules/
+.vite/
+dist/
+*.log
+.DS_Store
+memory/.l2_facts/*.md
+memory/.l3_skills/*.md
+memory/.l1_index/*.json
+memory/.l0_meta/*.md
