@@ -34,3 +34,4 @@ This runs:
 - an esbuild bundle check for `index.ts`
 
 The check script is intentionally stored with the extension, not in project repositories that only exercise Sherpa during testing.
+
