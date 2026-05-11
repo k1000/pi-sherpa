@@ -31,12 +31,12 @@ test("suggestVerificationCommands maps changed files to checks", () => {
   const advice = suggestVerificationCommands([
     "apps/workers/src/index.ts",
     "packages/shared/src/db/drizzle/schema/foo.ts",
-    "routes.csv",
+    "catalog.csv",
   ]);
   assert(advice.commands.some((item) => item.command === "pnpm typecheck"), "missing TS typecheck");
   assert(advice.commands.some((item) => item.command === "pnpm --filter workers typecheck"), "missing workers typecheck");
   assert(advice.commands.some((item) => item.command === "pnpm db:generate"), "missing db generate");
-  assert(advice.routesReview, "expected route review");
+  assert(advice.catalogReview, "expected catalog review");
 });
 
 test("compactScratchpad archives large sections", () => withTemp((dir) => {

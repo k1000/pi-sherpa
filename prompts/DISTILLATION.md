@@ -34,7 +34,7 @@ Durable knowledge belongs in the new semantic ontology:
 │   └── evidence/    # experiments, reports, proofs, source-grounded support
 ├── journal/         # dated development of ideas and chronological narrative
 ├── inbox/           # uncertain auto-candidates awaiting promotion
-└── sources/         # source snapshots or mirrored source truth when useful
+└── sources/         # external source material ONLY: papers, articles, third-party reports. NEVER mirror repo docs.
 ```
 
 Do **not** create, redirect to, or retrieve durable project memory from old bucket folders by default:
@@ -62,7 +62,7 @@ Choose the strongest semantic home:
 | `evidence` | `wiki/evidence/` | Experiments, reports, proofs, benchmark results, source-grounded support for claims |
 | `journal` | `journal/YYYY-MM-DD.md` | Time-stamped development of ideas, session narrative, chronological thinking trail |
 | `inbox` | `inbox/auto-candidates.md` or `inbox/<slug>.md` | Uncertain candidates that need review before promotion |
-| `source` | `sources/...` | Mirrored source truth, snapshots, raw reports, imported docs worth retaining |
+| `source` | `sources/...` | External source material: papers, articles, third-party reports. Repo docs stay in the repo. |
 
 Journal and inbox entries are not final homes for durable conclusions. Promote stable conclusions into `wiki/` pages.
 

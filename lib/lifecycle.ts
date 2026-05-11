@@ -6,7 +6,7 @@ export type TaskOutcome = "completed" | "partial" | "blocked" | "failed" | "reve
 export type VerificationAdvice = {
   commands: Array<{ command: string; reason: string }>;
   docsReview: boolean;
-  routesReview: boolean;
+  catalogReview: boolean;
 };
 
 const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|sql|json|md|yml|yaml)$/i;
@@ -29,7 +29,7 @@ export function suggestVerificationCommands(changedFiles: string[]): Verificatio
   const hasWorker = changedFiles.some((file) => file.includes("apps/workers") || file.includes("packages/domains/workers") || file.includes("worker"));
   const hasSchema = changedFiles.some((file) => file.includes("db/drizzle") || /migration|schema/i.test(file));
   const hasSherpa = changedFiles.some((file) => file.includes("pi-sherpa") || file.includes(".pi/sherpa"));
-  const hasDocs = changedFiles.some((file) => /(^|\/)docs\/|README|AGENTS\.md|routes\.(csv|md)/.test(file));
+  const hasDocs = changedFiles.some((file) => /(^|\/)docs\/|README|AGENTS\.md|catalog\.csv/.test(file));
 
   if (hasTs) commands.push({ command: "pnpm typecheck", reason: "TypeScript files changed" });
   if (hasWorker) commands.push({ command: "pnpm --filter workers typecheck", reason: "worker-related files changed" });
@@ -38,7 +38,7 @@ export function suggestVerificationCommands(changedFiles: string[]): Verificatio
   if (hasSherpa) commands.push({ command: "pnpm exec esbuild /Users/kamil/.pi/agent/extensions/pi-sherpa/index.ts --bundle --platform=node --format=esm --external:@mariozechner/pi-ai --external:@mariozechner/pi-coding-agent --external:typebox --outfile=/tmp/pi-sherpa-check.mjs", reason: "Sherpa extension changed" });
 
   const unique = new Map(commands.map((item) => [item.command, item]));
-  return { commands: [...unique.values()].slice(0, 8), docsReview: !hasDocs && changedFiles.some((file) => SOURCE_EXT.test(file)), routesReview: changedFiles.some((file) => file === "routes.csv" || file === "routes.md" || file.startsWith("scripts/") || file.includes("docs/") || file.includes("package.json")) };
+  return { commands: [...unique.values()].slice(0, 8), docsReview: !hasDocs && changedFiles.some((file) => SOURCE_EXT.test(file)), catalogReview: changedFiles.some((file) => file === "catalog.csv" || file.startsWith("scripts/") || file.includes("docs/") || file.includes("package.json")) };
 }
 
 export function compactScratchpad(root: string, options: { maxBytes?: number; archiveDir?: string } = {}) {

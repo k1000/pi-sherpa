@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, append
 import os from "node:os";
 import path from "node:path";
 import { getProjectKBBasedir } from "./project-kb";
+import { upsertCatalogRow } from "./catalog";
 
 export type MemoryPaths = {
   cwd: string;
@@ -194,8 +195,26 @@ export async function syncReflectMemory(paths: MemoryPaths, options: { refId?: s
 
     const dir = obsidianDir(paths, entry);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, `${slug}.md`), note);
-    synced.push(`${entry.id} -> ${path.relative(paths.cwd, path.join(dir, `${slug}.md`))}`);
+    const target = path.join(dir, `${slug}.md`);
+    writeFileSync(target, note);
+    upsertCatalogRow(paths.cwd, {
+      id: `reflect.${entry.id}`,
+      scope: "project",
+      project: path.basename(paths.cwd),
+      type: semanticWikiType(entry).pageType,
+      path: path.relative(paths.cwd, target).replace(/\\/g, "/"),
+      title: entry.title ?? entry.id,
+      summary: entry.summary ?? body.slice(0, 180),
+      aliases: entry.id,
+      tags: Array.isArray(entry.tags) ? entry.tags.join("|") : "reflect",
+      status: "active",
+      confidence: entry.importance ?? "medium",
+      updated: new Date().toISOString().slice(0, 10),
+      based_on: entry.id,
+      routes: [entry.title ?? "", ...(entry.tags ?? [])].filter(Boolean).join("|"),
+      keywords: [entry.id, entry.type ?? "", entry.importance ?? ""].filter(Boolean).join("|"),
+    });
+    synced.push(`${entry.id} -> ${path.relative(paths.cwd, target)}`);
   }
 
   return [

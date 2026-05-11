@@ -85,6 +85,16 @@ type SherpaConfig = {
 
 type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean };
 type SourcePlan = { sources: Source[]; reason: string; confidence: number; planner: "heuristic" | "llm" | "override" | "fallback"; routePlan?: RoutePlan };
+// Sherpa three-stage retrieval pipeline types
+type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
+type CurateResult = {
+  items: ContextItem[];
+  abstain: boolean;
+  abstainReason: string;
+  rejected: Array<{ index: number; reason: string; source: string }>;
+  confidence: number;
+  planner: "heuristic" | "llm";
+};
 type ContextBundle = { taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
 
 type ContextDisposition =
@@ -550,6 +560,31 @@ function normalizeSources(input: string[] | undefined, mode: string): Source[] {
   return out;
 }
 
+const SHERPA_STOP_WORDS = new Set([
+  "like", "want", "dont", "don", "this", "that", "these", "those", "with", "from", "into", "through", "during", "before", "after", "above", "below", "between", "under", "again", "further", "then", "once", "here", "there", "when", "where", "while", "because", "until", "since", "about", "against", "among", "along", "around", "beyond", "despite", "except", "inside", "outside", "toward", "within", "without", "across", "behind", "beside", "beneath", "besides", "concerning", "considering", "following", "including", "regarding", "throughout", "upon", "would", "could", "should", "might", "must", "shall", "will", "need", "dare", "ought", "used", "able", "also", "just", "only", "even", "back", "still", "already", "yet", "ever", "never", "always", "often", "sometimes", "usually", "really", "quite", "very", "too", "much", "many", "more", "most", "some", "any", "all", "both", "each", "every", "few", "little", "less", "least", "other", "another", "such", "same", "own", "sure", "true", "false", "right", "left", "last", "first", "next", "previous", "early", "late", "soon", "now", "today", "tomorrow", "yesterday", "ago", "hence", "thus", "therefore", "however", "moreover", "furthermore", "nevertheless", "nonetheless", "otherwise", "instead", "meanwhile", "rather", "pretty", "fairly", "almost", "nearly", "hardly", "barely", "simply", "easily", "probably", "possibly", "perhaps", "maybe", "certainly", "definitely", "absolutely", "completely", "totally", "entirely", "mostly", "partly", "slightly", "somewhat", "kind", "sort", "type", "way", "thing", "stuff", "point", "part", "piece", "bit", "lot", "group", "set", "list", "line", "area", "side", "end", "top", "bottom", "front", "middle", "center", "edge", "corner", "place", "spot", "case", "example", "instance", "fact", "reason", "cause", "result", "effect", "idea", "thought", "view", "opinion", "belief", "feeling", "sense", "question", "answer", "problem", "issue", "matter", "subject", "topic", "theme", "story", "news", "report", "study", "research", "project", "work", "job", "task", "duty", "role", "goal", "aim", "purpose", "plan", "strategy", "method", "approach", "process", "step", "stage", "phase", "level", "degree", "rate", "amount", "number", "quantity", "sum", "total", "whole", "half", "third", "quarter", "percent", "hundred", "thousand", "million", "billion",
+]);
+
+function extractSearchTerms(query: string, max = 12): string[] {
+  const raw = query.match(/[A-Za-z0-9_./-]{4,}/g) ?? [];
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const t of raw) {
+    const lower = t.toLowerCase();
+    if (SHERPA_STOP_WORDS.has(lower)) continue;
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    terms.push(t);
+    if (terms.length >= max) break;
+  }
+  return terms;
+}
+
+// Fallback: extract search terms the same way the old pipeline used.
+// Inferior to model inference but prevents complete failure when model is unavailable.
+function heuristicIndicators(focus: string): string[] {
+  return extractSearchTerms(focus, 12);
+}
+
 function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   const f = focus.toLowerCase();
   const sources: Source[] = [];
@@ -590,86 +625,287 @@ function extractJsonObject(text: string): unknown {
   catch { return null; }
 }
 
-async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<SourcePlan> {
-  const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
-  const overridden = normalizeSources(sourceOverride, mode);
-  if (overridden.length) return { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan };
-
-  const fallback = { ...heuristicSourcePlan(focus, mode), routePlan };
-  if (routePlan) {
-    const routedSources = normalizeSources([...fallback.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
-    fallback.sources = routedSources;
-    fallback.reason = `route ${routePlan.name}: ${fallback.reason}`;
-    fallback.confidence = Math.max(fallback.confidence, 0.8);
+async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus: string): Promise<SearchIndicators> {
+  // Stage 1: model infers which unique technical identifiers would appear in relevant context.
+  // Runs ONCE per request and feeds into all subsequent searches.
+  if (state.config.model.heuristicOnly) {
+    return { indicators: heuristicIndicators(focus), reason: "heuristic extraction", confidence: 0.3, planner: "heuristic" };
   }
-  if (state.config.model.heuristicOnly || mode !== "front-door") return fallback;
-
   const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) return fallback;
+  if (!model) {
+    return { indicators: heuristicIndicators(focus), reason: "model unavailable, falling back", confidence: 0.3, planner: "heuristic" };
+  }
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return fallback;
-
+  if (!auth.ok || !auth.apiKey) {
+    return { indicators: heuristicIndicators(focus), reason: "no API key, falling back", confidence: 0.3, planner: "heuristic" };
+  }
   const message: UserMessage = {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: [
-      `Prompt: ${focus}`,
+      `User intent: ${focus}`,
       "",
-      "Select which sources Sherpa should search before retrieving context.",
-      "Available sources: files, docs, git, project_memory, web. Do not choose session for front-door prompts.",
-      "Return ONLY JSON: {\"sources\":[...],\"reason\":\"...\",\"confidence\":0.0}",
-      "Prefer the fewest sources likely to contain the answer. Choose web only for current/latest/online facts or external docs not likely in the repo.",
-    ].join("\n") }],
+      "You are Sherpa, a code search expert. Given the user's intent above,",
+      "list 8-12 SPECIFIC technical identifiers (function names, variable names, file patterns,",
+      "module paths, domain terms) that would appear in RELEVANT source code or documentation.",
+      "",
+      "Rules:",
+      "- Prefer SPECIFIC identifiers over generic ones. 'parseTree', 'tokenize', 'grammarRule'",
+      "  are good. 'user', 'data', 'error', 'value' are only useful if paired with a domain-specific term.",
+      "- These indicators should discriminate RELEVANT code from IRRELEVANT code that happens",
+      "  to share the same raw keywords.",
+      "- If the intent is about trading strategies, 'grid_spacing', 'position_sizing', 'risk_limit'",
+      "  matter more than 'strategy' or 'trade'.",
+      'Return ONLY JSON: {"indicators":["..."],"reason":"why these indicators","confidence":0.0}',
+    ].join("\\n") }],
+  };
+  try {
+    const response = await Promise.race([
+      complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
+      timeoutAfter<any>(SOURCE_PLANNER_TIMEOUT_MS, "indicator inference timed out"),
+    ]);
+    if (response.stopReason === "aborted") {
+      return { indicators: heuristicIndicators(focus), reason: "model aborted, falling back", confidence: 0.2, planner: "heuristic" };
+    }
+    const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
+    const parsed = extractJsonObject(text) as any;
+    if (parsed && Array.isArray(parsed.indicators) && parsed.indicators.length > 0) {
+      const indicators = parsed.indicators
+        .filter((s: unknown): s is string => typeof s === "string" && s.length >= 2)
+        .slice(0, 12);
+      return {
+        indicators,
+        reason: String(parsed.reason ?? "").slice(0, 240) || "model inference",
+        confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.5))),
+        planner: "llm",
+      };
+    }
+    return { indicators: heuristicIndicators(focus), reason: "model returned invalid JSON, falling back", confidence: 0.2, planner: "heuristic" };
+  } catch {
+    return { indicators: heuristicIndicators(focus), reason: "model error, falling back", confidence: 0.2, planner: "heuristic" };
+  }
+}
+
+async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
+  // Returns BOTH source plan (Stage 0/2) and inferred search indicators (Stage 1).
+  const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
+  const overridden = normalizeSources(sourceOverride, mode);
+  if (overridden.length) {
+    const sourcePlan: SourcePlan = { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan };
+    const indicators = await inferSearchIndicators(state, ctx, focus);
+    return { sourcePlan, indicators };
+  }
+
+  const fallbackPlan = { ...heuristicSourcePlan(focus, mode), routePlan };
+  if (routePlan) {
+    const routedSources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
+    fallbackPlan.sources = routedSources;
+    fallbackPlan.reason = `route ${routePlan.name}: ${fallbackPlan.reason}`;
+    fallbackPlan.confidence = Math.max(fallbackPlan.confidence, 0.8);
+  }
+  const heuristicInds = { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" as const };
+
+  if (state.config.model.heuristicOnly || mode !== "front-door") {
+    return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+  }
+
+  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
+  if (!model) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+
+  // Single model call: infer both indicators (Stage 1) AND source selection.
+  const message: UserMessage = {
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: [
+      `User intent: ${focus}`,
+      "",
+      "You are Sherpa in Stage 1: inferring what to search for.",
+      "",
+      "TASK A — Search indicators: List 8-12 SPECIFIC technical identifiers",
+      "(function names, file patterns, module paths, domain terms) that would appear in",
+      'RELEVANT code — not just any code containing the raw keywords.',
+      'Return as JSON: {"indicators":{"indicators":["..."],"reason":"...","confidence":0.0}}',
+      "",
+      "TASK B — Source selection: Which sources should Sherpa search?",
+      "Available: files, docs, git, project_memory, web.",
+      "Prefer the fewest sources likely to contain the answer.",
+      "Choose web only for current/latest/online facts not in the repo.",
+      'Also return as JSON: {"sources":{"sources":["..."],"reason":"...","confidence":0.0}}',
+      "",
+      `Return ONLY a single JSON object with both "indicators" and "sources" keys.`,
+    ].join("\\n") }],
   };
 
   try {
     const response = await Promise.race([
       complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
-      timeoutAfter<any>(SOURCE_PLANNER_TIMEOUT_MS, "source planning timed out"),
+      timeoutAfter<any>(SOURCE_PLANNER_TIMEOUT_MS, "source + indicator planning timed out"),
     ]);
-    if (response.stopReason === "aborted") return fallback;
-    const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\n");
-    const llmPlan = parseSourcePlan(text, mode);
-    return llmPlan ? { ...llmPlan, sources: normalizeSources([...llmPlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode), routePlan } : fallback;
+    if (response.stopReason === "aborted") {
+      return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+    }
+    const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
+    const parsed = extractJsonObject(text) as any;
+
+    let indicators: SearchIndicators = heuristicInds;
+    if (parsed?.indicators && Array.isArray(parsed.indicators.indicators) && parsed.indicators.indicators.length > 0) {
+      const inds = parsed.indicators.indicators
+        .filter((s: unknown): s is string => typeof s === "string" && s.length >= 2)
+        .slice(0, 12);
+      indicators = {
+        indicators: inds,
+        reason: String(parsed.indicators.reason ?? "").slice(0, 240) || "model inference",
+        confidence: Math.max(0.1, Math.min(1, Number(parsed.indicators.confidence ?? 0.5))),
+        planner: "llm",
+      };
+    }
+
+    if (parsed?.sources) {
+      const rawSources = JSON.stringify(parsed.sources);
+      const sourcePlan = parseSourcePlan(rawSources, mode);
+      if (sourcePlan?.sources.length) {
+        const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
+        return { sourcePlan: { ...sourcePlan, sources: mergedSources, routePlan }, indicators };
+      }
+    }
+    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner fallback: ${fallbackPlan.reason}` }, indicators };
   } catch {
-    return { ...fallback, planner: "fallback", reason: `planner fallback: ${fallback.reason}` };
+    return { sourcePlan: fallbackPlan, indicators: heuristicInds };
   }
 }
 
-async function curateCandidates(state: State, ctx: ExtensionContext, candidates: ContextItem[], focus: string, mode: string): Promise<ContextItem[]> {
-  const fallback = heuristicOrderCandidates(candidates, focus, mode);
 
-  // Keep explicit /sherpa deterministic and broad. The LLM curator is only for
-  // automatic front-door injection, where precision matters most.
-  if (mode !== "front-door" || state.config.model.heuristicOnly || candidates.length <= 1) return fallback;
+async function curateCandidates(
+  state: State,
+  ctx: ExtensionContext,
+  candidates: ContextItem[],
+  focus: string,
+  mode: string,
+  indicators: SearchIndicators,
+): Promise<CurateResult> {
+  // Stage 3: model judges whether each candidate actually corresponds to the user's intent.
+  // HARD GATE: if no candidates are relevant, the result is abstain — nothing goes to the main agent.
+  const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
+
+  if (mode !== "front-door" || state.config.model.heuristicOnly || candidates.length <= 1) {
+    return {
+      items: heuristicOrdered.slice(0, 8),
+      abstain: false,
+      abstainReason: "",
+      rejected: [],
+      confidence: 0.3,
+      planner: "heuristic",
+    };
+  }
 
   const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) return fallback;
+  if (!model) {
+    return {
+      items: heuristicOrdered.slice(0, 8),
+      abstain: false,
+      abstainReason: "",
+      rejected: [],
+      confidence: 0.3,
+      planner: "heuristic",
+    };
+  }
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return fallback;
+  if (!auth.ok || !auth.apiKey) {
+    return {
+      items: heuristicOrdered.slice(0, 8),
+      abstain: false,
+      abstainReason: "",
+      rejected: [],
+      confidence: 0.3,
+      planner: "heuristic",
+    };
+  }
 
-  const manifest = fallback.slice(0, 30).map((c, i) => ({
-    index: i,
-    type: c.type,
-    source: c.source,
-    relevance: Number(c.relevance.toFixed(2)),
-    summary: c.summary.slice(0, 500),
-  }));
+    // Project domain — the model uses this to judge whether the QUERY belongs here.
+  const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operations, bash commands, "
+    + "pi extensions, pi skills, Sherpa memory, Obsidian knowledge bases, coding tasks, "
+    + "alphabot trading strategies, backtesting, and workspace operations.";
+
+  // Conservative OOD patterns — only the most obvious non-project queries.
+  // These are a safety net; the LLM is the primary domain gate.
+  // Only add patterns that are HIGHLY unlikely to appear in any valid project query.
+  const OOD_PATTERNS = [
+    /\b(capital of\b|\bpresident of|\bgovernment of)\b/i,
+    /\bmy dog\b|\bmy cat\b|\bmy pet\b|\bmy cat\b/i,
+    /\bmeaning of life\b|\bphilosophy\b/i,
+    /\bbrew(ing)? coffee\b|\bhow to brew\b/i,
+    /\bmy wedding\b|\bplan my vacation\b/i,
+  ];
+  const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
+
+  // Filter out generic/noisy candidates that always appear but never help answer specific queries.
+  // Session recent entries are JSON session events — they contain many keywords but are too
+  // generic to help answer any specific query. Remove them so Stage 3 isn't tricked by keyword collision.
+  const NOISY_TYPES = new Set(["session_recent", "session_event", "audit_log", "system_log"]);
+  const NOISY_PATTERNS = [
+    /session_compact|audit event|session event/i,
+    /No durable structural learning|no actionable/i,
+    /proactive|session_compact/i,
+  ];
+  const isNoisy = (c: { type: string; summary: string; raw?: string }) =>
+    NOISY_TYPES.has(c.type) ||
+    NOISY_PATTERNS.some(p => p.test(c.summary) || (c.raw && p.test(c.raw)));
+
+  const manifest = heuristicOrdered
+    .filter(c => !isNoisy(c))
+    .slice(0, 30)
+    .map((c, i) => ({
+      index: i,
+      type: c.type,
+      source: c.source,
+      relevance: Number(c.relevance.toFixed(2)),
+      summary: c.summary.slice(0, 500),
+      rawExcerpt: (c.raw ?? "").slice(0, 200),
+    }));
 
   const message: UserMessage = {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: [
-      `Focus: ${focus}`,
+      `User query: ${focus}`,
+      `Inferred indicators: ${indicators.indicators.join(", ")}`,
+      `Why these indicators: ${indicators.reason}`,
       "",
-      "You are Sherpa, a context curator for a coding agent.",
-      "Given retrieved candidates, choose the smallest useful ordered set for the next coding turn.",
-      "Prefer source files/tests over docs for code-change prompts. Exclude generic/noisy docs unless directly useful.",
-      "Return ONLY JSON array of candidate indexes in desired order, max 8 items. Example: [2,0,5]",
+      "You are Sherpa, Stage 3: domain-gating suppression.",
+      "",
+      "STEP 1 — Domain check: is this query within the project domain?",
+      `Project domain: ${PROJECT_DOMAIN}`,
+      "A query is IN-DOMAIN if answering it requires knowledge from the project workspace",
+      "(code, files, memory, docs, config, strategy logic, experiment results).",
+      "A query is OUT-OF-DOMAIN if the agent can answer it fully from its own knowledge",
+      "(general knowledge, personal advice, hobbies, health, food, travel, art).",
+      "",
+      "CRITICAL — avoid keyword collision: do NOT select a candidate just because it shares",
+      "a word with the query. A journal entry mentioning 'France' is NOT relevant to",
+      "'what is the capital of France'. A code snippet mentioning 'dog' is NOT relevant to",
+      "'my dog is sick'. Relevance means: THIS specific snippet helps answer THIS question.",
+      "",
+      "STEP 2 — Candidate selection (only if query is in-domain):",
+      "For each candidate, ask: 'If someone asked me this question, would THIS snippet help me",
+      "give a BETTER, MORE ACCURATE answer than I could give from my own knowledge?'",
+      "If yes, select it. If the snippet only shares keywords with the question but covers",
+      "a different topic — or if the agent already knows the answer without it — REJECT it.",
+      "",
+      'Return ONLY JSON with this exact shape:',
+      '{',
+      '  "queryInDomain": true,          // is the query within the project domain?',
+      '  "selected": [0, 3, 5],          // indexes of relevant candidates (ignored if queryInDomain=false)',
+      '  "rejected": [{"index":1,"reason":"about X, not Y"}],  // not relevant to this query',
+      '  "confidence": 0.0,               // confidence in this judgment',
+      '  "reason": "why the query is or is not in-domain, and why selected candidates help',
+      '}',
       "",
       JSON.stringify(manifest, null, 2),
-    ].join("\n") }],
+    ].join("\\n") }],
   };
+
 
   try {
     const abort = new AbortController();
@@ -679,29 +915,73 @@ async function curateCandidates(state: State, ctx: ExtensionContext, candidates:
       { systemPrompt: state.retrievalPrompt, messages: [message] },
       { apiKey: auth.apiKey, headers: auth.headers, signal: abort.signal },
     ).finally(() => clearTimeout(timeout));
-    if (response.stopReason === "aborted") return fallback;
-    const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n");
-    const parsed = extractJsonArray(text);
-    if (!Array.isArray(parsed)) return fallback;
+    if (response.stopReason === "aborted") {
+      return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
+    }
+    const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\\n");
+    const parsed = extractJsonObject(text) as any;
+    if (!parsed) {
+      return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
+    }
+
+    const selected: number[] = Array.isArray(parsed.selected) ? parsed.selected : [];
+    const queryInDomain = parsed.queryInDomain !== false; // default true, only false if explicitly set
+    const rejected: Array<{ index: number; reason: string; source: string }> = Array.isArray(parsed.rejected)
+      ? parsed.rejected.filter((r: any) => typeof r?.index === "number").map((r: any) => ({
+          index: Number(r.index),
+          reason: String(r.reason ?? ""),
+          source: String(manifest[r.index]?.source ?? ""),
+        }))
+      : [];
+    const confidence = Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.4)));
+
+    // HARD GATE: if query is out-of-domain, suppress everything — let the model answer from its own knowledge.
+    // If in-domain but no candidates match, also suppress.
+    // The model is the judge — we trust its semantic domain judgment.
+    // Additionally, a fast pattern-based pre-filter catches obvious OOD queries before calling the model.
+    if (isLikelyOod || !queryInDomain) {
+      return {
+        items: [],
+        abstain: true,
+        abstainReason: isLikelyOod
+          ? `obvious out-of-domain query — pattern matched '${focus.slice(0, 40)}'`
+          : `query is outside project domain — ${String(parsed.reason ?? "model gated it out").slice(0, 200)}`,
+        rejected,
+        confidence,
+        planner: "llm",
+      };
+    }
+    if (selected.length === 0) {
+      return {
+        items: [],
+        abstain: true,
+        abstainReason: String(parsed.reason ?? "no relevant candidates found for in-domain query").slice(0, 240),
+        rejected,
+        confidence,
+        planner: "llm",
+      };
+    }
 
     const picked: ContextItem[] = [];
     const seen = new Set<number>();
-    for (const v of parsed) {
-      const idx = typeof v === "number" ? v : Number(v);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= manifest.length || seen.has(idx)) continue;
-      seen.add(idx);
-      picked.push(fallback[idx]);
+    for (const idx of selected) {
+      const n = typeof idx === "number" ? idx : Number(idx);
+      if (!Number.isInteger(n) || n < 0 || n >= manifest.length || seen.has(n)) continue;
+      seen.add(n);
+      picked.push(heuristicOrdered[n]);
       if (picked.length >= 8) break;
     }
-    if (!picked.length) return fallback;
 
-    // Keep unpicked candidates as a tail so token-budget selection can still fill
-    // space if the curator was overly sparse.
-    return [...picked, ...fallback.filter((_, i) => !seen.has(i))];
+    if (!picked.length) {
+      return { items: [], abstain: true, abstainReason: "model returned selected indexes but none were valid", rejected, confidence, planner: "llm" };
+    }
+
+    return { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm" };
   } catch {
-    return fallback;
+    return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
   }
 }
+
 async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, budgetChars = 1200): Promise<string> {
   if (state.config.model.heuristicOnly) return summarize(raw, budgetChars);
   const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
@@ -949,7 +1229,7 @@ async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Pr
   }
 }
 
-async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan?: SourcePlan, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
+async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
   const enabled = (s: Source) => Boolean(state.config.sources[s]) && (!sourcePlan || sourcePlan.sources.includes(s));
   const candidates: ContextItem[] = [];
   const add = (type: string, source: string, raw: string, relBoost = 0) => {
@@ -999,7 +1279,8 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
         }
       } catch { /* ignore route file */ }
     }
-    const out = await rg(ctx.cwd, focus);
+    // Stage 2: search using model-inferred indicators, not raw focus text
+    const out = await rg(ctx.cwd, indicators.indicators);
     for (const block of out.split("\n").slice(0, 30)) {
       if (!block.trim()) continue;
       // rg format: file:line:content. Split on the first two separators only so
@@ -1009,7 +1290,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
       if (firstColon === -1 || secondColon === -1) continue;
       const fileAndLine = block.slice(0, secondColon);
       const content = block.slice(secondColon + 1).trim();
-      if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
+      if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicators.indicators.join(" "), mode)) continue;
       add("file_snippet", `repo://${fileAndLine}`, content, 0.15);
     }
   })());
@@ -1019,7 +1300,8 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
     // context-file loader. Sherpa should not duplicate them in front-door or
     // explicit retrieval bundles; it focuses on project docs and source-grounded
     // snippets that are not already preloaded.
-    const docFiles = getDocFilesForFocus(ctx.cwd, focus, mode, sourcePlan?.routePlan);
+    // Stage 2: doc paths filtered by inferred indicators, not raw focus
+    const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan);
     for (const f of docFiles) {
       const p = path.join(ctx.cwd, f);
       if (existsSync(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
@@ -1040,7 +1322,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
     // Results are organized by scope: current project first, then research.
     // Other projects are searched only when explicitly requested.
     const root = obsidianMemoryPath(state);
-    const currentProjectMatches = catalogMatches(root, focus, 8);
+    const currentProjectMatches = catalogMatches(root, indicators.indicators.join(" "), 8);
 
     for (const { row, relevance } of currentProjectMatches) {
       const target = path.join(root, row.path);
@@ -1056,7 +1338,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
         const areaRoot = path.join(researchBase, area);
         try {
           if (!statSync(areaRoot).isDirectory()) continue;
-          for (const { row, relevance } of catalogMatches(areaRoot, focus, 5)) {
+          for (const { row, relevance } of catalogMatches(areaRoot, indicators.indicators.join(" "), 5)) {
             const target = path.join(areaRoot, row.path);
             if (!existsSync(target)) continue;
             const raw = readFileSync(target, "utf8").slice(0, 2600);
@@ -1074,7 +1356,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
           const projectRoot = path.join(projectsBase, project);
           try {
             if (!statSync(projectRoot).isDirectory() || path.resolve(projectRoot) === currentRoot) continue;
-            for (const { row, relevance } of catalogMatches(projectRoot, focus, 4)) {
+            for (const { row, relevance } of catalogMatches(projectRoot, indicators.indicators.join(" "), 4)) {
               const target = path.join(projectRoot, row.path);
               if (!existsSync(target)) continue;
               const raw = readFileSync(target, "utf8").slice(0, 2200);
@@ -1142,9 +1424,31 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
 
   await Promise.allSettled(retrievalTasks);
 
-  const orderedCandidates = await curateCandidates(state, ctx, candidates, focus, mode);
+// Stage 3: model judges candidates with hard suppression gate.
+  const curateResult = await curateCandidates(state, ctx, candidates, focus, mode, indicators);
+
+  // HARD GATE: if Stage 3 suppressed everything, return empty bundle (triggers abstain)
+  if (curateResult.abstain) {
+    state.bundles++;
+    const abstainBundle: ContextBundle = {
+      taskId: `sherpa-${Date.now()}`,
+      focus,
+      mode,
+      budgetUsedTokens: 0,
+      items: [],
+      candidateCount: candidates.length,
+      sourcePlan,
+    };
+    abstainBundle.signal = buildContextSignal(abstainBundle);
+    return abstainBundle;
+  }
+
   const items: ContextItem[] = []; let used = 0;
-  for (const c of orderedCandidates) { const t = approxTokens(c.summary) + 30; if (used + t <= tokenBudget && c.relevance >= 0.08) { items.push(c); used += t; } if (items.length >= 8) break; }
+  for (const c of curateResult.items) {
+    const t = approxTokens(c.summary) + 30;
+    if (used + t <= tokenBudget) { items.push(c); used += t; }
+    if (items.length >= 8) break;
+  }
   state.bundles++;
   const bundle: ContextBundle = { taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
   bundle.signal = buildContextSignal(bundle);
@@ -1449,7 +1753,7 @@ export default function (pi: ExtensionAPI) {
   }});
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!state?.config.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
+    if (!state?.config?.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
     if (isTrivial(event.prompt)) { state.lastSkip = "trivial prompt"; return; }
 
     setSherpaStatus(ctx, "curating", event.prompt);
@@ -1460,17 +1764,18 @@ export default function (pi: ExtensionAPI) {
     ]);
 
     try {
-      const sourcePlan = await planSources(state, ctx, event.prompt, "front-door");
+      const { sourcePlan, indicators } = await planSources(state, ctx, event.prompt, "front-door");
       ctx.ui.setWidget(SHERPA_UI_KEY, [
         "🤵 Sherpa is curating context…",
-        `🧭 Source plan: ${sourcePlan.sources.join(", ")} (${sourcePlan.planner})`,
-        `💡 ${sourcePlan.reason}`,
+        `🧭 Sources: ${sourcePlan.sources.join(", ")} (${sourcePlan.planner})`,
+        `＇　️ Indicators: ${indicators.indicators.slice(0, 5).join(", ")}${indicators.indicators.length > 5 ? "..." : ""}`
+        `💡 ${indicators.reason.slice(0, 80)}`
       ]);
 
       // Front-door context must stay high-signal. Avoid session_recent by default because it often
       // echoes tool-result noise back into the next prompt. Explicit Sherpa requests can still use it.
       const bundle = await Promise.race([
-        buildBundle(state, ctx, event.prompt, "front-door", state.config.frontDoor.tokenBudget, sourcePlan),
+        buildBundle(state, ctx, event.prompt, "front-door", state.config.frontDoor.tokenBudget, sourcePlan, indicators),
         timeoutAfter<ContextBundle>(CURATION_TIMEOUT_MS, "front-door curation timed out"),
       ]);
       bundle.items = filterAlreadySeenSources(ctx, bundle.items);
@@ -1520,16 +1825,26 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: ["Use sherpa_request_context when you need focused repo, docs, git, or session context before editing."],
     parameters: requestSchema,
     async execute(_toolCallId, params: RequestParams, _signal, _onUpdate, ctx) {
-      if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+      // Defensive: ensure state is always initialized before any access
+      if (typeof state === "undefined" || state === null) {
+        try {
+          state = restoreState(ctx, loadConfig(ctx.cwd));
+        } catch (e: any) {
+          return { content: [{ type: "text", text: `Sherpa init failed: ${e?.message ?? String(e)}` }], details: { error: "init_failed", detail: e?.stack?.slice(0, 300) } };
+        }
+      }
       setSherpaStatus(ctx, "context", params.focus);
       try {
-        const expanded = (params.expandHandles ?? []).map(h => state!.handles.get(h)).filter(Boolean) as ContextItem[];
-        const sourcePlan = await planSources(state, ctx, params.focus, "explicit", params.sources);
+        const _state = state; // capture at function scope to avoid TDZ issues
+        const expanded = (params.expandHandles ?? []).map(h => _state.handles.get(h)).filter(Boolean) as ContextItem[];
+        const { sourcePlan, indicators } = await planSources(_state, ctx, params.focus, "explicit", params.sources);
         setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, params.focus);
-        const bundle = await buildBundle(state, ctx, params.focus, "explicit", params.tokenBudget ?? state.config.explicit.tokenBudget, sourcePlan, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy });
+        const bundle = await buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy });
         const extra = expanded.map(i => `\n\n## Expanded ${i.handle}\nSource: ${i.source}\n\n${(i.raw ?? i.summary).slice(0, (params.tokenBudget ?? 3000) * 4)}`).join("");
         persist();
         return { content: [{ type: "text", text: bundleMarkdown(bundle) + extra }], details: bundle };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Sherpa error: ${e?.message ?? String(e)}\n${(e?.stack ?? "").split("\n").slice(0, 5).join("\n")}` }], details: { error: e?.message ?? String(e) } };
       } finally {
         setSherpaStatus(ctx);
       }
@@ -1628,9 +1943,9 @@ export default function (pi: ExtensionAPI) {
     try {
       // User-invoked /sherpa should behave like an intervention: inject the context and wake the
       // main agent. Source planning chooses the likely stores before expensive retrieval.
-      const sourcePlan = await planSources(state, ctx, focus, "explicit");
+      const { sourcePlan, indicators } = await planSources(state, ctx, focus, "explicit");
       setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, focus);
-      const bundle = await buildBundle(state, ctx, focus, "explicit", state.config.explicit.tokenBudget, sourcePlan);
+      const bundle = await buildBundle(state, ctx, focus, "explicit", state.config.explicit.tokenBudget, sourcePlan, indicators);
       const abstainReason = shouldAbstain(bundle.items, "explicit");
       if (abstainReason) {
         state.lastSkip = abstainReason;

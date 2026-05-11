@@ -37,27 +37,19 @@ export function hashAutoMemory(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
-export function extractAutoMemoryCandidates(text: string): string[] {
-  const structural = /\b(always|never|must|should|invariant|rule|pattern|convention|schema|migration|idempotent|dryRun|dry run|typecheck|direct db|SKIP LOCKED|caps\.id|text not uuid|production|staging|worker|sherpa|reflect|memory|distill)\b/i;
-  const noisy = /^(\s*[{\[]|\s*at\s|\s*\d+\)|\s*✓|\s*RUN\s|\s*>\s)/;
-  const seen = new Set<string>();
-  const candidates: string[] = [];
-
-  for (const raw of text.split(/\n+/)) {
-    const line = raw.replace(/\s+/g, " ").trim();
-    if (line.length < 45 || line.length > 420) continue;
-    if (noisy.test(line)) continue;
-    if (!structural.test(line)) continue;
-
-    const normalized = line.replace(/^[-*]\s*/, "");
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    candidates.push(normalized);
-    if (candidates.length >= 12) break;
-  }
-
-  return candidates;
+/**
+ * Naive keyword extractor — DEPRECATED.
+ *
+ * This regex-based approach misses research findings, conclusions, and
+ * emergent patterns because it only matches imperative keywords
+ * ("must", "should", "always", etc.). Real knowledge extraction requires
+ * reading comprehension, not pattern matching.
+ *
+ * Archivist now uses its dedicated model for session analysis.
+ * This function is kept for backward compatibility but returns empty.
+ */
+export function extractAutoMemoryCandidates(_text: string): string[] {
+  return [];
 }
 
 function ensureObsidianMemoryDirs(obsidianMemoryPath: string): string {
@@ -69,7 +61,9 @@ function ensureObsidianMemoryDirs(obsidianMemoryPath: string): string {
     "wiki/evidence",
     "journal",
     "inbox",
-    "sources",
+    // Note: sources/ is intentionally NOT auto-created. It is for external
+    // material only (papers, articles, third-party reports). Repo docs live
+    // in the repo and are retrieved via Sherpa's file source — never mirrored.
   ]) {
     mkdirSync(path.join(obsidianMemoryPath, dir), { recursive: true });
   }
@@ -88,51 +82,32 @@ export function writeAutoMemoryArtifact(
 ) {
   getProjectKBBasedir(config.cwd); // Keep repo-local scratchpad/scaffold available; durable memory lives in Obsidian.
   const obsidianBase = ensureObsidianMemoryDirs(config.obsidianMemoryPath);
-  const now = new Date().toISOString();
   const hash = hashAutoMemory(`${reason}\n${rawText}`);
   if (state.writtenHashes.includes(hash)) return { written: false, hash, candidates: [] as string[] };
 
   const candidates = extractAutoMemoryCandidates(rawText);
-  const sessionPath = path.join(obsidianBase, "journal", `${todayIsoDate()}.md`);
-  mkdirSync(path.dirname(sessionPath), { recursive: true });
-  appendFileSync(sessionPath, [
-    `\n## ${now} — ${reason}`,
-    "",
-    candidates.length ? "### Candidate learnings" : "### Session event",
-    ...(candidates.length
-      ? candidates.map((candidate) => `- ${candidate}`)
-      : ["- No durable structural learning candidate detected; event recorded for audit continuity."]),
-    "",
-  ].join("\n"));
 
   if (candidates.length) {
+    const now = new Date().toISOString();
+    const sessionPath = path.join(obsidianBase, "journal", `${todayIsoDate()}.md`);
+    mkdirSync(path.dirname(sessionPath), { recursive: true });
+    appendFileSync(sessionPath, [
+      `\n## ${now} — ${reason}`,
+      "",
+      "### Candidate learnings",
+      ...candidates.map((candidate) => `- ${candidate}`),
+      "",
+    ].join("\n"));
+
     config.appendScratchpadCandidate([
       `Reason: ${reason}`,
       `Hash: ${hash}`,
-      `Durable destination: ${path.relative(config.obsidianVault, obsidianBase)}/inbox`,
+      `Durable destination: ${path.relative(config.obsidianVault, obsidianBase)}/journal`,
       "",
       ...candidates.map((candidate) => `- ${candidate}`),
     ].join("\n"), "Auto memory candidates");
-
-    const candidatePath = path.join(obsidianBase, "inbox", `auto-session-${todayIsoDate()}-${hash}.md`);
-    writeFileSync(candidatePath, [
-      `# Auto Session Learning — ${todayIsoDate()}`,
-      "",
-      "## Metadata",
-      `- **Reason:** ${reason}`,
-      `- **Created:** ${now}`,
-      "- **Source:** Sherpa auto-memory lifecycle hook",
-      `- **Project:** ${path.basename(config.cwd)}`,
-      "- **Confidence:** low",
-      "",
-      "## Candidate Learnings",
-      ...candidates.map((candidate) => `- ${candidate}`),
-      "",
-      "## Review Note",
-      "Automatically extracted; review before promoting into a maintained wiki concept, procedure, decision, system, or evidence page.",
-    ].join("\n"));
   }
 
   state.writtenHashes = [...state.writtenHashes.slice(-49), hash];
-  return { written: true, hash, candidates };
+  return { written: candidates.length > 0, hash, candidates };
 }
