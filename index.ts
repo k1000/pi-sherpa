@@ -830,13 +830,23 @@ async function curateCandidates(
 
   // Conservative OOD patterns — only the most obvious non-project queries.
   // These are a safety net; the LLM is the primary domain gate.
-  // Only add patterns that are HIGHLY unlikely to appear in any valid project query.
+  // Hard out-of-domain patterns — obvious non-project queries that need no retrieval.
+  // These fire BEFORE calling the LLM, so they save latency and prevent false positives.
   const OOD_PATTERNS = [
-    /\b(capital of\b|\bpresident of|\bgovernment of)\b/i,
-    /\bmy dog\b|\bmy cat\b|\bmy pet\b|\bmy cat\b/i,
-    /\bmeaning of life\b|\bphilosophy\b/i,
-    /\bbrew(ing)? coffee\b|\bhow to brew\b/i,
-    /\bmy wedding\b|\bplan my vacation\b/i,
+    // General world knowledge — never requires project context
+    /\bcapital of\b|\bpresident of\b|\bgovernment\b/i,
+    /\bphotosynthesis\b|\bquantum physics\b|\bevolution\b/i,
+    /\bpoem\b|\bpoetry\b|\bwrite (me )?a (story|poem|song)\b/i,
+    /\bmeaning of life\b/i,
+    /\brestaurant\b|\brecipe\b|\bbrew\b/i,
+    // Personal life advice — never requires project context
+    /\bmy (dog|cat|pet|horse|fish)\b/i,
+    /\b(wedding|honeymoon|anniversary)\b/i,
+    /\bdinner\b|\blunch\b|\bbreakfast\b|\bwhat do I make for\b/i,
+    /\blearning (to play )?(guitar|piano|drums)\b|\b(play|learn) guitar at\b/i,
+    /\bbirthday card for (my |her |his )?mom\b|\bbirthday message\b/i,
+    /\bmy (wife|husband|girlfriend|boyfriend|family|friends?)\b/i,
+    /\b(is it worth|should I) learning\b/i,
   ];
   const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
 
