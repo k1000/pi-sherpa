@@ -45,7 +45,7 @@ export type PreservationDecision = {
 
 // ── Routing ────────────────────────────────────────────────────────────────
 
-function routeReflection(entry: PreservationInput): string {
+export function routeReflection(entry: PreservationInput): string {
   if (entry.hasTarget) return "project";
   const tags = new Set(entry.tags.map((t) => t.toLowerCase()));
   const isTranscendental = TRANSCENDENTAL_TAGS.some((t) => tags.has(t));

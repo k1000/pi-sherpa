@@ -3,7 +3,7 @@
  * Run with: tsx tests/distillation-experiment.test.ts
  */
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createAutoMemoryState, writeAutoMemoryArtifact } from "../lib/auto-memory";
@@ -44,18 +44,13 @@ test("explicit task, automation, and session distillation all produce durable Ob
 
   assert(existsSync(task.skillPath), "task skill missing");
   assert(existsSync(automation.skillPath), "automation skill missing");
-  assert(task.skillPath.startsWith(path.join(memory, "wiki", "procedures")), "task procedure should be in Obsidian semantic wiki");
-  assert(automation.skillPath.startsWith(path.join(memory, "wiki", "procedures")), "automation procedure should be in Obsidian semantic wiki");
+  assert(task.skillPath.startsWith(path.join(vault, "projects", "research", "typescript")), "task procedure should be routed to research domain memory");
+  assert(automation.skillPath.startsWith(path.join(vault, "projects", "research", "typescript")), "automation procedure should be routed to research domain memory");
   assert(!task.skillPath.includes(".pi-memory") && !automation.skillPath.includes(".pi-memory"), "explicit distillation should not use .pi-memory by default");
 
-  assert(agent.written && compact.written && shutdown.written, "session lifecycle distillation should write all events");
-  assert(readdirSync(path.join(memory, "inbox")).length === 3, "session distillation should create three inbox candidate artifacts");
-  assert(scratch.length === 3, "session distillation should emit three scratchpad candidates");
-
-  const journalText = readFileSync(path.join(memory, "journal", new Date().toISOString().slice(0, 10) + ".md"), "utf8");
-  assert(journalText.includes("agent_end"), "journal proof missing agent_end");
-  assert(journalText.includes("session_compact"), "journal proof missing session_compact");
-  assert(journalText.includes("session_shutdown:exit"), "journal proof missing shutdown");
+  assert(!agent.written && !compact.written && !shutdown.written, "deprecated regex extractor should not write lifecycle artifacts");
+  assert(readdirSync(path.join(memory, "inbox")).length === 0, "session distillation should not create regex-derived inbox artifacts");
+  assert(scratch.length === 0, "session distillation should not emit regex-derived scratchpad candidates");
 }));
 
 for (const { name, fn } of tests) {

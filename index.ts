@@ -2,12 +2,9 @@ import { complete, type UserMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import {
-  createAutoMemoryState,
   hashAutoMemory,
   stringifyForAutoMemory,
-  writeAutoMemoryArtifact,
 } from "./lib/auto-memory";
-import type { AutoMemoryState } from "./lib/auto-memory";
 import {
   createAutomationState,
   discoverRunnableAutomations,
@@ -18,15 +15,39 @@ import {
 } from "./lib/automation";
 import type { AutomationState } from "./lib/automation";
 import { getProjectKBBasedir } from "./lib/project-kb";
-import { recallMemory, syncReflectMemory } from "./lib/memory";
-import { writeDistilledSkill } from "./lib/distillation";
-import { evaluatePersistence } from "./lib/preserve";
+import {
+  createBundleId,
+  getBundle,
+  readQualitySummary,
+  readRecentEvaluations,
+  stashBundle,
+  summarizeEvaluations,
+  writeEvaluation,
+  writeQualitySummary,
+  type ContextBundleRecord,
+} from "./lib/evaluation";
+import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
+import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces, writeDspyTrace } from "./lib/dspy";
+import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
+
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
+import { applyEvaluationFeedbackToCandidates, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { writeDistilledSkill } from "./lib/distillation";
+import { assignTiers } from "./lib/progressive-context";
+import { filterActiveSources } from "./lib/conditional-source";
+import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
+import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
+import type { SessionSearchMatch } from "./lib/session-search";
+import { writeNudge } from "./lib/nudge";
+import type { NudgeTarget } from "./lib/nudge";
+import { checkAutoDistill, prepareDistillPayloads, getAutoDistillStatus, markAutoDistillRun } from "./lib/auto-distill";
 import { ensureRouteMap, parseRouteMap } from "./lib/route-map";
+import { searchSemble } from "./lib/semble";
+import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
@@ -45,6 +66,10 @@ function promptFileName(kind: PromptKind) {
   return "AUTOMATION";
 }
 function loadPromptKind(cwd: string, kind: PromptKind, config?: Partial<SherpaConfig>) {
+  if (config?.dspy?.enabled) {
+    const compiled = readCompiledPrompt(cwd, config.dspy.compiledPromptPath ?? ".pi/sherpa/compiled", kind);
+    if (compiled) return { prompt: compiled.prompt, source: `dspy:${compiled.source}` };
+  }
   const promptCfg = config?.prompts?.[kind];
   const projectConfigured = promptCfg?.projectPath ?? `.pi/sherpa/prompts/${promptFileName(kind)}.md`;
   const globalConfigured = promptCfg?.globalPath ?? `prompts/${promptFileName(kind)}.md`;
@@ -63,7 +88,7 @@ function loadSherpaSystemPrompt(cwd: string, config?: Partial<SherpaConfig>) {
 
 
 type Mode = "auto" | "explicit" | "proactive" | "off";
-type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory";
+type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "surreal_memory" | "semble" | "graphify";
 
 type SherpaConfig = {
   enabled: boolean;
@@ -75,11 +100,19 @@ type SherpaConfig = {
   privacy: { allowNetwork: boolean; allowRemoteModel: boolean };
   model: { provider: string; id: string; useMainPiModel: boolean; heuristicOnly: boolean; fallbackToHeuristics: boolean };
   summarization: { maxToolResultChars: number; replacementBudget: number };
-  writeSide: { enabled: boolean; owner: "archivist" | "sherpa" };
   memory: { obsidianVault: string; obsidianMemoryPath: string; scratchpadPath: string };
   web: { enabled: boolean; provider: "brave" | "tavily" | "serpapi"; apiKeyEnv: string; maxResults: number; timeoutMs: number; cacheTtlMs: number };
+  semble: { enabled: boolean; command: string; topK: number; timeoutMs: number };
+  graphify: { enabled: boolean; command: string; graphPath: string; timeoutMs: number; budgetTokens: number; maxLines: number; };
+  memoryStore: { surreal: MemoryApiStoreConfig };
+  surrealMemory: { chainWeightBoost: number; constrainedLimit: number; broadFallbackLimit: number; evidenceDepth: number };
   routeMap: { enabled: boolean; path: string; applyTo: "all" | "front-door" | "explicit" };
   dedupe: { urls: { enabled: boolean; normalize: boolean; scope: "bundle" } };
+  dspy: {
+    enabled: boolean;
+    compiledPromptPath: string;
+    autoCompile: { enabled: boolean; minTraces: number; bundleInterval: number; onEvaluate: boolean; onSessionShutdown: boolean; maxOncePerDay: boolean };
+  };
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
 };
 
@@ -95,7 +128,7 @@ type CurateResult = {
   confidence: number;
   planner: "heuristic" | "llm";
 };
-type ContextBundle = { taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
+type ContextBundle = { bundleId: string; taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
 
 type ContextDisposition =
   | { kind: "answer_directly"; reason: string }
@@ -138,6 +171,11 @@ type ContextSignalV1 = {
   risks: string[];
   missingInfo: string[];
   suggestedCommands: SuggestedCommand[];
+  openingRecommendation?: {
+    likelyUseful: string[];
+    likelyNoise: string[];
+    missingInfoNeeded: string[];
+  };
   renderHints?: { style: "minimal" | "normal" | "detailed"; maxItems?: number };
   diagnostics: { sourcesSearched: string[]; candidateCount: number; selectedCount: number };
 };
@@ -151,7 +189,9 @@ type State = {
   turnCount: number;
   lastProactiveTurn: number;
   feedback: Array<{ used: string[]; unused: string[]; missing: string[]; at: number }>;
-  autoMemory: AutoMemoryState;
+  bundleRecords: Map<string, ContextBundleRecord>;
+  lastBundleId?: string;
+  dspyAuto: { lastCompileAt?: string; lastCompileDate?: string; lastBundleCount: number };
   automation: AutomationState;
   lifecycleHashes: string[];
   systemPrompt: string;
@@ -217,15 +257,19 @@ const DEFAULT_CONFIG: SherpaConfig = {
   frontDoor: { enabled: true, tokenBudget: 1200 },
   explicit: { enabled: true, tokenBudget: 3000 },
   proactive: { enabled: false, tokenBudget: 800, cooldownTurns: 3 },
-  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true },
+  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true, surreal_memory: false, semble: true, graphify: true },
   privacy: { allowNetwork: false, allowRemoteModel: false },
   model: { provider: "olmx", id: "Qwen3.6-35B-A3B-4bit", useMainPiModel: false, heuristicOnly: false, fallbackToHeuristics: true },
   summarization: { maxToolResultChars: 12000, replacementBudget: 1500 },
-  writeSide: { enabled: false, owner: "archivist" },
   memory: { obsidianVault: "/Users/kamil/Documents/articles", obsidianMemoryPath: "projects/project", scratchpadPath: ".pi-memory/scratchpad" },
   web: { enabled: false, provider: "brave", apiKeyEnv: "BRAVE_SEARCH_API_KEY", maxResults: 5, timeoutMs: 5000, cacheTtlMs: 6 * 60 * 60 * 1000 },
-  routeMap: { enabled: true, path: "routes.csv", applyTo: "all" },
+  semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
+  graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
+  memoryStore: { surreal: { enabled: false, mode: "memory-api", url: "http://127.0.0.1:8010", namespace: "pi", database: "memory", userEnv: "SURREAL_USER", passEnv: "SURREAL_PASS" } },
+  surrealMemory: { chainWeightBoost: 0.12, constrainedLimit: 8, broadFallbackLimit: 4, evidenceDepth: 2 },
+  routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
+  dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
   prompts: {
     retrieval: { projectPath: ".pi/sherpa/prompts/RETRIEVAL.md", globalPath: "prompts/RETRIEVAL.md" },
     distillation: { projectPath: ".pi/sherpa/prompts/DISTILLATION.md", globalPath: "prompts/DISTILLATION.md" },
@@ -250,12 +294,6 @@ function loadConfig(cwd: string): SherpaConfig {
 function saveConfig(cwd: string, cfg: SherpaConfig) {
   const p = configPath(cwd); mkdirSync(path.dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
-}
-function sherpaWriteSideEnabled(state: State | undefined) {
-  return Boolean(state?.config.writeSide?.enabled);
-}
-function writeSideMovedMessage() {
-  return "Sherpa write-side bookkeeping is disabled; Archivist owns durable memory/documentation writes. Use archivist_* tools or /archivist:* commands. Sherpa still owns read-side retrieval and scratchpad.";
 }
 function obsidianVaultPath(state: State) {
   return state.config.memory?.obsidianVault || DEFAULT_CONFIG.memory.obsidianVault;
@@ -424,9 +462,32 @@ const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
 const SHERPA_CONTEXT_TYPE = "sherpa-context";
 const CURATION_TIMEOUT_MS = 8_000;
 const SOURCE_PLANNER_TIMEOUT_MS = 1_500;
+const DSPY_COMPILE_MIN_EVALUATIONS = 10;
+const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
+const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
 
 function isCodePrompt(focus: string) {
   return /\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|hook|module|typescript|javascript|python|sql)\b/i.test(focus);
+}
+
+function inferConditionalTaskType(focus: string, mode: string): string | undefined {
+  const f = focus.toLowerCase();
+  if (/\b(debug|diagnose|investigate|error|exception|crash|failing|failed|log)\b/.test(f)) return "debug";
+  if (/\b(architecture|design|topology|dependency|dependencies|call path|relationship|boundary|flow|onboard)\b/.test(f)) return "architecture";
+  if (/\b(refactor|implement|feature|fix|bug|test|typecheck|lint|compile|function|class|api|route|component|module)\b/.test(f)) return "refactor";
+  return mode === "explicit" ? undefined : "code_search";
+}
+
+function enabledSourceSet(state: State): Set<string> {
+  return new Set(Object.entries(state.config.sources).filter(([, enabled]) => Boolean(enabled)).map(([source]) => source));
+}
+
+function applyConditionalSourceActivation(state: State, focus: string, mode: string, sources: Source[]): Source[] {
+  return filterActiveSources(sources, {
+    taskType: inferConditionalTaskType(focus, mode),
+    query: focus,
+    enabledSources: enabledSourceSet(state),
+  }) as Source[];
 }
 
 function isPreloadedContextFile(rel: string) {
@@ -509,12 +570,61 @@ function routeSkipsPath(routePlan: RoutePlan | undefined, p: string) {
   return routePlan.skip.some(s => s && normalized.includes(s.replace(/\\/g, "/").toLowerCase()));
 }
 
+function isSourceLookupPrompt(focus: string) {
+  return /\b(where|which file|what file|implemented|implementation|tested|test covers|exact files?|function names?|code generates|served|stored|configured|connects|downloads|display)\b/i.test(focus);
+}
+
+function isStickyGenericSnippet(item: Pick<ContextItem, "source" | "summary" | "raw" | "type">) {
+  const text = `${item.source}\n${item.summary}\n${item.raw ?? ""}`.toLowerCase();
+  return text.includes("if websocket fails, stick falls back")
+    || text.includes("falls back to get /agent/jobs/{id} polling")
+    || text.includes("sherpa returned low-confidence context instead of abstaining")
+    || text.includes("surface route contamination warnings when route names/paths do not exist");
+}
+
+function permitsRootReadme(focus: string) {
+  return /\b(root\s+readme|readme\.md|eth-lag-alpha|repo overview|project overview)\b/i.test(focus);
+}
+
+function isRootReadmeSource(source: string) {
+  const normalized = source.replace(/\\/g, "/").toLowerCase();
+  return normalized === "repo://readme.md" || normalized.startsWith("repo://readme.md:");
+}
+
+function isGenericNoiseSource(source: string) {
+  const normalized = source.replace(/\\/g, "/").toLowerCase();
+  return normalized === "repo://readme.md"
+    || normalized.endsWith("/readme.md")
+    || normalized.includes("/readme.md:")
+    || normalized.startsWith("file://~/.pi/agent/skills/")
+    || normalized.includes("/wiki/systems/archivist-sherpa-gap-analysis.md");
+}
+
+function sourceCorrespondenceThreshold(focus: string, mode: string) {
+  if (mode !== "front-door") return -Infinity;
+  if (isCodePrompt(focus) || isSourceLookupPrompt(focus)) return 0.16;
+  return 0.08;
+}
+
+function sourceDedupeKey(source: string) {
+  if (source.startsWith("repo://README.md")) return "repo://README.md";
+  return source.replace(/:\d+(?::\d+)?$/, "");
+}
+
 function candidateSortKey(item: ContextItem, focus: string, mode: string) {
-  if (mode !== "front-door" || !isCodePrompt(focus)) return item.relevance;
-  const sourcePriority = item.type === "file_snippet" ? 0.25
-    : item.type === "doc_snippet" ? -0.2
-    : 0;
-  return item.relevance + sourcePriority;
+  const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
+  let value = item.relevance;
+  if (wantsSource) {
+    value += item.type === "file_snippet" || item.type === "file_exact" || item.type === "semantic_code_snippet" ? 0.35
+      : item.type === "doc_snippet" ? -0.25
+      : 0;
+  }
+  if (isRootReadmeSource(item.source) && !permitsRootReadme(focus)) value -= 1.0;
+  if (item.source === "repo://README.md") value -= wantsSource ? 0.35 : 0.15;
+  if (isGenericNoiseSource(item.source)) value -= wantsSource ? 0.3 : 0.12;
+  if (isStickyGenericSnippet(item)) value -= 0.5;
+  if (/repo:\/\/(docs\/sherpa-|\.pi\/sherpa-)/.test(item.source) && !/\bsherpa\b/i.test(focus)) value -= 0.45;
+  return value;
 }
 
 function sessionText(ctx: ExtensionContext) {
@@ -528,8 +638,31 @@ function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[]) {
   return items.filter(i => !text.includes(i.source));
 }
 
+function postProcessCandidates(candidates: ContextItem[], focus: string, mode: string) {
+  const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
+  const sorted = [...candidates].sort((a, b) => candidateSortKey(b, focus, mode) - candidateSortKey(a, focus, mode));
+  const out: ContextItem[] = [];
+  const seen = new Set<string>();
+  let readmeCount = 0;
+  for (const item of sorted) {
+    const key = sourceDedupeKey(item.source);
+    if (seen.has(key)) continue;
+    if (isRootReadmeSource(item.source)) {
+      if (!permitsRootReadme(focus)) continue;
+      if (readmeCount >= 1) continue;
+      if (wantsSource && isStickyGenericSnippet(item)) continue;
+      readmeCount++;
+    }
+    if (candidateSortKey(item, focus, mode) < sourceCorrespondenceThreshold(focus, mode)) continue;
+    if (wantsSource && /repo:\/\/(docs\/sherpa-|\.pi\/sherpa-)/.test(item.source) && !/\bsherpa\b/i.test(focus)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode: string) {
-  return [...candidates].sort((a, b) => candidateSortKey(b, focus, mode) - candidateSortKey(a, focus, mode));
+  return postProcessCandidates(candidates, focus, mode);
 }
 
 function extractJsonArray(text: string): unknown {
@@ -546,17 +679,21 @@ function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
 }
 
-const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "docs", "git", "session", "project_memory", "web"];
+const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "semble", "graphify", "docs", "git", "session", "project_memory", "surreal_memory", "web"];
 
 function normalizeSources(input: string[] | undefined, mode: string): Source[] {
   const allowed = new Set<Source>(mode === "front-door"
-    ? ["files", "docs", "git", "project_memory", "web"]
+    ? ["files", "semble", "graphify", "docs", "git", "project_memory", "surreal_memory", "web"]
     : ALL_RETRIEVAL_SOURCES);
   const out: Source[] = [];
   for (const raw of input ?? []) {
     const s = raw;
     if (allowed.has(s as Source) && !out.includes(s as Source)) out.push(s as Source);
   }
+  // Semble is the default code-search companion. Any plan that searches repo
+  // files should also search Semble unless the project config disables it.
+  if (out.includes("files") && allowed.has("semble") && !out.includes("semble")) out.push("semble");
+  if (out.includes("files") && allowed.has("graphify") && !out.includes("graphify") && /\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|subsystem|boundary|boundaries|community|communities|flow|pipeline)\b/i.test(input?.join(" ") ?? "")) out.push("graphify");
   return out;
 }
 
@@ -585,19 +722,20 @@ function heuristicIndicators(focus: string): string[] {
   return extractSearchTerms(focus, 12);
 }
 
-function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
+export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   const f = focus.toLowerCase();
   const sources: Source[] = [];
   const add = (...ss: Source[]) => { for (const s of ss) if (!sources.includes(s)) sources.push(s); };
 
-  if (/\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|module)\b/.test(f)) add("files");
+  if (/\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|module)\b/.test(f)) add("files", "semble");
   if (/\b(doc|docs|readme|guide|explain|overview|architecture|design|how\s+to|reference|manual)\b/.test(f)) add("docs");
+  if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory", "surreal_memory");
   if (/\b(git|diff|changed|changes|status|staged|unstaged|commit|branch|recent)\b/.test(f)) add("git");
-  if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology)\b/.test(f)) add("project_memory");
+  if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory", "surreal_memory");
   if (/\b(internet|web|online|search\s+web|latest|current|today|recent\s+news|external\s+source|documentation\s+online)\b/.test(f)) add("web");
   if (mode !== "front-door" && /\b(previous|earlier|continue|session|conversation|last\s+time|we\s+discussed)\b/.test(f)) add("session");
 
-  if (!sources.length) add(...(mode === "front-door" ? ["files", "docs"] as Source[] : ["files", "docs", "git", "project_memory"] as Source[]));
+  if (!sources.length) add(...(mode === "front-door" ? ["files", "semble", "docs"] as Source[] : ["files", "semble", "graphify", "docs", "git", "project_memory", "surreal_memory"] as Source[]));
   return { sources, reason: `heuristic matched ${sources.join(", ")}`, confidence: sources.length === 1 ? 0.7 : 0.6, planner: "heuristic" };
 }
 
@@ -705,6 +843,8 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
   }
   const heuristicInds = { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" as const };
 
+  fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
+
   if (state.config.model.heuristicOnly || mode !== "front-door") {
     return { sourcePlan: fallbackPlan, indicators: heuristicInds };
   }
@@ -729,7 +869,11 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
       'Return as JSON: {"indicators":{"indicators":["..."],"reason":"...","confidence":0.0}}',
       "",
       "TASK B — Source selection: Which sources should Sherpa search?",
-      "Available: files, docs, git, project_memory, web.",
+      "Available: files, semble, graphify, docs, git, project_memory, surreal_memory, web.",
+      "Act as a router:",
+      "- If the prompt is clearly reduced to source code, implementation, symbols, tests, errors, or exact files, choose files + semble.",
+      "- If the prompt asks about architecture, topology, call paths, dependencies, relationships, subsystem boundaries, or how X connects to Y, choose graphify + files + semble.",
+      "- If the prompt spans conceptual setup, flows, lifecycles, boundaries, or how code fits into a system, choose graphify + files + semble + project_memory, and docs when durable docs likely help.",
       "Prefer the fewest sources likely to contain the answer.",
       "Choose web only for current/latest/online facts not in the repo.",
       'Also return as JSON: {"sources":{"sources":["..."],"reason":"...","confidence":0.0}}',
@@ -767,7 +911,7 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
       const sourcePlan = parseSourcePlan(rawSources, mode);
       if (sourcePlan?.sources.length) {
         const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
-        return { sourcePlan: { ...sourcePlan, sources: mergedSources, routePlan }, indicators };
+        return { sourcePlan: { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan }, indicators };
       }
     }
     return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner fallback: ${fallbackPlan.reason}` }, indicators };
@@ -789,7 +933,18 @@ async function curateCandidates(
   // HARD GATE: if no candidates are relevant, the result is abstain — nothing goes to the main agent.
   const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
 
-  if (mode !== "front-door" || state.config.model.heuristicOnly || candidates.length <= 1) {
+  if (mode === "front-door" && heuristicOrdered.length === 0) {
+    return {
+      items: [],
+      abstain: true,
+      abstainReason: "no curated candidates correspond to the query after suppression",
+      rejected: [],
+      confidence: 0.3,
+      planner: "heuristic",
+    };
+  }
+
+  if (mode !== "front-door" || state.config.model.heuristicOnly || heuristicOrdered.length <= 1) {
     return {
       items: heuristicOrdered.slice(0, 8),
       abstain: false,
@@ -863,14 +1018,13 @@ async function curateCandidates(
     NOISY_TYPES.has(c.type) ||
     NOISY_PATTERNS.some(p => p.test(c.summary) || (c.raw && p.test(c.raw)));
 
-  const manifest = heuristicOrdered
-    .filter(c => !isNoisy(c))
-    .slice(0, 30)
+  const curationPool = heuristicOrdered.filter(c => !isNoisy(c)).slice(0, 30);
+  const manifest = curationPool
     .map((c, i) => ({
       index: i,
       type: c.type,
       source: c.source,
-      relevance: Number(c.relevance.toFixed(2)),
+      relevance: Number(candidateSortKey(c, focus, mode).toFixed(2)),
       summary: c.summary.slice(0, 500),
       rawExcerpt: (c.raw ?? "").slice(0, 200),
     }));
@@ -976,9 +1130,9 @@ async function curateCandidates(
     const seen = new Set<number>();
     for (const idx of selected) {
       const n = typeof idx === "number" ? idx : Number(idx);
-      if (!Number.isInteger(n) || n < 0 || n >= manifest.length || seen.has(n)) continue;
+      if (!Number.isInteger(n) || n < 0 || n >= curationPool.length || seen.has(n)) continue;
       seen.add(n);
-      picked.push(heuristicOrdered[n]);
+      picked.push(curationPool[n]);
       if (picked.length >= 8) break;
     }
 
@@ -1000,9 +1154,13 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
     throw new Error(`Sherpa model not found: ${state.config.model.provider}/${state.config.model.id}`);
   }
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
+  if (!auth.ok) {
     if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
-    throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+    throw new Error((auth as any).error ?? `Auth failed for ${model.provider}`);
+  }
+  if (!auth.apiKey) {
+    if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
+    throw new Error(`No API key for ${model.provider}`);
   }
   const message: UserMessage = {
     role: "user",
@@ -1065,6 +1223,38 @@ function isSmallEditCandidate(focus: string, items: ContextItem[]) {
   return fileItems.length > 0 && fileItems.length <= 3 && items[0].relevance >= 0.35;
 }
 
+function isLikelyGenericOpeningNoise(item: ContextSignalItem, focus = ""): boolean {
+  const source = item.source.toLowerCase();
+  const f = focus.toLowerCase();
+  const explicitlyNeeded = (source.includes("docs/mission_prompt.md") || source.includes("docs/missions.md")) && /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/.test(f)
+    || (source.includes("documentation-drift") || source.includes("archivist_actionable_solutions.md")) && /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/.test(f)
+    || source.includes("/.pi/agent/skills/") && /\b(skill|skills|agent skill|load skill)\b/.test(f)
+    || source.endsWith("/readme.md") && /\b(readme|overview|onboard|onboarding|project summary)\b/.test(f);
+  if (explicitlyNeeded) return false;
+  return item.relevance < 0.25
+    || source.endsWith("/readme.md")
+    || source.includes("docs/mission_prompt.md")
+    || source.includes("docs/missions.md")
+    || source.includes("documentation-drift")
+    || source.includes("archivist_actionable_solutions.md")
+    || source.includes("/.pi/agent/skills/");
+}
+
+function buildOpeningRecommendation(signal: Omit<ContextSignalV1, "openingRecommendation">): ContextSignalV1["openingRecommendation"] | undefined {
+  const likelyUseful = signal.items
+    .filter((item) => item.relevance >= 0.45 && !isLikelyGenericOpeningNoise(item, signal.focus))
+    .slice(0, 3)
+    .map((item) => `${item.handle} ${item.source}`);
+  const likelyNoise = signal.items
+    .filter((item) => isLikelyGenericOpeningNoise(item, signal.focus))
+    .slice(0, 3)
+    .map((item) => `${item.handle} ${item.source}`);
+  const missingInfoNeeded = [...signal.risks, ...signal.missingInfo].slice(0, 3);
+  if (signal.confidence >= 0.7 && !likelyNoise.length && !missingInfoNeeded.length) return undefined;
+  if (!likelyUseful.length && !likelyNoise.length && !missingInfoNeeded.length) return undefined;
+  return { likelyUseful, likelyNoise, missingInfoNeeded };
+}
+
 function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
   const taskType = inferTaskType(bundle.focus);
   const best = bundle.items[0]?.relevance ?? 0;
@@ -1115,8 +1305,8 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
     };
   }
 
-  return {
-    version: "1",
+  const signalBase = {
+    version: "1" as const,
     focus: bundle.focus,
     taskType,
     confidence,
@@ -1126,9 +1316,10 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
     risks,
     missingInfo,
     suggestedCommands,
-    renderHints: { style: bundle.mode === "front-door" ? "minimal" : "normal", maxItems: 8 },
+    renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 8 },
     diagnostics: { sourcesSearched: bundle.sourcePlan?.sources ?? [], candidateCount: bundle.candidateCount ?? bundle.items.length, selectedCount: bundle.items.length },
   };
+  return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
 }
 
 function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan) {
@@ -1146,18 +1337,146 @@ function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens:
   const commandBlock = signal.suggestedCommands.length
     ? `\n### Suggested validation\n${signal.suggestedCommands.map(c => `- \`${c.command}\` — ${c.reason}`).join("\n")}\n`
     : "";
+  const rec = signal.openingRecommendation;
+  const openingRecommendationBlock = rec && (rec.likelyUseful.length || rec.likelyNoise.length || rec.missingInfoNeeded.length)
+    ? `\n### Opening recommendation\n${[
+        rec.likelyUseful.length ? `- Likely useful: ${rec.likelyUseful.join("; ")}` : "",
+        rec.likelyNoise.length ? `- Treat as likely noise unless task explicitly needs it: ${rec.likelyNoise.join("; ")}` : "",
+        rec.missingInfoNeeded.length ? `- Missing info likely needed: ${rec.missingInfoNeeded.join("; ")}` : "",
+      ].filter(Boolean).join("\n")}\n`
+    : "";
   const items = signal.items.map(i => {
     const body = i.inline
       ? `\n\`\`\`\n${i.inline}\n\`\`\``
       : `\n  ${i.summary}\n  Why: ${i.why}\n  Pointer: ${i.source}. Expand: /sherpa:expand ${i.handle}`;
     return `- **${i.handle}** [${i.type}, ${(i.relevance * 100).toFixed(0)}%] ${i.source}${body}`;
   }).join("\n");
-  return `## Sherpa Context (${mode}, ~${budgetUsedTokens} tokens)${routeLine}${dispositionLine}${proposal}${riskBlock}${commandBlock}\n### Context items\n${items}`;
+  return `## Sherpa Context (${mode}, ~${budgetUsedTokens} tokens)${routeLine}${dispositionLine}${proposal}${riskBlock}${commandBlock}${openingRecommendationBlock}\n### Context items\n${items}`;
 }
 
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
-  return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan);
+  const body = signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan);
+  const tiered = assignTiers(bundle.items, Math.max(bundle.budgetUsedTokens, 1));
+  const tierSummary = tiered.length
+    ? `\n\n### Progressive disclosure\n${[
+        `- L0 references: ${tiered.filter((i) => i.tier === 0).length}`,
+        `- L1 snippets: ${tiered.filter((i) => i.tier === 1).length}`,
+        `- L2 inline/full: ${tiered.filter((i) => i.tier === 2).length}`,
+        "- Expand handles with `/sherpa:expand <handle>` or `expandHandles`.",
+      ].join("\n")}`
+    : "";
+  return `${body}${tierSummary}\n\nBundle: ${bundle.bundleId}`;
+}
+
+function traceItem(item: ContextItem) {
+  return {
+    handle: item.handle,
+    type: item.type,
+    source: item.source,
+    relevance: Number(item.relevance.toFixed(4)),
+    summary: item.summary.slice(0, 1000),
+  };
+}
+
+function traceGenericSourceClass(source: string): string | undefined {
+  const normalized = source.replace(/\\/g, "/").toLowerCase();
+  if (normalized.includes("docs/mission_prompt.md") || normalized.includes("docs/missions.md")) return "mission";
+  if (normalized.includes("documentation-drift") || normalized.includes("archivist_actionable_solutions.md") || normalized.includes("archivist-sherpa-gap-analysis")) return "archivist";
+  if (normalized.includes("/.pi/agent/skills/")) return "skill";
+  if (normalized === "repo://readme.md" || normalized.endsWith("/readme.md") || normalized.includes("/readme.md:")) return "readme";
+  return undefined;
+}
+
+function focusAllowsTraceGenericSource(source: string, focus: string): boolean {
+  const f = focus.toLowerCase();
+  switch (traceGenericSourceClass(source)) {
+    case "mission": return /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/.test(f);
+    case "archivist": return /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/.test(f);
+    case "skill": return /\b(skill|skills|agent skill|load skill)\b/.test(f);
+    case "readme": return /\b(readme|overview|onboard|onboarding|project summary)\b/.test(f);
+    default: return false;
+  }
+}
+
+function traceDecisions(focus: string, candidates: ContextItem[], selected: ContextItem[], curateResult: CurateResult) {
+  const selectedSources = new Set(selected.map((item) => item.source));
+  const curatedRejected = new Map(curateResult.rejected.map((item) => [item.source, item.reason]));
+  return candidates.slice(0, 60).map((candidate) => {
+    const reasons: string[] = [];
+    const generic = traceGenericSourceClass(candidate.source);
+    if (generic) reasons.push(`generic_source:${generic}`);
+    if (generic && !focusAllowsTraceGenericSource(candidate.source, focus)) reasons.push(`focus_does_not_allow_${generic}`);
+    if (candidate.relevance < 0.25) reasons.push("low_relevance");
+    const rejectedReason = curatedRejected.get(candidate.source);
+    if (rejectedReason) reasons.push(`curator:${rejectedReason}`);
+    const isSelected = selectedSources.has(candidate.source);
+    const isSuppressed = !isSelected && Boolean(generic && !focusAllowsTraceGenericSource(candidate.source, focus));
+    const decision = isSelected ? "selected" : isSuppressed ? "suppressed" : "rejected";
+    if (!reasons.length) reasons.push(isSelected ? "selected_by_curator" : "not_selected_by_curator");
+    return { source: candidate.source, finalRelevance: Number(candidate.relevance.toFixed(4)), decision, reasons };
+  });
+}
+
+function traceFeedbackStats(evalsCount: number, qualitySummaryUsed: boolean, decisions: ReturnType<typeof traceDecisions>) {
+  const penaltiesApplied = decisions.filter((d) => d.reasons.some((r) => r.startsWith("generic_source") || r.startsWith("focus_does_not_allow") || r === "low_relevance")).length;
+  const boostsApplied = decisions.filter((d) => d.reasons.some((r) => /boost|missed/.test(r))).length;
+  return { recentEvaluations: evalsCount, qualitySummaryUsed, penaltiesApplied, boostsApplied };
+}
+
+function recordDspyTrace(cwd: string, bundle: ContextBundle, indicators: SearchIndicators, candidates: ContextItem[], curateResult: CurateResult, feedback?: { recentEvaluations?: number; qualitySummaryUsed?: boolean; penaltiesApplied?: number; boostsApplied?: number }) {
+  try {
+    const decisions = traceDecisions(bundle.focus, candidates, bundle.items, curateResult);
+    writeDspyTrace(cwd, {
+      version: 1,
+      at: new Date().toISOString(),
+      bundleId: bundle.bundleId,
+      focus: bundle.focus,
+      mode: bundle.mode,
+      sourcePlan: {
+        sources: bundle.sourcePlan?.sources ?? [],
+        reason: bundle.sourcePlan?.reason ?? "",
+        confidence: bundle.sourcePlan?.confidence ?? 0,
+        planner: bundle.sourcePlan?.planner ?? "unknown",
+      },
+      indicators: {
+        indicators: indicators.indicators,
+        reason: indicators.reason,
+        confidence: indicators.confidence,
+        planner: indicators.planner,
+      },
+      candidateCount: candidates.length,
+      candidates: candidates.slice(0, 60).map(traceItem),
+      selected: bundle.items.map(traceItem),
+      curate: {
+        abstain: curateResult.abstain,
+        abstainReason: curateResult.abstainReason,
+        confidence: curateResult.confidence,
+        planner: curateResult.planner,
+        rejected: curateResult.rejected.slice(0, 60),
+      },
+      decisions,
+      feedback: { ...traceFeedbackStats(0, false, decisions), ...(feedback ?? {}) },
+      disposition: bundle.signal?.disposition.kind,
+    });
+  } catch { /* tracing must never affect retrieval */ }
+}
+
+function stashContextBundle(state: State, bundle: ContextBundle): void {
+  state.lastBundleId = bundle.bundleId;
+  stashBundle(state, {
+    bundleId: bundle.bundleId,
+    timestamp: Date.now(),
+    focus: bundle.focus,
+    mode: bundle.mode,
+    items: bundle.items.map((item) => ({
+      handle: item.handle,
+      type: item.type,
+      source: item.source,
+      summary: item.summary,
+      inline: item.inline,
+    })),
+  });
 }
 
 function fileSnippetAllowed(sourcePath: string, focus: string, mode: string) {
@@ -1172,8 +1491,9 @@ function fileSnippetAllowed(sourcePath: string, focus: string, mode: string) {
   return true;
 }
 
-async function rg(cwd: string, query: string, searchPath = cwd) {
-  const terms = query.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
+async function rg(cwd: string, query: string | string[], searchPath = cwd) {
+  const queryText = Array.isArray(query) ? query.join(" ") : query;
+  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
   if (!terms.length) return "";
   const bundledRg = path.join(cwd, "bin", "rg");
   const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
@@ -1198,6 +1518,148 @@ function webCachePath(cwd: string, query: string, provider: string) {
 
 function conciseWebQuery(focus: string) {
   return focus.replace(/[^\p{L}\p{N}\s._:/-]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+function surrealMemoryStore(state: State) {
+  const cfg = state.config.memoryStore?.surreal;
+  return cfg?.enabled ? new MemoryApiStore(cfg) : undefined;
+}
+
+async function requestQueryEmbedding(text: string): Promise<number[] | undefined> {
+  const apiKey = process.env.EMBEDDING_API_KEY;
+  if (!apiKey || !text.trim()) return undefined;
+  const baseUrl = process.env.EMBEDDING_BASE_URL || "https://api.openai.com/v1";
+  const model = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
+  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/embeddings`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ model, input: [text] }),
+  }).catch(() => undefined);
+  if (!response?.ok) return undefined;
+  const payload = await response.json().catch(() => undefined) as { data?: Array<{ embedding?: number[] }> } | undefined;
+  return payload?.data?.[0]?.embedding?.map(Number);
+}
+
+function surrealArtifactIdFromSource(source: string): string | undefined {
+  if (!source.startsWith("surreal://")) return undefined;
+  return decodeURIComponent(source.slice("surreal://".length));
+}
+
+function associativeMemoryProbes(focus: string, indicators: SearchIndicators): string[] {
+  const probes = [
+    focus,
+    indicators.indicators.join(" "),
+    ...indicators.indicators.slice(0, 6),
+    extractSearchTerms(focus, 8).join(" "),
+  ].map((probe) => probe.replace(/\s+/g, " ").trim()).filter((probe) => probe.length >= 3);
+  return [...new Set(probes)].slice(0, 8);
+}
+
+function inferSurrealMemoryTypes(focus: string): string[] | undefined {
+  const f = focus.toLowerCase();
+  const types = new Set<string>();
+  if (/\b(claim|fact|assertion|invariant|truth)\b/.test(f)) types.add("claim");
+  if (/\b(procedure|workflow|runbook|how\s+to|steps|process)\b/.test(f)) types.add("procedure");
+  if (/\b(decision|rationale|adr|tradeoff)\b/.test(f)) types.add("decision");
+  if (/\b(evidence|commit|source|proof|why)\b/.test(f)) types.add("evidence");
+  if (/\b(file|path|module|component|implementation|code)\b/.test(f)) types.add("source-file");
+  if (/\b(entity|symbol|concept|term|alias)\b/.test(f)) types.add("entity");
+  return types.size ? [...types] : undefined;
+}
+
+function inferSurrealResearchArea(focus: string): string | undefined {
+  const f = focus.toLowerCase();
+  if (/\b(sage|graphrag|rag|agent\s+memory|memory\s+engine|paper|arxiv|research|llm|ai)\b/.test(f)) return "ai";
+  return undefined;
+}
+
+function shouldSearchTranscendentalMemory(focus: string): boolean {
+  return /\b(transcendental|cross-project|global\s+memory|universal|principle|doctrine|meta-memory|wisdom)\b/i.test(focus);
+}
+
+async function searchSurrealAssociativeMemory(state: State, focus: string, indicators: SearchIndicators, project: string): Promise<MemoryResult[]> {
+  const store = surrealMemoryStore(state);
+  if (!store) return [];
+  const merged = new Map<string, MemoryResult>();
+  const probes = associativeMemoryProbes(focus, indicators);
+  const types = inferSurrealMemoryTypes(focus);
+  const area = inferSurrealResearchArea(focus);
+  const includeTranscendental = shouldSearchTranscendentalMemory(focus);
+  const constrainedLimit = Math.max(1, Math.min(30, state.config.surrealMemory?.constrainedLimit ?? DEFAULT_CONFIG.surrealMemory.constrainedLimit));
+  const broadFallbackLimit = Math.max(0, Math.min(20, state.config.surrealMemory?.broadFallbackLimit ?? DEFAULT_CONFIG.surrealMemory.broadFallbackLimit));
+  const queryEmbedding = await requestQueryEmbedding(focus);
+  for (const [index, probe] of probes.entries()) {
+    const embedding = index === 0 ? queryEmbedding : undefined;
+    const projectConstrained = await store.search({ text: probe, project, types, embedding, limit: constrainedLimit }).catch(() => []);
+    const projectBroad = types && broadFallbackLimit ? await store.search({ text: probe, project, embedding, limit: broadFallbackLimit }).catch(() => []) : [];
+    const research = area ? await store.search({ text: probe, area, types, embedding, limit: Math.max(3, Math.floor(constrainedLimit / 2)) }).catch(() => []) : [];
+    const broadResearch = area && broadFallbackLimit ? await store.search({ text: probe, area, embedding, limit: broadFallbackLimit }).catch(() => []) : [];
+    const transcendental = includeTranscendental ? await store.search({ text: probe, scope: "transcendental", types, embedding, limit: Math.max(3, Math.floor(constrainedLimit / 2)) }).catch(() => []) : [];
+    const results = [...projectConstrained, ...projectBroad, ...research, ...broadResearch, ...transcendental];
+    for (const result of results) {
+      const existing = merged.get(result.artifact.id);
+      const scoreBoost = index === 0 ? 0.08 : 0.03;
+      const scored = { ...result, score: Math.min(1, result.score + scoreBoost), reason: `${result.reason}; associative probe: ${probe}` };
+      if (!existing || scored.score > existing.score) merged.set(result.artifact.id, scored);
+    }
+  }
+  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 8);
+}
+
+async function recordSurrealRetrievalFeedback(state: State, bundle: ContextBundleRecord, evalRecord: { noise: string[]; missed: string[]; scores: { relevance: number }; reflection?: string }) {
+  const store = surrealMemoryStore(state);
+  if (!store) return;
+  const selectedIds = (bundle.items ?? []).map((item) => surrealArtifactIdFromSource(item.source)).filter((id): id is string => Boolean(id));
+  if (!selectedIds.length && !evalRecord.missed.length) return;
+  const unusedIds = (bundle.items ?? [])
+    .filter((item) => evalRecord.noise.includes(item.source))
+    .map((item) => surrealArtifactIdFromSource(item.source))
+    .filter((id): id is string => Boolean(id));
+  const usedIds = selectedIds.filter((id) => !unusedIds.includes(id));
+  await store.recordFeedback({
+    query: bundle.focus,
+    selectedIds,
+    usedIds,
+    unusedIds,
+    missing: evalRecord.missed,
+    outcome: evalRecord.scores.relevance >= 0.7 ? "helpful" : evalRecord.scores.relevance >= 0.35 ? "partial" : "unhelpful",
+    notes: evalRecord.reflection,
+    createdAt: new Date().toISOString(),
+  }).catch(() => undefined);
+}
+
+function graphifyGraphPath(cwd: string, cfg: SherpaConfig["graphify"]) {
+  const configured = cfg.graphPath || DEFAULT_CONFIG.graphify.graphPath;
+  return path.isAbsolute(configured) ? configured : path.join(cwd, configured);
+}
+
+function graphifyAllowedForQuery(focus: string) {
+  return /\b(architecture|architectural|topology|graph|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|subsystem|boundary|boundaries|community|communities|flow|pipeline|how\s+.+\s+fits|how\s+.+\s+connects)\b/i.test(focus);
+}
+
+async function searchGraphify(cwd: string, focus: string, cfg: SherpaConfig["graphify"]): Promise<string> {
+  if (!cfg?.enabled || !focus.trim()) return "";
+  const graph = graphifyGraphPath(cwd, cfg);
+  if (!existsSync(graph)) return "";
+  const timeout = Math.max(300, Math.min(10_000, Math.floor(cfg.timeoutMs || 1200)));
+  const budget = String(Math.max(300, Math.min(5000, Math.floor(cfg.budgetTokens || 1200))));
+  try {
+    const { stdout } = await execFileAsync(
+      cfg.command || "graphify",
+      ["query", focus, "--graph", graph, "--budget", budget],
+      { cwd, timeout, maxBuffer: 300_000 },
+    );
+    const lines = stdout.split("\n").map(line => line.trim()).filter(Boolean).slice(0, Math.max(3, Math.min(80, cfg.maxLines || 24)));
+    if (!lines.length) return "";
+    return [
+      "Graphify topology/routing hints. Use these as candidate nodes/files/functions; retrieve concrete code snippets with Semble or exact file reads before editing.",
+      `Graph: ${path.relative(cwd, graph) || graph}`,
+      "",
+      ...lines,
+    ].join("\n");
+  } catch {
+    return "";
+  }
 }
 
 async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Promise<Array<{ title: string; url: string; snippet: string }>> {
@@ -1268,6 +1730,11 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   const retrievalTasks: Promise<void>[] = [];
 
   if (enabled("files")) retrievalTasks.push((async () => {
+    for (const p of explicitPathCandidates(focus, ctx.cwd)) {
+      const exact = readExplicitSource(p);
+      if (exact) add("file_exact", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
+    }
+
     const routeRead = sourcePlan?.routePlan?.read ?? [];
     for (const rel of routeRead) {
       if (routeSkipsPath(sourcePlan?.routePlan, rel)) continue;
@@ -1305,6 +1772,25 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
     }
   })());
 
+  if (enabled("semble") && state.config.semble?.enabled) retrievalTasks.push((async () => {
+    const query = [focus, ...indicators.indicators].join(" ").trim();
+    const results = await searchSemble(ctx.cwd, query, state.config.semble);
+    for (const result of results) {
+      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
+      add(
+        "semantic_code_snippet",
+        `repo://${result.filePath}:${result.startLine}`,
+        result.content,
+        0.4,
+      );
+    }
+  })());
+
+  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) retrievalTasks.push((async () => {
+    const raw = await searchGraphify(ctx.cwd, focus, state.config.graphify);
+    if (raw) add("graphify_code_graph", `graphify://${path.relative(ctx.cwd, graphifyGraphPath(ctx.cwd, state.config.graphify)) || state.config.graphify.graphPath}`, raw, 0.32);
+  })());
+
   if (enabled("docs")) retrievalTasks.push(Promise.resolve().then(() => {
     // AGENTS.md/CLAUDE.md are already discovered and injected by Pi's main
     // context-file loader. Sherpa should not duplicate them in front-door or
@@ -1325,6 +1811,34 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   if (enabled("web")) retrievalTasks.push((async () => {
     const results = await searchWeb(state, ctx, focus);
     for (const r of results) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25);
+  })());
+
+  if (enabled("surreal_memory")) retrievalTasks.push((async () => {
+    const store = surrealMemoryStore(state);
+    if (!store) return;
+    const results = await searchSurrealAssociativeMemory(state, focus, indicators, path.basename(ctx.cwd));
+    for (const result of results) {
+      const evidenceDepth = Math.max(1, Math.min(3, state.config.surrealMemory?.evidenceDepth ?? DEFAULT_CONFIG.surrealMemory.evidenceDepth));
+      const evidenceChain = result.evidenceChain?.length ? result.evidenceChain : await store.retrieveEvidenceChain(result.artifact.id, { depth: evidenceDepth, limit: 10 }).catch(() => []);
+      const chainWeight = Math.max(0, ...evidenceChain.map((step) => Number(step.summary?.match(/weight=([0-9.]+)/)?.[1] ?? 0)));
+      const chain = evidenceChain.length
+        ? `\n\nEvidence chain:\n${evidenceChain.map((step) => `- ${step.from} -[${step.relation}]-> ${step.to}${step.summary ? ` (${step.summary})` : ""}`).join("\n")}`
+        : "";
+      const raw = [
+        `Scope: ${result.artifact.scope}`,
+        result.artifact.project ? `Project: ${result.artifact.project}` : "",
+        result.artifact.area ? `Area: ${result.artifact.area}` : "",
+        `Type: ${result.artifact.type}`,
+        `Title: ${result.artifact.title}`,
+        result.artifact.summary ? `Summary: ${result.artifact.summary}` : "",
+        result.artifact.sourcePath ? `Source: ${result.artifact.sourcePath}` : "",
+        "",
+        result.artifact.text ?? "",
+        chain,
+      ].filter(Boolean).join("\n");
+      const chainWeightBoost = Math.max(0, Math.min(1, state.config.surrealMemory?.chainWeightBoost ?? DEFAULT_CONFIG.surrealMemory.chainWeightBoost));
+      add("surreal_memory", `surreal://${result.artifact.id}`, raw, Math.max(0.28, result.score + (chainWeight * chainWeightBoost)));
+    }
   })());
 
   if (enabled("project_memory")) retrievalTasks.push((async () => {
@@ -1432,7 +1946,70 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
     add("session_recent", "session://recent", recent, 0.05);
   }));
 
+  if (enabled("project_memory")) retrievalTasks.push(Promise.resolve().then(() => {
+    try {
+      const memoryConfig = {
+        scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+        catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+        evaluationRoot: obsidianMemoryPath(state),
+      };
+      indexSherpaMemory(ctx.cwd, memoryConfig);
+      const memoryHits = searchSherpaMemory(ctx.cwd, [focus, ...indicators.indicators].join(" "), 8, memoryConfig);
+      for (const hit of memoryHits) {
+        add(
+          "memory_index",
+          `memory-index://${hit.kind}/${path.relative(ctx.cwd, hit.sourcePath)}`,
+          [
+            `Kind: ${hit.kind}`,
+            `Title: ${hit.title}`,
+            hit.summary ? `Summary: ${hit.summary}` : "",
+            `Source: ${hit.sourcePath}`,
+            "",
+            hit.snippet || hit.summary,
+          ].filter(Boolean).join("\n"),
+          0.24,
+        );
+      }
+    } catch { /* memory index recall is opportunistic */ }
+  }));
+
   await Promise.allSettled(retrievalTasks);
+
+  // Active retry: if first-pass retrieval only produced generic/uncurated context,
+  // try Semble first (the default code-search path), then one bounded raw-query
+  // grep fallback. This gives Stage 3 better candidates without flooding the session.
+  if (mode === "front-door" && enabled("files") && postProcessCandidates(candidates, focus, mode).length === 0) {
+    if (enabled("semble") && state.config.semble?.enabled) {
+      const retrySemble = await searchSemble(ctx.cwd, focus, state.config.semble);
+      for (const result of retrySemble.slice(0, 8)) {
+        if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
+        add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
+      }
+    }
+    const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
+    for (const block of retryOut.split("\n").slice(0, 16)) {
+      if (!block.trim()) continue;
+      const firstColon = block.indexOf(":");
+      const secondColon = firstColon >= 0 ? block.indexOf(":", firstColon + 1) : -1;
+      if (firstColon === -1 || secondColon === -1) continue;
+      const fileAndLine = block.slice(0, secondColon);
+      const content = block.slice(secondColon + 1).trim();
+      if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
+      add("file_snippet", `repo://${fileAndLine}`, content, 0.08);
+    }
+  }
+
+  // Closed-loop feedback: recent post-task evaluations penalize sources that were
+  // repeatedly noise and boost exact filenames that were previously missed.
+  let traceFeedback: { recentEvaluations?: number; qualitySummaryUsed?: boolean } = {};
+  try {
+    const memoryRoot = obsidianMemoryPath(state);
+    const recentEvaluations = readRecentEvaluations(memoryRoot, 200);
+    const qualitySummary = readQualitySummary(memoryRoot);
+    traceFeedback = { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
+    const adjusted = applyEvaluationFeedbackToCandidates(candidates, recentEvaluations, qualitySummary, { focus });
+    candidates.splice(0, candidates.length, ...adjusted);
+  } catch { /* feedback must never affect retrieval availability */ }
 
 // Stage 3: model judges candidates with hard suppression gate.
   const curateResult = await curateCandidates(state, ctx, candidates, focus, mode, indicators);
@@ -1441,6 +2018,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   if (curateResult.abstain) {
     state.bundles++;
     const abstainBundle: ContextBundle = {
+      bundleId: createBundleId(),
       taskId: `sherpa-${Date.now()}`,
       focus,
       mode,
@@ -1450,36 +2028,117 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
       sourcePlan,
     };
     abstainBundle.signal = buildContextSignal(abstainBundle);
+    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, curateResult, traceFeedback);
+    stashContextBundle(state, abstainBundle);
     return abstainBundle;
   }
 
   const items: ContextItem[] = []; let used = 0;
-  for (const c of curateResult.items) {
+  const finalItems = postProcessCandidates(curateResult.items, focus, mode);
+  if (mode === "front-door" && finalItems.length === 0) {
+    state.bundles++;
+    const abstainBundle: ContextBundle = {
+      bundleId: createBundleId(),
+      taskId: `sherpa-${Date.now()}`,
+      focus,
+      mode,
+      budgetUsedTokens: 0,
+      items: [],
+      candidateCount: candidates.length,
+      sourcePlan,
+    };
+    abstainBundle.signal = buildContextSignal(abstainBundle);
+    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, { ...curateResult, abstain: true, abstainReason: "post-curation suppression removed all selected candidates" }, traceFeedback);
+    stashContextBundle(state, abstainBundle);
+    return abstainBundle;
+  }
+  for (const c of finalItems) {
     const t = approxTokens(c.summary) + 30;
     if (used + t <= tokenBudget) { items.push(c); used += t; }
     if (items.length >= 8) break;
   }
   state.bundles++;
-  const bundle: ContextBundle = { taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
+  const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
   bundle.signal = buildContextSignal(bundle);
+  recordDspyTrace(ctx.cwd, bundle, indicators, candidates, curateResult, traceFeedback);
+  stashContextBundle(state, bundle);
   return bundle;
 }
 
-function restoreState(ctx: ExtensionContext, config: SherpaConfig): State {
+type PersistedSherpaState = Partial<Pick<State, "nextHandle" | "bundles" | "feedback" | "automation" | "lifecycleHashes" | "lastBundleId" | "dspyAuto">> & {
+  bundleRecords?: ContextBundleRecord[];
+  config?: SherpaConfig;
+};
+
+function createState(ctx: ExtensionContext, config: SherpaConfig): State {
   const retrievalPrompt = loadPromptKind(ctx.cwd, "retrieval", config);
   const distillPrompt = loadPromptKind(ctx.cwd, "distillation", config);
   const documentationPrompt = loadPromptKind(ctx.cwd, "documentation", config);
   const automationPrompt = loadPromptKind(ctx.cwd, "automation", config);
-  const state: State = { config, handles: new Map(), nextHandle: 1, bundles: 0, lastSkip: "none", turnCount: 0, lastProactiveTurn: -999, feedback: [], autoMemory: createAutoMemoryState(), automation: createAutomationState(), lifecycleHashes: [], systemPrompt: retrievalPrompt.prompt, systemPromptSource: retrievalPrompt.source, retrievalPrompt: retrievalPrompt.prompt, retrievalPromptSource: retrievalPrompt.source, distillPrompt: distillPrompt.prompt, distillPromptSource: distillPrompt.source, documentationPrompt: documentationPrompt.prompt, documentationPromptSource: documentationPrompt.source, automationPrompt: automationPrompt.prompt, automationPromptSource: automationPrompt.source };
+  return {
+    config,
+    handles: new Map(),
+    nextHandle: 1,
+    bundles: 0,
+    lastSkip: "none",
+    turnCount: 0,
+    lastProactiveTurn: -999,
+    feedback: [],
+    bundleRecords: new Map(),
+    dspyAuto: { lastBundleCount: 0 },
+    automation: createAutomationState(),
+    lifecycleHashes: [],
+    systemPrompt: retrievalPrompt.prompt,
+    systemPromptSource: retrievalPrompt.source,
+    retrievalPrompt: retrievalPrompt.prompt,
+    retrievalPromptSource: retrievalPrompt.source,
+    distillPrompt: distillPrompt.prompt,
+    distillPromptSource: distillPrompt.source,
+    documentationPrompt: documentationPrompt.prompt,
+    documentationPromptSource: documentationPrompt.source,
+    automationPrompt: automationPrompt.prompt,
+    automationPromptSource: automationPrompt.source,
+  };
+}
+
+function restoreBundleRecords(records: unknown): Map<string, ContextBundleRecord> {
+  const map = new Map<string, ContextBundleRecord>();
+  if (!Array.isArray(records)) return map;
+  for (const record of records.slice(-20)) {
+    if (record?.bundleId && Array.isArray(record.items)) map.set(record.bundleId, record as ContextBundleRecord);
+  }
+  return map;
+}
+
+function applyPersistedState(state: State, data: PersistedSherpaState): void {
+  state.nextHandle = Math.max(state.nextHandle, data.nextHandle ?? 1);
+  state.bundles = data.bundles ?? state.bundles;
+  state.feedback = data.feedback ?? state.feedback;
+  state.automation = { ...state.automation, ...(data.automation ?? {}) };
+  state.lifecycleHashes = Array.isArray(data.lifecycleHashes) ? data.lifecycleHashes : state.lifecycleHashes;
+  state.lastBundleId = data.lastBundleId ?? state.lastBundleId;
+  state.dspyAuto = { ...state.dspyAuto, ...(data.dspyAuto ?? {}) };
+  state.bundleRecords = restoreBundleRecords(data.bundleRecords);
+}
+
+function serializeState(state: State): PersistedSherpaState {
+  return {
+    nextHandle: state.nextHandle,
+    bundles: state.bundles,
+    feedback: state.feedback,
+    automation: state.automation,
+    lifecycleHashes: state.lifecycleHashes,
+    lastBundleId: state.lastBundleId,
+    dspyAuto: state.dspyAuto,
+    bundleRecords: [...state.bundleRecords.values()],
+    config: state.config,
+  };
+}
+
+function restoreState(ctx: ExtensionContext, config: SherpaConfig): State {
+  const state = createState(ctx, config);
   for (const e of ctx.sessionManager.getEntries() as any[]) {
-    if (e.type === "custom" && e.customType === "ai-sherpa-state" && e.data) {
-      state.nextHandle = Math.max(state.nextHandle, e.data.nextHandle ?? 1);
-      state.bundles = e.data.bundles ?? state.bundles;
-      state.feedback = e.data.feedback ?? state.feedback;
-      state.autoMemory = { ...state.autoMemory, ...(e.data.autoMemory ?? {}) };
-      state.automation = { ...state.automation, ...(e.data.automation ?? {}) };
-      state.lifecycleHashes = Array.isArray(e.data.lifecycleHashes) ? e.data.lifecycleHashes : state.lifecycleHashes;
-    }
+    if (e.type === "custom" && e.customType === "ai-sherpa-state" && e.data) applyPersistedState(state, e.data);
   }
   return state;
 }
@@ -1509,21 +2168,54 @@ function parseGitStatusFiles(status: string) {
   return files;
 }
 
-function recentTurnWrittenFiles(messages: any[] | undefined, cwd: string) {
-  const files = new Set<string>();
+function parseToolArguments(args: unknown): any {
+  if (!args) return {};
+  if (typeof args === "string") {
+    try { return JSON.parse(args); } catch { return {}; }
+  }
+  return typeof args === "object" ? args : {};
+}
+
+function normalizeRepoToolPath(rawPath: unknown, cwd: string): string | undefined {
+  if (typeof rawPath !== "string" || !rawPath) return undefined;
+  const cleaned = rawPath.replace(/^@/, "");
+  const absolute = path.isAbsolute(cleaned) ? cleaned : path.join(cwd, cleaned);
+  const relative = path.relative(cwd, absolute).replace(/\\/g, "/");
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+  return relative;
+}
+
+function collectRecentTaskFileEvidence(messages: any[] | undefined, cwd: string) {
+  const readFiles = new Set<string>();
+  const writtenFiles = new Set<string>();
   for (const msg of messages ?? []) {
     if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
-      if (block?.type !== "toolCall" || !["write", "edit"].includes(block.name)) continue;
-      const rawPath = block.arguments?.path;
-      if (typeof rawPath !== "string" || !rawPath) continue;
-      const cleaned = rawPath.replace(/^@/, "");
-      const absolute = path.isAbsolute(cleaned) ? cleaned : path.join(cwd, cleaned);
-      const relative = path.relative(cwd, absolute).replace(/\\/g, "/");
-      if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) files.add(relative);
+      if (block?.type !== "toolCall") continue;
+      const args = parseToolArguments(block.arguments);
+      const rel = normalizeRepoToolPath(args?.path, cwd);
+      if (!rel) continue;
+      if (["write", "edit"].includes(block.name)) writtenFiles.add(rel);
+      if (block.name === "read") readFiles.add(rel);
     }
   }
+  return { readFiles: [...readFiles], writtenFiles: [...writtenFiles] };
+}
+
+function extractMentionedRepoFiles(text: string, cwd: string) {
+  const files = new Set<string>();
+  const candidates = text.match(/(?:^|[\s`'"(])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)(?=$|[\s`'"),.:;])/g) ?? [];
+  for (const raw of candidates) {
+    const rel = raw.trim().replace(/^[`'"(]+|[`'"),.:;]+$/g, "");
+    if (!rel || rel.includes("://") || rel.startsWith("..")) continue;
+    const p = path.join(cwd, rel);
+    if (existsSync(p)) files.add(rel.replace(/\\/g, "/"));
+  }
   return [...files];
+}
+
+function recentTurnWrittenFiles(messages: any[] | undefined, cwd: string) {
+  return collectRecentTaskFileEvidence(messages, cwd).writtenFiles;
 }
 
 function docSearchTerms(files: string[]) {
@@ -1561,60 +2253,9 @@ function findDocumentationCandidates(cwd: string, changedSourceFiles: string[]) 
   return [...new Set(candidates)].slice(0, 8);
 }
 
-async function auditDocumentationDrift(state: State, ctx: ExtensionContext, changedFilesOverride?: string[]) {
-  const status = await gitChanged(ctx.cwd);
-  const files = changedFilesOverride ?? parseGitStatusFiles(status);
-  const changedSources = files.filter(isSourcePath);
-  if (!changedSources.length) return { needed: false, reason: "no source changes" };
-  const changedDocs = files.filter(isDocumentationPath);
-  if (changedDocs.length) return { needed: false, reason: "documentation changed with source", changedSources, changedDocs };
-
-  const hash = hashAutoMemory(`doc-audit\n${changedSources.sort().join("\n")}`);
-  if (state.autoMemory.docAuditHashes.includes(hash)) return { needed: false, reason: "already audited", changedSources };
-
-  const candidates = findDocumentationCandidates(ctx.cwd, changedSources);
-  appendScratchpadSection(state, ctx.cwd, "todo", [
-    "Sherpa detected source/config changes without documentation changes.",
-    "",
-    "Changed source/config files:",
-    ...changedSources.map(f => `- ${f}`),
-    "",
-    candidates.length ? "Likely documentation to review:" : "No obvious documentation file found; decide whether README/docs need a note.",
-    ...candidates.map(f => `- ${f}`),
-  ].join("\n"), "Documentation drift audit");
-
-  state.autoMemory.docAuditHashes = [...state.autoMemory.docAuditHashes.slice(-49), hash];
-  return { needed: true, hash, changedSources, candidates };
-}
-
-function documentationAuditMessage(audit: { changedSources?: string[]; candidates?: string[] }, promptSource?: string) {
-  const sources = audit.changedSources ?? [];
-  const docs = audit.candidates ?? [];
-  return [
-    "## Sherpa Documentation Audit",
-    "",
-    "Sherpa detected code/config changes without accompanying documentation updates.",
-    "Please review whether docs should be updated before considering the task complete.",
-    "Use the dedicated documentation-maintenance prompt as the policy source for this review.",
-    promptSource ? `Prompt: ${promptSource}` : "Prompt: prompts/DOCUMENTATION.md",
-    "",
-    "### Changed source/config files",
-    ...(sources.length ? sources.map(f => `- ${f}`) : ["- (none listed)"]),
-    "",
-    docs.length ? "### Likely documentation to review" : "### Documentation to review",
-    ...(docs.length ? docs.map(f => `- ${f}`) : ["- No obvious doc file found; check README/docs if behavior or usage changed."]),
-  ].join("\n");
-}
-
 export default function (pi: ExtensionAPI) {
   let state: State | undefined;
-  const persist = () => state && pi.appendEntry("ai-sherpa-state", { nextHandle: state.nextHandle, bundles: state.bundles, feedback: state.feedback, autoMemory: state.autoMemory, automation: state.automation, lifecycleHashes: state.lifecycleHashes, config: state.config });
-  const autoMemoryConfig = (ctx: ExtensionContext) => ({
-    cwd: ctx.cwd,
-    obsidianVault: obsidianVaultPath(state!),
-    obsidianMemoryPath: obsidianMemoryPath(state!),
-    appendScratchpadCandidate: (text: string, title?: string) => appendScratchpadSection(state!, ctx.cwd, "distill_candidate", text, title),
-  });
+  const persist = () => state && pi.appendEntry("ai-sherpa-state", serializeState(state));
   const statusLabel = (text: string) => {
     const singleLine = text.replace(/\s+/g, " ").trim();
     return singleLine.length > 44 ? `${singleLine.slice(0, 41)}...` : singleLine;
@@ -1629,6 +2270,42 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(SHERPA_UI_KEY, state?.config.enabled ? `Sherpa: ${state.config.mode}` : "Sherpa: off");
   };
 
+  const compileDspyCandidate = async (ctx: ExtensionContext, reason: string, notify: boolean, options: { force?: boolean } = {}) => {
+    if (!state?.config.dspy.autoCompile.enabled && !options.force) return { ran: false, reason: "auto compile disabled" };
+    const limit = 2000;
+    const evals = readRecentEvaluations(obsidianMemoryPath(state), limit);
+    const exported = exportDspyDataset(ctx.cwd, evals, { limit });
+    if (exported.traces < state.config.dspy.autoCompile.minTraces) return { ran: false, reason: `need ${state.config.dspy.autoCompile.minTraces} traces; have ${exported.traces}` };
+    if (!options.force) {
+      if (exported.matchedEvaluations < DSPY_COMPILE_MIN_EVALUATIONS) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_EVALUATIONS} matched evaluations; have ${exported.matchedEvaluations}` };
+      if (exported.averageMetric < DSPY_COMPILE_MIN_AVG_METRIC) return { ran: false, reason: `average metric ${exported.averageMetric.toFixed(2)} below ${DSPY_COMPILE_MIN_AVG_METRIC}` };
+      if (exported.highScoringExamples < DSPY_COMPILE_MIN_HIGH_EXAMPLES) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_HIGH_EXAMPLES} high-scoring examples; have ${exported.highScoringExamples}` };
+    }
+    const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
+    const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
+    const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
+    const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
+    const { stdout } = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+    state.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state.bundles };
+    persist();
+    if (notify) ctx.ui.notify([`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
+    return { ran: true, reason, exported };
+  };
+
+  const maybeAutoCompileDspy = async (ctx: ExtensionContext, event: "bundle" | "evaluate" | "session_shutdown") => {
+    if (!state?.config.dspy.autoCompile.enabled) return;
+    const cfg = state.config.dspy.autoCompile;
+    if (event === "evaluate" && !cfg.onEvaluate) return;
+    if (event === "session_shutdown" && !cfg.onSessionShutdown) return;
+    if (event === "bundle" && state.bundles - state.dspyAuto.lastBundleCount < cfg.bundleInterval) return;
+    if (cfg.maxOncePerDay && event !== "evaluate" && state.dspyAuto.lastCompileDate === todayIsoDate()) return;
+    try { await compileDspyCandidate(ctx, event, event !== "bundle"); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (event !== "bundle") ctx.ui.notify(`Sherpa DSPy auto-compile failed: ${message}`, "warning");
+    }
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     state = restoreState(ctx, loadConfig(ctx.cwd));
     getProjectKBBasedir(ctx.cwd);
@@ -1636,83 +2313,139 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
     ctx.ui.setWidget(SHERPA_LEGACY_UI_KEY, undefined);
     setSherpaStatus(ctx);
+    // Index new session log entries for FTS5 search
+    try {
+      const indexed = indexSessionLog(undefined, ctx.cwd);
+      if (indexed > 0) {
+        const total = getIndexedEntryCount(undefined, ctx.cwd);
+        try { ctx.ui.notify(`Sherpa indexed ${indexed} new session entries (${total} total)`, "info"); } catch {}
+      }
+    } catch { /* session search is best-effort at startup */ }
   });
 
-  pi.on("agent_end", async (event, ctx) => {
-    if (!state?.config.enabled || !sherpaWriteSideEnabled(state)) return;
-    const now = Date.now();
-    if (now - state.autoMemory.lastAgentEndAt >= 30_000) {
-      state.autoMemory.lastAgentEndAt = now;
-      const raw = stringifyForAutoMemory(event.messages ?? ctx.sessionManager.getEntries().slice(-12));
-      const result = writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(ctx), "agent_end", raw);
-      if (result.written && result.candidates.length) {
-        ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 memory: ${result.candidates.length} candidate(s)`);
-      }
+  pi.on("agent_end", (event, ctx) => {
+    if (!state?.config.enabled) return;
+    if ((event as { willRetry?: boolean }).willRetry === true) return;
 
-      const automationCandidates = updateAutomationCandidates(state.automation, raw, 3, ctx.cwd);
-      for (const candidate of automationCandidates) {
-        appendScratchpadSection(state, ctx.cwd, "distill_candidate", `${candidate.markdown}\n\nPolicy source: ${state.automationPromptSource}`, "Automation candidate");
-      }
-      if (automationCandidates.length) {
-        ctx.ui.notify(`Sherpa detected ${automationCandidates.length} automation candidate(s)`, "info");
-      }
-    }
+    const cwd = ctx.cwd;
+    const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
 
-    const recentText = stringifyForAutoMemory(event.messages ?? ctx.sessionManager.getEntries().slice(-12));
-    const outcome = classifyTaskOutcome(recentText);
-    const status = await gitChanged(ctx.cwd);
-    const changedFiles = parseGitStatusFiles(status);
-    const lifecycleHash = hashAutoMemory(`lifecycle\n${outcome.outcome}\n${changedFiles.sort().join("\n")}`);
-    if (!state.lifecycleHashes.includes(lifecycleHash) && (changedFiles.length || outcome.outcome !== "unknown")) {
-      const verification = suggestVerificationCommands(changedFiles);
-      appendScratchpadSection(state, ctx.cwd, "observation", [
-        `Outcome: ${outcome.outcome}`,
-        `Reason: ${outcome.reason}`,
-        "",
-        changedFiles.length ? "Changed files:" : "Changed files: none detected",
-        ...changedFiles.slice(0, 30).map((file) => `- ${file}`),
-        "",
-        verification.commands.length ? "Suggested verification:" : "Suggested verification: none",
-        ...verification.commands.map((item) => `- \`${item.command}\` — ${item.reason}`),
-        verification.docsReview ? "- Documentation review recommended." : "- Documentation review not required by heuristic.",
-        verification.routesReview ? "- routes.csv review recommended." : "- routes.csv review not required by heuristic.",
-      ].join("\n"), "Task lifecycle summary");
-      state.lifecycleHashes = [...state.lifecycleHashes.slice(-49), lifecycleHash];
-    }
+    setTimeout(() => {
+      void (async () => {
+        if (!state?.config.enabled) return;
+        try {
+          // Automation candidates
+          const raw = stringifyForAutoMemory(recentMessages);
+          const automationCandidates = updateAutomationCandidates(state.automation, raw, 3, cwd);
+          for (const candidate of automationCandidates) {
+            appendScratchpadSection(state, cwd, "distill_candidate", `${candidate.markdown}\n\nPolicy source: ${state.automationPromptSource}`, "Automation candidate");
+          }
+          if (automationCandidates.length) {
+            try { ctx.ui.notify(`Sherpa detected ${automationCandidates.length} automation candidate(s)`, "info"); } catch {}
+          }
 
-    const compacted = compactScratchpad(scratchpadRootPath(state, ctx.cwd));
-    if (compacted.compacted.length) ctx.ui.notify(`Sherpa compacted scratchpad sections: ${compacted.compacted.join(", ")}`, "info");
+          // Lifecycle observation
+          const recentText = stringifyForAutoMemory(recentMessages);
+          const outcome = classifyTaskOutcome(recentText);
+          const status = await gitChanged(cwd);
+          const changedFiles = parseGitStatusFiles(status);
+          const lifecycleHash = hashAutoMemory(`lifecycle\n${outcome.outcome}\n${changedFiles.sort().join("\n")}`);
+          if (!state.lifecycleHashes.includes(lifecycleHash) && (changedFiles.length || outcome.outcome !== "unknown")) {
+            const verification = suggestVerificationCommands(changedFiles);
+            appendScratchpadSection(state, cwd, "observation", [
+              `Outcome: ${outcome.outcome}`,
+              `Reason: ${outcome.reason}`,
+              "",
+              changedFiles.length ? "Changed files:" : "Changed files: none detected",
+              ...changedFiles.slice(0, 30).map((file) => `- ${file}`),
+              "",
+              verification.commands.length ? "Suggested verification:" : "Suggested verification: none",
+              ...verification.commands.map((item) => `- \`${item.command}\` — ${item.reason}`),
+              verification.docsReview ? "- Documentation review recommended." : "- Documentation review not required by heuristic.",
+            ].join("\n"), "Task lifecycle summary");
+            state.lifecycleHashes = [...state.lifecycleHashes.slice(-49), lifecycleHash];
+          }
 
-    // Only auto-audit docs for files this turn actually edited inside the current repo.
-    // Otherwise stale/unrelated dirty worktrees can interrupt global extension work.
-    const audit = await auditDocumentationDrift(state, ctx, recentTurnWrittenFiles(event.messages, ctx.cwd));
-    if (audit.needed) {
-      ctx.ui.notify("Sherpa detected possible documentation drift", "warning");
-      pi.sendMessage({ customType: "sherpa-doc-audit", content: documentationAuditMessage(audit, state.documentationPromptSource), display: true, details: audit }, { triggerTurn: true, deliverAs: "steer" });
-    }
-    persist();
-  });
+          // Retrieval self-evaluation: compare the most recent Sherpa bundle with the
+          // files the agent actually read/edited plus git-changed files. This creates
+          // durable feedback for DSPy export and immediate relevance/noise weighting.
+          try {
+            const bundle = state.lastBundleId ? getBundle(state, state.lastBundleId) : undefined;
+            if (bundle && Date.now() - bundle.timestamp < 2 * 60 * 60 * 1000) {
+              const evidence = collectRecentTaskFileEvidence(recentMessages, cwd);
+              const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
+              const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
+              if (hasTaskSignal) {
+                const evalRecord = evaluatePostTaskContext({
+                  bundle,
+                  outcome: outcome.outcome,
+                  files: { ...evidence, referencedFiles, changedFiles },
+                  finalText: recentText.slice(-2000),
+                });
+                const memoryRoot = obsidianMemoryPath(state);
+                const target = writeEvaluation(memoryRoot, evalRecord);
+                writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
+                appendScratchpadSection(state, cwd, "observation", [
+                  `Bundle: ${evalRecord.bundleId}`,
+                  `Scores: relevance=${evalRecord.scores.relevance} precision=${evalRecord.scores.precision} recall=${evalRecord.scores.recall}`,
+                  evalRecord.noise.length ? `Noise: ${evalRecord.noise.slice(0, 8).join(", ")}` : "Noise: none detected",
+                  evalRecord.missed.length ? `Missed: ${evalRecord.missed.slice(0, 8).join(", ")}` : "Missed: none detected",
+                  `Hint: ${evalRecord.improvementHint}`,
+                  `Stored: ${path.relative(memoryRoot, target)}`,
+                ].join("\n"), "Sherpa retrieval evaluation");
+                void recordSurrealRetrievalFeedback(state, bundle, evalRecord);
+                void maybeAutoCompileDspy(ctx, "evaluate");
+              }
+            }
+          } catch { /* retrieval evaluation must never affect task completion */ }
 
-  pi.on("session_compact", async (event, ctx) => {
-    if (!state?.config.enabled || !sherpaWriteSideEnabled(state)) return;
-    const raw = stringifyForAutoMemory(event.compactionEntry ?? ctx.sessionManager.getEntries().slice(-20));
-    writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(ctx), "session_compact", raw);
-    persist();
+          // Auto-distillation check
+          try {
+            const scratchpadRoot = scratchpadRootPath(state, cwd);
+            const adConfig = {
+              scratchpadRoot,
+              minChangedFiles: 3,
+              enabled: state.config.enabled,
+            };
+            const adCheck = checkAutoDistill({
+              outcome: outcome.outcome,
+              changedFiles: changedFiles.length,
+              hasDistillCandidates: true,
+            }, adConfig);
+            if (adCheck.shouldTrigger) {
+              const payloads = prepareDistillPayloads(adCheck.newCandidates);
+              const writes = payloads.map((payload) => writeDistilledSkill(payload, cwd, obsidianMemoryPath(state)));
+              appendScratchpadSection(state, cwd, "observation", [
+                `Auto-distill completed: ${adCheck.reason}`,
+                `Domains: ${[...new Set(payloads.map((p) => p.domain))].join(", ")}`,
+                `Candidates: ${payloads.length}`,
+                ...writes.map((w, i) => `${i + 1}. [${w.destination}] ${path.relative(ctx.cwd, w.skillPath)}`),
+              ].join("\n"), "Auto-distill completed");
+              markAutoDistillRun(scratchpadRoot);
+              try { ctx.ui.notify(`Sherpa auto-distilled ${writes.length} candidate(s)`, "info"); } catch {}
+            }
+          } catch { /* auto-distill is best-effort */ }
+
+          // Compact scratchpad
+          const compacted = compactScratchpad(scratchpadRootPath(state, cwd));
+          if (compacted.compacted.length) {
+            try { ctx.ui.notify(`Sherpa compacted scratchpad sections: ${compacted.compacted.join(", ")}`, "info"); } catch {}
+          }
+        } catch (error) {
+          try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
+        }
+      })();
+    }, 0);
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
+    if (state?.config.enabled) await maybeAutoCompileDspy(ctx, "session_shutdown");
+    closeSessionDb();
+    closeSherpaMemoryIndexes();
     ctx.ui.setWidget(SHERPA_UI_KEY, undefined);
     ctx.ui.setStatus(SHERPA_UI_KEY, undefined);
     ctx.ui.setWidget(SHERPA_LEGACY_UI_KEY, undefined);
     ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
-
-    if (!state?.config.enabled || !sherpaWriteSideEnabled(state)) return;
-    const now = Date.now();
-    if (now - state.autoMemory.lastSessionEventAt < 10_000) return;
-    state.autoMemory.lastSessionEventAt = now;
-    const raw = stringifyForAutoMemory({ reason: event.reason, recent: ctx.sessionManager.getEntries().slice(-20) });
-    writeAutoMemoryArtifact(state.autoMemory, autoMemoryConfig(ctx), `session_shutdown:${event.reason}`, raw);
-    persist();
   });
 
   pi.registerTool({
@@ -1721,7 +2454,6 @@ export default function (pi: ExtensionAPI) {
     description: "Run a safe registered project automation from package.json or scripts/. Unsafe or approval-required automations are refused.",
     parameters: runAutomationSchema,
     async execute(_toolCallId, params: RunAutomationParams, _signal, _onUpdate, ctx) {
-      if (!sherpaWriteSideEnabled(state)) return { content: [{ type: "text" as const, text: writeSideMovedMessage() }], details: { movedTo: "archivist_run_automation" } };
       const automation = findRunnableAutomation(ctx.cwd, params.name);
       if (!automation) {
         const available = discoverRunnableAutomations(ctx.cwd)
@@ -1755,8 +2487,168 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Session Search Tool ──
+  const sessionSearchSchema = Type.Object({
+    query: Type.String({ description: "Search query for past sessions (FTS5 full-text search)" }),
+    limit: Type.Optional(Type.Number({ description: "Maximum results (default: 10, max: 100)" })),
+    sessionId: Type.Optional(Type.String({ description: "Optional: load full session by ID" })),
+    listSessions: Type.Optional(Type.Boolean({ description: "If true, list all indexed sessions instead of searching" })),
+  });
+  type SessionSearchParams = Static<typeof sessionSearchSchema>;
+
+  pi.registerTool({
+    name: "sherpa_session_search",
+    label: "Sherpa Session Search",
+    description: "Search past conversations in the session log via FTS5 full-text search. Indexes HyperPod session.jsonl into SQLite for cross-session recall.",
+    promptSnippet: "Search past conversations via FTS5 full-text search across all indexed sessions.",
+    promptGuidelines: [
+      "Use sherpa_session_search when you need to recall a past conversation, solution, or pattern.",
+      "Pass query as a natural language phrase (e.g., 'error pipeline' or 'deploy to production').",
+      "Use sessionId to load all entries for a specific session.",
+      "Use listSessions: true to browse available sessions before searching.",
+    ],
+    parameters: sessionSearchSchema,
+    async execute(_toolCallId, params: SessionSearchParams, _signal, _onUpdate, ctx) {
+      if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+      try {
+        // Index new entries first for fresh data
+        const indexed = indexSessionLog(undefined, ctx.cwd);
+
+        if (params.listSessions) {
+          const sessions = listSessions(undefined, ctx.cwd);
+          const total = getIndexedEntryCount(undefined, ctx.cwd);
+          const lines = sessions.map((s) =>
+            `- **${s.sessionId}**: ${s.entryCount} entries, ${s.firstTs.slice(0, 10)} to ${s.lastTs.slice(0, 10)}`
+          );
+          return {
+            content: [{ type: "text" as const, text: `## Indexed Sessions\nTotal entries: ${total}\n\n${lines.join("\n") || "(no sessions indexed yet)"}` }],
+            details: { sessions, totalEntries: total, indexed },
+          };
+        }
+
+        if (params.sessionId) {
+          const entries = loadSession(params.sessionId, undefined, ctx.cwd);
+          const text = entries.map((e) => `[${e.ts.slice(0, 19)}] ${e.kind}: ${e.text.slice(0, 300)}`).join("\n\n");
+          return {
+            content: [{ type: "text" as const, text: `## Session: ${params.sessionId}\n${entries.length} entries\n\n${text.slice(0, 8000) || "(empty session)"}` }],
+            details: { sessionId: params.sessionId, entries: entries.length, indexed },
+          };
+        }
+
+        const results = searchSessions(params.query, params.limit ?? 10, undefined, ctx.cwd);
+        if (results.length === 0) {
+          const suggestions = ["Try a simpler query (single word or short phrase).", "Use listSessions to browse available sessions first.", "Ensure the session log has entries (PATH/hyperpod-tmp/session.jsonl)."];
+          return {
+            content: [{ type: "text" as const, text: `## No results for "${params.query}"\n\n${suggestions.join("\n")}` }],
+            details: { query: params.query, count: 0, indexed },
+          };
+        }
+        const lines = results.map((r: SessionSearchMatch, i: number) =>
+          `### ${i + 1}. ${r.sessionId} (rank ${r.rank.toFixed(6)})\n**Timestamp:** ${r.ts.slice(0, 19)} | **Kind:** ${r.kind}\n${r.snippet}\n`
+        );
+        return {
+          content: [{ type: "text" as const, text: `## Session Search: "${params.query}"\n${results.length} matches\n\n${lines.join("\n")}` }],
+          details: { query: params.query, count: results.length, results, indexed },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: `Session search error: ${e?.message ?? String(e)}` }], details: { error: e?.message ?? String(e) } };
+      }
+    },
+  });
+
+  // ── SQLite Memory Index Tool ──
+  const memorySearchSchema = Type.Object({
+    query: Type.Optional(Type.String({ description: "Search query for indexed Sherpa memory artifacts" })),
+    limit: Type.Optional(Type.Number({ description: "Maximum search results (default: 10, max: 100)" })),
+    reindex: Type.Optional(Type.Boolean({ description: "Rebuild/update the SQLite memory index before searching" })),
+    statusOnly: Type.Optional(Type.Boolean({ description: "Only return index stats; no search" })),
+  });
+  type MemorySearchParams = Static<typeof memorySearchSchema>;
+
+  pi.registerTool({
+    name: "sherpa_memory_search",
+    label: "Sherpa Memory Search",
+    description: "Index and search Sherpa memory artifacts via SQLite/FTS5 while keeping Markdown/CSV files canonical.",
+    promptSnippet: "Search indexed Sherpa memory artifacts (scratchpad, catalog rows, evaluations) via SQLite/FTS5.",
+    promptGuidelines: [
+      "Use sherpa_memory_search when you need recall across Sherpa scratchpad, catalog rows, or retrieval evaluations.",
+      "Set reindex=true before searching if memory artifacts may have changed recently.",
+      "Use statusOnly=true to inspect index size without searching.",
+    ],
+    parameters: memorySearchSchema,
+    async execute(_toolCallId, params: MemorySearchParams, _signal, _onUpdate, ctx) {
+      if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+      try {
+        const config = {
+          scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+          catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+          evaluationRoot: obsidianMemoryPath(state),
+        };
+        const stats = (params.reindex || params.statusOnly || params.query) ? indexSherpaMemory(ctx.cwd, config) : indexSherpaMemory(ctx.cwd, config);
+        if (params.statusOnly || !params.query?.trim()) {
+          return { content: [{ type: "text" as const, text: `## Sherpa Memory Index\nDocuments: ${stats.documents}\nScratchpad entries: ${stats.scratchpadEntries}\nCatalog entries: ${stats.catalogEntries}\nEvaluations: ${stats.evaluations}\nDedup hashes: ${stats.dedupHashes}\nDB: ${stats.dbPath}` }], details: stats };
+        }
+        const results = searchSherpaMemory(ctx.cwd, params.query, params.limit ?? 10, config);
+        const lines = results.map((r, i) => `### ${i + 1}. ${r.title}\n**Kind:** ${r.kind}\n**Source:** ${r.sourcePath}\n${r.snippet || r.summary}`).join("\n\n");
+        return { content: [{ type: "text" as const, text: `## Sherpa Memory Search: "${params.query}"\n${results.length} result(s)\n\n${lines || "(no matches)"}` }], details: { stats, results } };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: `Sherpa memory search error: ${e?.message ?? String(e)}` }], details: { error: e?.message ?? String(e) } };
+      }
+    },
+  });
+
+  // ── Nudge Tool ──
+  const nudgeSchema = Type.Object({
+    target: Type.Union([Type.Literal("observation"), Type.Literal("distill_candidate")], {
+      description: "Which scratchpad section to write to: observation or distill_candidate",
+    }),
+    content: Type.String({ description: "The observation, lesson, or fact to persist" }),
+    dedupKey: Type.Optional(Type.String({ description: "Optional dedup key to combine with content for dedup matching" })),
+    skipDedup: Type.Optional(Type.Boolean({ description: "Skip deduplication check (default: false)" })),
+  });
+  type NudgeParams = Static<typeof nudgeSchema>;
+
+  pi.registerTool({
+    name: "sherpa_nudge",
+    label: "Sherpa Nudge",
+    description: "Proactively save an observation, preference, environment fact, correction, or convention to the scratchpad. Automatically deduplicates and manages capacity. Ported from Hermes Agent's agent-curated memory with nudges.",
+    promptSnippet: "Save an observation or lesson learned to the Sherpa scratchpad with automatic dedup.",
+    promptGuidelines: [
+      "Use sherpa_nudge when you discover a non-trivial fact about the project, environment, or user preferences.",
+      "Good candidates: environment facts, project conventions, corrections, completed workflows, tool quirks.",
+      "Avoid: trivial facts, easily re-discoverable info, raw data dumps, session-specific ephemera.",
+      "Prefer 'observation' for general facts. Use 'distill_candidate' for procedural knowledge worth archiving.",
+    ],
+    parameters: nudgeSchema,
+    async execute(_toolCallId, params: NudgeParams, _signal, _onUpdate, ctx) {
+      if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+      try {
+        const root = scratchpadRootPath(state, ctx.cwd);
+        const result = writeNudge(
+          params.target as NudgeTarget,
+          params.content,
+          { scratchpadRoot: root },
+          { dedupKey: params.dedupKey, skipDedup: params.skipDedup },
+        );
+        const parts: string[] = [];
+        if (result.written) parts.push("✅ Written");
+        if (result.deduped) parts.push("⏭ Skipped (exact duplicate)");
+        if (result.nearDuplicate) parts.push("⚠ Near-duplicate detected (written but may overlap)");
+        if (result.capacityWarning) parts.push(`📊 ${result.capacityWarning}`);
+        if (result.autoCompacted) parts.push("📦 Section auto-compacted (older entries archived)");
+        parts.push(`📁 ${result.path}`);
+        parts.push(`📝 ${result.entryCount} entries, ${result.usagePercent}% capacity`);
+        return {
+          content: [{ type: "text" as const, text: parts.join("\n") }],
+          details: result,
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text" as const, text: `Nudge error: ${e?.message ?? String(e)}` }], details: { error: e?.message ?? String(e) } };
+      }
+    },
+  });
+
   pi.registerCommand("sherpa:automations", { description: "List safe project automations Sherpa can run", handler: async (_args, ctx) => {
-    if (!sherpaWriteSideEnabled(state)) return ctx.ui.notify(writeSideMovedMessage(), "info");
     const automations = discoverRunnableAutomations(ctx.cwd);
     const lines = automations.map(a => `- ${formatRunnableAutomation(a, state?.automation.runStats[a.name])}`).slice(0, 80);
     ctx.ui.notify(lines.length ? lines.join("\n") : "No project automations discovered", "info");
@@ -1778,7 +2670,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setWidget(SHERPA_UI_KEY, [
         "🤵 Sherpa is curating context…",
         `🧭 Sources: ${sourcePlan.sources.join(", ")} (${sourcePlan.planner})`,
-        `＇　️ Indicators: ${indicators.indicators.slice(0, 5).join(", ")}${indicators.indicators.length > 5 ? "..." : ""}`
+        `＇　️ Indicators: ${indicators.indicators.slice(0, 5).join(", ")}${indicators.indicators.length > 5 ? "..." : ""}`,
         `💡 ${indicators.reason.slice(0, 80)}`
       ]);
 
@@ -1790,6 +2682,7 @@ export default function (pi: ExtensionAPI) {
       ]);
       bundle.items = filterAlreadySeenSources(ctx, bundle.items);
       bundle.signal = buildContextSignal(bundle);
+      void maybeAutoCompileDspy(ctx, "bundle");
       const abstainReason = shouldAbstain(bundle.items, "front-door");
       if (abstainReason) { state.lastSkip = abstainReason; return; }
       ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 injecting ${bundle.items.length} item(s)`);
@@ -1814,7 +2707,8 @@ export default function (pi: ExtensionAPI) {
     const summary = await llmSummarize(ctx, state, text, state.config.summarization.replacementBudget * 4);
     const handle = `ctx-${state.nextHandle++}`;
     state.handles.set(handle, { handle, type: "tool_raw", source: `tool://${event.toolName}/${event.toolCallId}`, relevance: 1, summary, raw: text });
-    return { content: [{ type: "text", text: `Sherpa compressed long ${event.toolName} output into ${handle}.\n\n${summary}\n\nUse /sherpa:expand ${handle} for raw output.` }], details: { ...(event.details ?? {}), sherpaRawHandle: handle, sherpaCompressed: true } };
+    const details = event.details && typeof event.details === "object" ? event.details : {};
+    return { content: [{ type: "text", text: `Sherpa compressed long ${event.toolName} output into ${handle}.\n\n${summary}\n\nUse /sherpa:expand ${handle} for raw output.` }], details: { ...details, sherpaRawHandle: handle, sherpaCompressed: true } };
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -1850,6 +2744,7 @@ export default function (pi: ExtensionAPI) {
         const { sourcePlan, indicators } = await planSources(_state, ctx, params.focus, "explicit", params.sources);
         setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, params.focus);
         const bundle = await buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy });
+        void maybeAutoCompileDspy(ctx, "bundle");
         const extra = expanded.map(i => `\n\n## Expanded ${i.handle}\nSource: ${i.source}\n\n${(i.raw ?? i.summary).slice(0, (params.tokenBudget ?? 3000) * 4)}`).join("");
         persist();
         return { content: [{ type: "text", text: bundleMarkdown(bundle) + extra }], details: bundle };
@@ -1942,7 +2837,7 @@ export default function (pi: ExtensionAPI) {
       if (!text) return;
       const target = appendScratchpadSection(state, ctx.cwd, section, text);
       persist();
-      ctx.ui.notify(`Sherpa scratchpad appended: ${scratchpadRootRelative(state, ctx.cwd, target)}`, "success");
+      ctx.ui.notify(`Sherpa scratchpad appended: ${scratchpadRootRelative(state, ctx.cwd, target)}`, "info");
     },
   });
 
@@ -1956,6 +2851,7 @@ export default function (pi: ExtensionAPI) {
       const { sourcePlan, indicators } = await planSources(state, ctx, focus, "explicit");
       setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, focus);
       const bundle = await buildBundle(state, ctx, focus, "explicit", state.config.explicit.tokenBudget, sourcePlan, indicators);
+      void maybeAutoCompileDspy(ctx, "bundle");
       const abstainReason = shouldAbstain(bundle.items, "explicit");
       if (abstainReason) {
         state.lastSkip = abstainReason;
@@ -1965,7 +2861,7 @@ export default function (pi: ExtensionAPI) {
         persist();
         return;
       }
-      ctx.ui.notify(`Sherpa found ${bundle.items.length} useful items; triggering agent`, "success");
+      ctx.ui.notify(`Sherpa found ${bundle.items.length} useful items; triggering agent`, "info");
       pi.sendMessage({ customType: "sherpa-context", content: bundleMarkdown(bundle), display: true, details: bundle }, { triggerTurn: true, deliverAs: "steer" });
       persist();
     } finally {
@@ -1979,6 +2875,227 @@ export default function (pi: ExtensionAPI) {
     pi.sendMessage({ customType: "sherpa-context", content: `## Expanded ${item.handle}\n${item.source}\n\n${item.raw ?? item.summary}`, display: true, details: item }, { triggerTurn: false, deliverAs: "nextTurn" });
   }});
 
+  pi.registerCommand("sherpa:evaluate", { description: "Record retrieval quality: [bundle-id] [outcome] [relevance] [precision] [recall] [reflection]", handler: async (args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const parsed = parseEvaluationArgs(args, state.lastBundleId, (bundleId) => getBundle(state!, bundleId));
+    if (!parsed.bundleId) return ctx.ui.notify("No recent Sherpa bundle to evaluate", "warning");
+
+    const memoryRoot = obsidianMemoryPath(state);
+    const evalRecord = {
+      bundleId: parsed.bundleId,
+      taskOutcome: parsed.taskOutcome,
+      scores: { relevance: parsed.relevance, precision: parsed.precision, recall: parsed.recall },
+      noise: [],
+      missed: parsed.bundle ? [] : ["bundle not found in recent in-memory records"],
+      reflection: parsed.reflection || defaultEvaluationReflection(parsed.bundleId, parsed.bundle),
+      improvementHint: evaluationImprovementHint(parsed.recall),
+      evaluatedAt: new Date().toISOString(),
+    };
+    const target = writeEvaluation(memoryRoot, evalRecord);
+    writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
+    if (parsed.bundle) void recordSurrealRetrievalFeedback(state, parsed.bundle, evalRecord);
+    ctx.ui.notify(`Sherpa evaluation written: ${path.relative(memoryRoot, target)}`, "info");
+    void maybeAutoCompileDspy(ctx, "evaluate");
+  }});
+
+  pi.registerCommand("sherpa:evals", { description: "Summarize recent Sherpa retrieval evaluations", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const evals = readRecentEvaluations(obsidianMemoryPath(state), 50);
+    ctx.ui.notify(evals.length ? formatEvaluationSummary(evals) : "No Sherpa evaluations found yet", "info");
+  }});
+
+  pi.registerCommand("sherpa:trace-report", { description: "Summarize recent Sherpa raw trace decisions: /sherpa:trace-report [limit]", handler: async (args, ctx) => {
+    const limit = Number(args?.trim()) || 500;
+    const traces = readDspyTraces(ctx.cwd, limit);
+    if (!traces.length) return ctx.ui.notify("No Sherpa traces found yet", "warning");
+    const report = summarizeDspyTraces(traces);
+    const fmt = (items: Array<{ source: string; count: number }>) => items.map((item) => `${item.source}×${item.count}`).join(", ") || "none";
+    const fmtReasons = (items: Array<{ reason: string; count: number }>) => items.map((item) => `${item.reason}×${item.count}`).join(", ") || "none";
+    ctx.ui.notify([
+      `Sherpa trace report: traces=${report.traces}`,
+      `avg candidates=${report.averageCandidates.toFixed(2)}; avg selected=${report.averageSelected.toFixed(2)}; abstentionRate=${report.abstentionRate.toFixed(2)}`,
+      `decisions: selected=${report.decisions.selected}; boosted=${report.decisions.boosted}; rejected=${report.decisions.rejected}; suppressed=${report.decisions.suppressed}`,
+      `top selected: ${fmt(report.topSelected)}`,
+      `top rejected: ${fmt(report.topRejected)}`,
+      `top suppressed: ${fmt(report.topSuppressed)}`,
+      `top reasons: ${fmtReasons(report.topReasons)}`,
+    ].join("\n"), "info");
+  }});
+
+  pi.registerCommand("sherpa:quality", { description: "Write and show the rolling Sherpa retrieval quality summary for this project", handler: async (args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const limit = Number(args?.trim()) || 200;
+    const memoryRoot = obsidianMemoryPath(state);
+    const evals = readRecentEvaluations(memoryRoot, limit);
+    if (!evals.length) return ctx.ui.notify("No Sherpa evaluations found yet", "warning");
+    const target = writeQualitySummary(memoryRoot, evals);
+    const summary = summarizeEvaluations(evals);
+    ctx.ui.notify([
+      `Sherpa quality summary written: ${path.relative(memoryRoot, target)}`,
+      `window=${summary.count}; avg relevance=${summary.averageRelevance.toFixed(2)} precision=${summary.averagePrecision.toFixed(2)} recall=${summary.averageRecall.toFixed(2)}`,
+      `top noise: ${summary.topNoise.slice(0, 5).map(n => `${n.source}×${n.count}`).join(", ") || "none"}`,
+      `top missed: ${summary.topMissed.slice(0, 5).map(m => `${m.pattern}×${m.count}`).join(", ") || "none"}`,
+    ].join("\n"), "info");
+  }});
+
+  pi.registerCommand("sherpa:quality:all", { description: "Refresh and summarize Sherpa retrieval quality summaries across all Obsidian projects", handler: async (args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const limit = Number(args?.trim()) || 200;
+    const projectsRoot = path.join(obsidianVaultPath(state), "projects");
+    if (!existsSync(projectsRoot)) return ctx.ui.notify(`Projects memory root not found: ${projectsRoot}`, "warning");
+    const rows: Array<{ project: string; count: number; relevance: number; precision: number; recall: number; target: string }> = [];
+    for (const name of readdirSync(projectsRoot)) {
+      const projectRoot = path.join(projectsRoot, name);
+      if (!statSync(projectRoot).isDirectory()) continue;
+      const evals = readRecentEvaluations(projectRoot, limit);
+      if (!evals.length) continue;
+      const target = writeQualitySummary(projectRoot, evals);
+      const summary = summarizeEvaluations(evals);
+      rows.push({ project: name, count: summary.count, relevance: summary.averageRelevance, precision: summary.averagePrecision, recall: summary.averageRecall, target });
+    }
+    rows.sort((a, b) => a.relevance - b.relevance || b.count - a.count);
+    ctx.ui.notify(rows.length ? [
+      `Sherpa quality summaries refreshed for ${rows.length} project(s)`,
+      ...rows.slice(0, 20).map((row) => `${row.project}: n=${row.count} rel=${row.relevance.toFixed(2)} prec=${row.precision.toFixed(2)} rec=${row.recall.toFixed(2)}`),
+    ].join("\n") : "No project Sherpa evaluations found", rows.length ? "info" : "warning");
+  }});
+
+  pi.registerCommand("sherpa:dspy:export", { description: "Export Sherpa traces and evaluations as DSPy-style JSONL train/dev datasets", handler: async (args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const limit = Number(args?.trim()) || 2000;
+    const evals = readRecentEvaluations(obsidianMemoryPath(state), limit);
+    const result = exportDspyDataset(ctx.cwd, evals, { limit });
+    ctx.ui.notify([
+      "Sherpa DSPy-style dataset exported",
+      `traces=${result.traces}; matched evaluations=${result.matchedEvaluations}`,
+      `avgMetric=${result.averageMetric.toFixed(2)}; high=${result.highScoringExamples}; low=${result.lowScoringExamples}`,
+      `train=${result.train}; dev=${result.dev}`,
+      `train: ${path.relative(ctx.cwd, result.trainPath)}`,
+      `dev: ${path.relative(ctx.cwd, result.devPath)}`,
+    ].join("\n"), result.traces ? "info" : "warning");
+  }});
+
+  pi.registerCommand("sherpa:dspy:compile", { description: "Export traces/evaluations and compile a retrieval prompt-feedback artifact (pass --force to ignore quality gates)", handler: async (args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const rawArgs = args?.trim() ?? "";
+    const force = /(^|\s)--force(\s|$)/.test(rawArgs);
+    const limit = Number(rawArgs.replace(/--force/g, "").trim()) || 2000;
+    const evals = readRecentEvaluations(obsidianMemoryPath(state), limit);
+    const exported = exportDspyDataset(ctx.cwd, evals, { limit });
+    if (!exported.traces) {
+      ctx.ui.notify("No Sherpa traces found yet. Use Sherpa normally, evaluate bundles, then retry.", "warning");
+      return;
+    }
+    const qualityProblems = [
+      exported.matchedEvaluations < DSPY_COMPILE_MIN_EVALUATIONS ? `need ${DSPY_COMPILE_MIN_EVALUATIONS} matched evaluations; have ${exported.matchedEvaluations}` : "",
+      exported.averageMetric < DSPY_COMPILE_MIN_AVG_METRIC ? `average metric ${exported.averageMetric.toFixed(2)} below ${DSPY_COMPILE_MIN_AVG_METRIC}` : "",
+      exported.highScoringExamples < DSPY_COMPILE_MIN_HIGH_EXAMPLES ? `need ${DSPY_COMPILE_MIN_HIGH_EXAMPLES} high-scoring examples; have ${exported.highScoringExamples}` : "",
+    ].filter(Boolean);
+    if (qualityProblems.length && !force) {
+      ctx.ui.notify([
+        "Sherpa DSPy-style compile skipped: evaluation quality gate failed",
+        ...qualityProblems,
+        "Run /sherpa:dspy:compile --force only to inspect a low-quality candidate; do not promote it.",
+      ].join("\n"), "warning");
+      return;
+    }
+    const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
+    const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
+    const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
+    try {
+      const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
+      const { stdout, stderr } = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+      state = restoreState(ctx, state.config);
+      ctx.ui.notify([
+        force ? "Sherpa DSPy-style candidate compile complete (forced)" : "Sherpa DSPy-style candidate compile complete",
+        `exported train=${exported.train}; dev=${exported.dev}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`,
+        `candidate: ${candidateDir}/retrieval.prompt.json`,
+        "Promote with /sherpa:dspy:promote, then enable with /sherpa:dspy:on.",
+        stdout.trim(),
+        stderr.trim(),
+      ].filter(Boolean).join("\n"), "info");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Sherpa DSPy compile failed: ${message}`, "error");
+    }
+  }});
+
+  pi.registerCommand("sherpa:dspy:eval", { description: "Compare DSPy candidate and active compiled prompt artifacts", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const candidate = readCompiledPrompt(ctx.cwd, ".pi/sherpa/compiled-candidates", "retrieval");
+    const active = readCompiledPrompt(ctx.cwd, state.config.dspy.compiledPromptPath, "retrieval");
+    const metric = (artifact: ReturnType<typeof readCompiledPrompt>) => {
+      const value = artifact?.metadata?.average_metric;
+      return typeof value === "number" ? value : undefined;
+    };
+    const candidateMetric = metric(candidate);
+    const activeMetric = metric(active);
+    const verdict = candidateMetric === undefined
+      ? "candidate has no metric"
+      : activeMetric === undefined
+        ? "candidate is promotable; no active metric to compare"
+        : candidateMetric >= activeMetric
+          ? "candidate metric is >= active metric"
+          : "candidate metric is below active metric; inspect before promoting";
+    ctx.ui.notify([
+      "Sherpa DSPy artifact evaluation",
+      `candidate=${candidate ? candidate.source : "missing"}`,
+      `candidateMetric=${candidateMetric ?? "unknown"}`,
+      `active=${active ? active.source : "missing"}`,
+      `activeMetric=${activeMetric ?? "unknown"}`,
+      `verdict=${verdict}`,
+    ].join("\n"), candidate && (!activeMetric || !candidateMetric || candidateMetric >= activeMetric) ? "info" : "warning");
+  }});
+
+  pi.registerCommand("sherpa:dspy:promote", { description: "Promote compiled DSPy candidate artifacts to the active compiled prompt directory", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const candidate = path.join(ctx.cwd, ".pi", "sherpa", "compiled-candidates", "retrieval.prompt.json");
+    if (!existsSync(candidate)) {
+      ctx.ui.notify("No DSPy candidate found. Run /sherpa:dspy:compile first.", "warning");
+      return;
+    }
+    const targetDir = path.isAbsolute(state.config.dspy.compiledPromptPath) ? state.config.dspy.compiledPromptPath : path.join(ctx.cwd, state.config.dspy.compiledPromptPath);
+    mkdirSync(targetDir, { recursive: true });
+    const target = path.join(targetDir, "retrieval.prompt.json");
+    if (existsSync(target)) {
+      const backup = path.join(targetDir, `retrieval.prompt.${new Date().toISOString().replace(/[:.]/g, "-")}.bak.json`);
+      copyFileSync(target, backup);
+    }
+    copyFileSync(candidate, target);
+    state = restoreState(ctx, state.config);
+    ctx.ui.notify(`Sherpa DSPy candidate promoted: ${path.relative(ctx.cwd, target)}`, "info");
+  }});
+
+  pi.registerCommand("sherpa:dspy:on", { description: "Enable compiled DSPy prompt artifacts", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    state.config.dspy.enabled = true;
+    saveConfig(ctx.cwd, state.config);
+    state = restoreState(ctx, state.config);
+    ctx.ui.notify(`Sherpa DSPy compiled prompts enabled: ${state.config.dspy.compiledPromptPath}`, "info");
+  }});
+
+  pi.registerCommand("sherpa:dspy:off", { description: "Disable compiled DSPy prompt artifacts", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    state.config.dspy.enabled = false;
+    saveConfig(ctx.cwd, state.config);
+    state = restoreState(ctx, state.config);
+    ctx.ui.notify("Sherpa DSPy compiled prompts disabled", "info");
+  }});
+
+  pi.registerCommand("sherpa:dspy:status", { description: "Show DSPy compiled prompt status", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const compiled = readCompiledPrompt(ctx.cwd, state.config.dspy.compiledPromptPath, "retrieval");
+    ctx.ui.notify([
+      `enabled=${state.config.dspy.enabled}`,
+      `compiledPromptPath=${state.config.dspy.compiledPromptPath}`,
+      `retrievalArtifact=${compiled ? compiled.source : "missing or no prompt field"}`,
+      `candidateArtifact=${readCompiledPrompt(ctx.cwd, ".pi/sherpa/compiled-candidates", "retrieval")?.source ?? "missing"}`,
+      `activeRetrievalPrompt=${state.retrievalPromptSource}`,
+      `autoCompile=${state.config.dspy.autoCompile.enabled ? "on" : "off"}; minTraces=${state.config.dspy.autoCompile.minTraces}; bundleInterval=${state.config.dspy.autoCompile.bundleInterval}`,
+      `lastAutoCompile=${state.dspyAuto.lastCompileAt ?? "never"}`,
+    ].join("\n"), compiled ? "info" : "warning");
+  }});
+
   pi.registerCommand("sherpa:status", { description: "Show Sherpa status", handler: async (_args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const configuredModel = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
@@ -1990,22 +3107,9 @@ export default function (pi: ExtensionAPI) {
       `distillPrompt=${state.distillPromptSource}`,
       `documentationPrompt=${state.documentationPromptSource}`,
       `automationPrompt=${state.automationPromptSource}`,
-      `writeSide=${sherpaWriteSideEnabled(state) ? "enabled (legacy Sherpa)" : "disabled (Archivist-owned)"}`,
+      `surrealMemory=${state.config.memoryStore.surreal.enabled ? `${state.config.memoryStore.surreal.url} mode=${state.config.memoryStore.surreal.mode ?? "memory-api"} ns=${state.config.memoryStore.surreal.namespace} db=${state.config.memoryStore.surreal.database}; source=${state.config.sources.surreal_memory ? "on" : "off"}; depth=${state.config.surrealMemory.evidenceDepth}; chainBoost=${state.config.surrealMemory.chainWeightBoost}` : "disabled"}`,
       `lastSkip=${state.lastSkip}`,
     ].join("\n"), "info");
-  }});
-
-  pi.registerCommand("sherpa:docs:audit", { description: "Audit whether changed code/config needs documentation updates", handler: async (_args, ctx) => {
-    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
-    if (!sherpaWriteSideEnabled(state)) return ctx.ui.notify(writeSideMovedMessage(), "info");
-    const audit = await auditDocumentationDrift(state, ctx);
-    persist();
-    if (audit.needed) {
-      ctx.ui.notify("Sherpa detected possible documentation drift", "warning");
-      pi.sendMessage({ customType: "sherpa-doc-audit", content: documentationAuditMessage(audit, state.documentationPromptSource), display: true, details: audit }, { triggerTurn: true, deliverAs: "steer" });
-      return;
-    }
-    ctx.ui.notify(`Sherpa documentation audit: ${audit.reason}`, "info");
   }});
 
   pi.registerCommand("sherpa:prompt", { description: "Show active Sherpa system prompt source", handler: async (_args, ctx) => {
@@ -2018,7 +3122,7 @@ export default function (pi: ExtensionAPI) {
     ].join("\n\n---\n\n"), display: true }, { triggerTurn: false, deliverAs: "nextTurn" });
   }});
 
-  pi.registerCommand("sherpa:on", { description: "Enable Sherpa", handler: async (_args, ctx) => { if (!state) state = restoreState(ctx, loadConfig(ctx.cwd)); state.config.enabled = true; saveConfig(ctx.cwd, state.config); ctx.ui.setStatus("ai-sherpa", `Sherpa: ${state.config.mode}`); ctx.ui.notify("Sherpa enabled", "success"); }});
+  pi.registerCommand("sherpa:on", { description: "Enable Sherpa", handler: async (_args, ctx) => { if (!state) state = restoreState(ctx, loadConfig(ctx.cwd)); state.config.enabled = true; saveConfig(ctx.cwd, state.config); ctx.ui.setStatus("ai-sherpa", `Sherpa: ${state.config.mode}`); ctx.ui.notify("Sherpa enabled", "info"); }});
   pi.registerCommand("sherpa:off", { description: "Disable Sherpa", handler: async (_args, ctx) => { if (!state) state = restoreState(ctx, loadConfig(ctx.cwd)); state.config.enabled = false; saveConfig(ctx.cwd, state.config); ctx.ui.setStatus("ai-sherpa", "Sherpa: off"); ctx.ui.notify("Sherpa disabled", "info"); }});
 
   pi.registerCommand("sherpa:model", { description: "Choose Sherpa LLM model", handler: async (_args, ctx) => {
@@ -2030,7 +3134,7 @@ export default function (pi: ExtensionAPI) {
     state.config.model.heuristicOnly = picked === "heuristic-only";
     state.config.model.useMainPiModel = picked === "use-main-pi-model";
     if (!state.config.model.heuristicOnly && !state.config.model.useMainPiModel) { const [provider, ...rest] = picked.split("/"); state.config.model.provider = provider; state.config.model.id = rest.join("/"); }
-    saveConfig(ctx.cwd, state.config); persist(); ctx.ui.notify(`Sherpa model: ${picked}`, "success");
+    saveConfig(ctx.cwd, state.config); persist(); ctx.ui.notify(`Sherpa model: ${picked}`, "info");
   }});
 
   // ─── Sherpa Preserve Tool ────────────────────────────────────────────
@@ -2096,7 +3200,7 @@ export default function (pi: ExtensionAPI) {
       "",
       `- Daily log: ${path.relative(scratchpadRootPath(state, ctx.cwd), daily)}`,
     ].join("\n"));
-    ctx.ui.notify(`Sherpa checkpoint saved: ${path.relative(scratchpadRootPath(state, ctx.cwd), working)} + ${path.relative(scratchpadRootPath(state, ctx.cwd), daily)}`, "success");
+    ctx.ui.notify(`Sherpa checkpoint saved: ${path.relative(scratchpadRootPath(state, ctx.cwd), working)} + ${path.relative(scratchpadRootPath(state, ctx.cwd), daily)}`, "info");
   }});
 
   pi.registerCommand("sherpa:mistake", { description: "Record a structured project mistake/improvement note to Obsidian", handler: async (args, ctx) => {
@@ -2114,180 +3218,55 @@ export default function (pi: ExtensionAPI) {
     ].join("\n");
     const target = appendScratchpad(state, ctx.cwd, "mistakes.md", entry);
     appendScratchpad(state, ctx.cwd, `sessions/daily/${todayIsoDate()}.md`, `\n## Mistake noted — ${now}\n\n${text.trim()}\n`);
-    ctx.ui.notify(`Sherpa mistake saved: ${path.relative(scratchpadRootPath(state, ctx.cwd), target)}`, "success");
+    ctx.ui.notify(`Sherpa mistake saved: ${path.relative(scratchpadRootPath(state, ctx.cwd), target)}`, "info");
   }});
 
-  function memoryPaths(ctx: ExtensionContext) {
-    return {
-      cwd: ctx.cwd,
-      extensionMemoryDir: SHERPA_MEMORY_DIR,
-      obsidianVault: obsidianVaultPath(state!),
-      obsidianMemoryPath: obsidianMemoryPath(state!),
-    };
-  }
-
-  function parseSyncArgs(args?: string) {
-    const parts = args?.trim() ? args.trim().split(/\s+/) : [];
-    const out: { refId?: string; destination?: string; dryRun?: boolean; since?: string } = {};
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i]!;
-      if (part === "--dry-run") out.dryRun = true;
-      if (part === "--ref-id") out.refId = parts[++i];
-      if (part === "--destination") out.destination = parts[++i];
-      if (part === "--since") out.since = parts[++i];
-    }
-    return out;
-  }
-
-  pi.registerCommand("sherpa:recall", { description: "Recall Sherpa long-term memory", handler: async (args, ctx) => {
+  pi.registerCommand("sherpa:session-search", { description: "Search past sessions via FTS5: /sherpa:session-search <query> [limit]", handler: async (args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
-    const query = args?.trim() || await ctx.ui.input("Sherpa Recall", "Query?");
-    if (!query) return;
-    try {
-      ctx.ui.notify(recallMemory(memoryPaths(ctx), query), "info");
-    } catch (e: any) {
-      ctx.ui.notify(`Sherpa recall failed: ${e.message ?? e}`, "error");
-    }
+    const parts = (args ?? "").trim().split(/\s+(?=\d+$)/);
+    const query = parts.length > 1 ? parts[0]! : (args ?? "").trim();
+    const limit = parts.length > 1 ? parseInt(parts[1]!, 10) : 5;
+    if (!query) { ctx.ui.notify("Usage: /sherpa:session-search <query> [limit]", "warning"); return; }
+    const indexed = indexSessionLog(undefined, ctx.cwd);
+    const results = searchSessions(query, limit, undefined, ctx.cwd);
+    const total = getIndexedEntryCount(undefined, ctx.cwd);
+    if (!results.length) { ctx.ui.notify(`Session search: no results for "${query}" (${total} entries indexed)`, "info"); return; }
+    ctx.ui.notify(
+      `Session search: "${query}" (${results.length} matches)\n` +
+      results.map((r: SessionSearchMatch, i: number) =>
+        `${i + 1}. ${r.sessionId} [${r.ts.slice(0, 19)}] ${r.snippet.slice(0, 80)}`
+      ).join("\n"),
+      "info"
+    );
   }});
 
-  pi.registerCommand("sherpa:sync-reflect", { description: "Sync reflect captures into Sherpa memory", handler: async (args, ctx) => {
+  pi.registerCommand("sherpa:nudge", { description: "Save an observation to scratchpad: /sherpa:nudge <target> <content>", handler: async (args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
-    if (!sherpaWriteSideEnabled(state)) return ctx.ui.notify(writeSideMovedMessage(), "info");
-    try {
-      const result = await syncReflectMemory(memoryPaths(ctx), parseSyncArgs(args));
-      ctx.ui.notify(result, "success");
-    } catch (e: any) {
-      ctx.ui.notify(`Sherpa reflect sync failed: ${e.message ?? e}`, "error");
-    }
+    const parts = (args ?? "").trim().match(/^(observation|distill_candidate)\s+(.+)$/s);
+    if (!parts) { ctx.ui.notify("Usage: /sherpa:nudge observation|distill_candidate <content>", "warning"); return; }
+    const target = parts[1] as NudgeTarget;
+    const content = parts[2]!.trim();
+    const root = scratchpadRootPath(state, ctx.cwd);
+    const result = writeNudge(target, content, { scratchpadRoot: root });
+    const msg: string[] = [];
+    if (result.written) msg.push("✅ Written");
+    if (result.deduped) msg.push("⏭ Skipped (exact duplicate)");
+    if (result.nearDuplicate) msg.push("⚠ Near-duplicate");
+    if (result.capacityWarning) msg.push(`📊 ${result.capacityWarning}`);
+    if (result.autoCompacted) msg.push("📦 Auto-compacted");
+    ctx.ui.notify(msg.join(" | "), "info");
   }});
 
-  // ─── Decision Gate ─────────────────────────────────────────────────
-  // Sherpa evaluates whether something is worth persisting before writing.
+  pi.registerCommand("sherpa:auto-distill:status", { description: "Show auto-distillation status", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const root = scratchpadRootPath(state, ctx.cwd);
+    const status = getAutoDistillStatus({ scratchpadRoot: root, enabled: state.config.enabled });
+    ctx.ui.notify(
+      `Auto-distill: ${status.enabled ? "on" : "off"}${status.suppressed ? " (suppressed)" : ""}`,
+      status.enabled ? "info" : "warning"
+    );
+  }});
 
-  const preserveSchema = Type.Object({
-    refId: Type.String({ description: "Reflect capture ID (e.g. ref_20260322_abc123)" }),
-    type: Type.String({ description: "reflect type: knowledge | process | automation | pattern" }),
-    title: Type.String({ description: "Short title of the reflection" }),
-    summary: Type.String({ description: "Summary or content of the reflection" }),
-    importance: Type.String({ description: "low | medium | high | critical" }),
-    tags: Type.Array(Type.String(), { description: "Tags for routing and search" }),
-    storage: Type.Optional(Type.String({ description: "auto | obsidian | project | scratchpad — overrides Sherpa routing if set" })),
-  });
-
-  pi.registerTool({
-    name: "sherpa_preserve",
-    label: "Sherpa Preserve",
-    description: "Evaluate a reflection for persistence value and route it to the right memory destination. Sherpa runs a decision gate: only persists if it contains structural knowledge worth preserving. Call this after reflect_capture.",
-    parameters: preserveSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!sherpaWriteSideEnabled(state)) return { content: [{ type: "text" as const, text: writeSideMovedMessage() }], details: { movedTo: "archivist_preserve" } };
-      const decision = evaluatePersistence({
-        type: params.type,
-        title: params.title,
-        summary: params.summary,
-        importance: params.importance,
-        tags: params.tags,
-      });
-
-      if (decision.decision === "discard") {
-        return {
-          content: [{
-            type: "text" as const,
-            text: [
-              `🚫 Discarded: "${params.title}"`,
-              ``,
-              `Reason: ${decision.reason}`,
-              `Confidence: ${decision.confidence}`,
-            ].join("\n"),
-          }],
-          details: { decision: "discard", reason: decision.reason, confidence: decision.confidence },
-        };
-      }
-
-      const dest = params.storage && params.storage !== "auto"
-        ? params.storage
-        : decision.destination;
-
-      if (dest === "none") {
-        return {
-          content: [{ type: "text", text: `⏭ Skipped: "${params.title}" — not worth persisting` }],
-          details: { decision: "discard", reason: decision.reason, refId: params.refId },
-        };
-      }
-
-      const syncResult = await syncReflectMemory(memoryPaths(ctx), { refId: params.refId, destination: dest });
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: [
-            `✅ Persisted: "${params.title}"`,
-            ``,
-            `Destination: ${dest}`,
-            `Confidence: ${decision.confidence}`,
-            ``,
-            `Reason: ${decision.reason}`,
-            ``,
-            syncResult,
-          ].join("\n"),
-        }],
-        details: { decision: "persist", destination: dest, refId: params.refId, confidence: decision.confidence },
-      };
-    },
-  });
-
-  // ─── Sherpa Distill Tool ────────────────────────────────────────────
-  // Evolves prompts, skills, MCP definitions, and behavioral rules from failures.
-
-  const distillSchema = Type.Object({
-    trigger: Type.String({ description: "What triggered this distillation: success | failure | pattern" }),
-    task: Type.String({ description: "What was being attempted" }),
-    outcome: Type.String({ description: "What happened — success, partial, or failure details" }),
-    context: Type.Optional(Type.String({ description: "What led to this outcome" })),
-    domain: Type.Optional(Type.String({ description: "Domain: python, typescript, git, trading, etc." })),
-    existingSkill: Type.Optional(Type.String({ description: "Name of an existing skill to update/improve" })),
-    tags: Type.Optional(Type.Array(Type.String(), { description: "Tags for routing/update matching" })),
-    operation: Type.Optional(Type.String({ description: "auto | create | update" })),
-    mergePolicy: Type.Optional(Type.String({ description: "deterministic | llm | manual" })),
-    targetPath: Type.Optional(Type.String({ description: "Existing memory path to update" })),
-    targetId: Type.Optional(Type.String({ description: "Existing memory id to update" })),
-  });
-
-  pi.registerTool({
-    name: "sherpa_distill",
-    label: "Sherpa Distill",
-    description: "Evolve prompts, skills, MCP definitions, and behavioral rules from failures and successes.",
-    parameters: distillSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!sherpaWriteSideEnabled(state)) return { content: [{ type: "text" as const, text: writeSideMovedMessage() }], details: { movedTo: "archivist_distill" } };
-      const distill = writeDistilledSkill({
-        trigger: params.trigger,
-        task: params.task,
-        outcome: params.outcome,
-        context: params.context,
-        domain: params.domain,
-        targetPath: params.targetPath,
-      }, ctx.cwd, obsidianMemoryPath(state!));
-      const { slug, skillPath } = distill;
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: [
-            `🧪 Distilled: ${params.task}`,
-            "",
-            `Trigger: ${params.trigger}`,
-            `Domain: ${params.domain ?? "general"}`,
-            `Scope: ${distill.destination === "explicit" ? "explicit target" : "obsidian project memory"}`,
-            `Skill: ${skillPath}`,
-            "",
-            `**Lesson:** ${params.outcome.slice(0, 300)}`,
-          ].join("\n"),
-        }],
-        details: { trigger: params.trigger, domain: params.domain, slug, skillPath, destination: distill.destination },
-      };
-    },
-  });
   pi.registerCommand("sherpa:settings", { description: "Configure Sherpa", handler: async (_args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const picked = await ctx.ui.select("Sherpa setting", ["mode:auto", "mode:explicit", "mode:proactive", "mode:off", "toggle front-door", "toggle proactive", "choose model"]);
@@ -2296,6 +3275,6 @@ export default function (pi: ExtensionAPI) {
     if (picked === "toggle front-door") state.config.frontDoor.enabled = !state.config.frontDoor.enabled;
     if (picked === "toggle proactive") state.config.proactive.enabled = !state.config.proactive.enabled;
     saveConfig(ctx.cwd, state.config); ctx.ui.setStatus("ai-sherpa", `Sherpa: ${state.config.enabled ? state.config.mode : "off"}`);
-    if (picked === "choose model") pi.sendUserMessage("/sherpa:model", { deliverAs: "followUp" }); else ctx.ui.notify("Sherpa settings saved", "success");
+    if (picked === "choose model") pi.sendUserMessage("/sherpa:model", { deliverAs: "followUp" }); else ctx.ui.notify("Sherpa settings saved", "info");
   }});
 }

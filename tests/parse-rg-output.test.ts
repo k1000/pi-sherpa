@@ -196,7 +196,7 @@ test("rg: finds Sherpa-related files", async () => {
     const output = await rg("/Users/kamil/.pi/agent", "Sherpa");
     assert(output.length > 0, "Should find Sherpa in files");
     assert(output.includes("Sherpa"), "Output should contain 'Sherpa'");
-    assert(output.includes(".ts:"), "Output should contain file:line format");
+    assert(/:\d+:/.test(output), "Output should contain file:line format");
 });
 
 // TEST 10: rg with no matches returns empty

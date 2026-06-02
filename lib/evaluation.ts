@@ -31,6 +31,7 @@ export type ContextEvaluation = {
 };
 
 const EVAL_DIR = "wiki/evidence/sherpa-evaluations";
+const QUALITY_SUMMARY_PATH = "wiki/evidence/sherpa-quality-summary.json";
 
 export function createBundleId(): string {
   return `bundle-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -127,6 +128,7 @@ function tryParseArray(raw: string | undefined): string[] {
 }
 
 export function summarizeEvaluations(evals: ContextEvaluation[]): {
+  count: number;
   averageRelevance: number;
   averagePrecision: number;
   averageRecall: number;
@@ -149,6 +151,7 @@ export function summarizeEvaluations(evals: ContextEvaluation[]): {
   for (const e of evals) if (e.improvementHint) hintCounts.set(e.improvementHint, (hintCounts.get(e.improvementHint) ?? 0) + 1);
 
   return {
+    count: evals.length,
     averageRelevance: avg(relevanceScores),
     averagePrecision: avg(precisionScores),
     averageRecall: avg(recallScores),
@@ -156,4 +159,33 @@ export function summarizeEvaluations(evals: ContextEvaluation[]): {
     topMissed: [...missedCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([pattern, count]) => ({ pattern, count })),
     topHints: [...hintCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([hint, count]) => ({ hint, count })),
   };
+}
+
+export type SherpaQualitySummary = ReturnType<typeof summarizeEvaluations> & {
+  generatedAt: string;
+  window: number;
+};
+
+export function writeQualitySummary(projectRoot: string, evals: ContextEvaluation[]): string {
+  const target = path.join(projectRoot, QUALITY_SUMMARY_PATH);
+  mkdirSync(path.dirname(target), { recursive: true });
+  const summary: SherpaQualitySummary = {
+    generatedAt: new Date().toISOString(),
+    window: evals.length,
+    ...summarizeEvaluations(evals),
+  };
+  writeFileSync(target, JSON.stringify(summary, null, 2));
+  return target;
+}
+
+export function readQualitySummary(projectRoot: string): SherpaQualitySummary | undefined {
+  const target = path.join(projectRoot, QUALITY_SUMMARY_PATH);
+  if (!existsSync(target)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(target, "utf8")) as SherpaQualitySummary;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.topNoise) || !Array.isArray(parsed.topMissed)) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
 }

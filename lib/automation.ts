@@ -182,7 +182,7 @@ function detectProjectLanguage(cwd: string): "typescript" | "javascript" | "pyth
     try {
       const pkg = JSON.parse(readFileSync(path.join(cwd, "package.json"), "utf8"));
       const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
-      if (pkg.type === "module" || deps.typescript || deps.tsx || deps.ts-node) return "typescript";
+      if (pkg.type === "module" || deps.typescript || deps.tsx || deps["ts-node"]) return "typescript";
     } catch {
       // ignore malformed package.json
     }

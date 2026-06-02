@@ -4,7 +4,7 @@ import path from "node:path";
 export type CatalogRow = Record<string, string>;
 export type ScoredRow = { row: CatalogRow; relevance: number };
 
-function parseCsvLine(line: string): string[] {
+export function parseCsvLine(line: string): string[] {
   const cells: string[] = [];
   let current = "";
   let quoted = false;
@@ -23,9 +23,8 @@ export function csvCell(value: string): string {
   return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 
-export function readCsvRows(target: string): CatalogRow[] {
-  if (!existsSync(target)) return [];
-  const lines = readFileSync(target, "utf8").split(/\r?\n/).filter((line) => line.trim());
+export function parseCsvRows(raw: string): CatalogRow[] {
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim());
   if (lines.length < 2) return [];
   const header = parseCsvLine(lines[0]!).map((cell) => cell.trim());
   return lines.slice(1).map((line) => {
@@ -34,6 +33,11 @@ export function readCsvRows(target: string): CatalogRow[] {
     header.forEach((key, index) => { row[key] = cells[index] ?? ""; });
     return row;
   });
+}
+
+export function readCsvRows(target: string): CatalogRow[] {
+  if (!existsSync(target)) return [];
+  return parseCsvRows(readFileSync(target, "utf8"));
 }
 
 export function readProjectCatalog(projectRoot: string): CatalogRow[] {
@@ -83,6 +87,63 @@ export function catalogMatches(
 
 export function readGlobalTaxonomy(): CatalogRow[] {
   return readCsvRows("/Users/kamil/Documents/articles/taxonomy.csv").filter((row) => row.kind && row.id);
+}
+
+export type CatalogRouteEntry = {
+  name: string;
+  triggers: string[];
+  read: string[];
+  docs: string[];
+  skip: string[];
+};
+
+export function splitCatalogListCell(value: string): string[] {
+  return value.split("|").map((item) => item.trim()).filter(Boolean);
+}
+
+export function catalogRouteTriggers(row: CatalogRow): string[] {
+  const triggers = new Set<string>();
+  for (const value of [row.routes, row.keywords, row.aliases, row.tags, row.title, row.id]) {
+    for (const pipePart of splitCatalogListCell(value || "")) {
+      const trimmed = pipePart.trim();
+      if (!trimmed) continue;
+      triggers.add(trimmed);
+      if (!trimmed.includes(" ")) continue;
+      for (const word of trimmed.split(/\s+/).map((w) => w.trim()).filter((w) => w.length > 2)) {
+        triggers.add(word);
+      }
+    }
+  }
+  return [...triggers];
+}
+
+export function normalizeCatalogRouteSource(value: string): string {
+  return value.replace(/^(repo|skip):\/\//, "").replace(/^skip:/, "").trim();
+}
+
+export function catalogRowRouteSources(row: CatalogRow): Pick<CatalogRouteEntry, "read" | "docs"> {
+  const rawPath = (row.path || "").trim();
+  if (!rawPath) return { read: [], docs: [] };
+  if (/^https?:\/\//i.test(rawPath)) return { read: [], docs: [rawPath] };
+  const rel = normalizeCatalogRouteSource(rawPath);
+  const lower = rel.toLowerCase();
+  if (/\.mdx?$/i.test(lower) || lower === "readme.md" || lower.startsWith("docs/")) {
+    return { read: [], docs: [rel] };
+  }
+  return { read: [rel], docs: [] };
+}
+
+export function catalogRowsToRouteEntries(rows: CatalogRow[]): CatalogRouteEntry[] {
+  return rows.map((row) => {
+    const { read, docs } = catalogRowRouteSources(row);
+    return {
+      name: row.title?.trim() || row.id?.trim() || "Catalog route",
+      triggers: catalogRouteTriggers(row),
+      read,
+      docs,
+      skip: splitCatalogListCell(row.skip || ""),
+    };
+  }).filter((route) => (route.read.length || route.docs.length) && route.triggers.length);
 }
 
 export const DEFAULT_CATALOG_HEADER = [

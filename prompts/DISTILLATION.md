@@ -64,7 +64,7 @@ Choose the strongest semantic home:
 | `inbox` | `inbox/auto-candidates.md` or `inbox/<slug>.md` | Uncertain candidates that need review before promotion |
 | `source` | `sources/...` | External source material: papers, articles, third-party reports. Repo docs stay in the repo. |
 
-Journal and inbox entries are not final homes for durable conclusions. Promote stable conclusions into `wiki/` pages.
+Journal and inbox entries are not final homes for durable conclusions. Promote stable project conclusions into `wiki/` pages. Cross-project research domains (for example `typescript`, `python`, `trading`, or `ai`) may route to `research/<area>/` instead of the project wiki.
 
 ## Preserve Only If
 

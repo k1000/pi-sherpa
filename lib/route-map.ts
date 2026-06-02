@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { catalogRowsToRouteEntries, parseCsvRows } from "./catalog";
 
 export type RoutePlan = {
   name: string;
@@ -15,7 +16,7 @@ export type RouteMapConfig = {
   path?: string;
 };
 
-const DEFAULT_ROUTE_MAP_PATH = "routes.csv";
+const DEFAULT_ROUTE_MAP_PATH = "catalog.csv";
 
 function pathExists(cwd: string, rel: string) {
   return existsSync(path.join(cwd, rel));
@@ -223,6 +224,7 @@ export function ensureRouteMap(config: RouteMapConfig | undefined, cwd: string) 
   const configured = config.path || DEFAULT_ROUTE_MAP_PATH;
   const routePath = path.isAbsolute(configured) ? configured : path.join(cwd, configured);
   if (existsSync(routePath)) return;
+  if (path.basename(configured) === "catalog.csv") return;
   mkdirSync(path.dirname(routePath), { recursive: true });
   writeFileSync(routePath, buildRouteMap(cwd));
 }
@@ -292,6 +294,10 @@ function splitListCell(value: string) {
   return value.split("|").map((item) => item.trim()).filter(Boolean);
 }
 
+function parseCatalogCsv(raw: string): RoutePlan[] {
+  return catalogRowsToRouteEntries(parseCsvRows(raw)).map((route) => ({ ...route, score: 0 }));
+}
+
 function parseRouteCsv(raw: string): RoutePlan[] {
   const lines = raw.split(/\r?\n/).filter((line) => line.trim());
   if (!lines.length) return [];
@@ -351,5 +357,6 @@ function parseRouteMarkdown(raw: string): RoutePlan[] {
 export function parseRouteMap(raw: string): RoutePlan[] {
   const firstLine = raw.split(/\r?\n/).find((line) => line.trim())?.trim().toLowerCase() || "";
   if (firstLine.startsWith("name,") || firstLine.includes(",triggers,")) return parseRouteCsv(raw);
+  if (firstLine.startsWith("id,") && firstLine.includes(",path,") && (firstLine.includes(",routes,") || firstLine.includes(",keywords"))) return parseCatalogCsv(raw);
   return parseRouteMarkdown(raw);
 }

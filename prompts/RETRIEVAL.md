@@ -29,10 +29,18 @@ The three stages are enforced by the Sherpa extension code. The model prompt in 
 
 ## Rules
 
-- **Stage 1 drives Stage 2**: search is always based on inferred indicators, not raw keywords.
+- **Stage 1 drives Stage 2**: search is usually based on inferred indicators, not raw keywords.
+  Exception: if the user provides an absolute path, repo-relative path, filename, symbol, or handle,
+  retrieve that exact source first and rank it above fuzzy project-orientation matches.
 - **Stage 3 is a hard gate**: if the model finds no relevant candidates, Sherpa abstains entirely.
   Irrelevant context must NOT be presented to the main agent.
 - Prefer precise source pointers over large dumps.
+- **Semble and Graphify are complementary code-retrieval mechanisms**:
+  - Use **Semble** as the default source-snippet delivery mechanism for code, implementation, symbol, test, bug, refactor, or exact-file tasks. Semble returns concrete snippets with file/line pointers that are ready for the main agent.
+  - Use **Graphify** as the topology/routing mechanism when the query asks about architecture, call paths, dependencies, relationships, subsystem boundaries, communities, or "how does X connect to Y?" Graphify is fast after graph build and is best for finding connected nodes/files/functions.
+  - For architectural code questions, use Graphify first to identify candidate nodes/files/functions, then use Semble or exact file reads to retrieve concrete snippets. Do not return raw Graphify node dumps as final context unless the user explicitly asks for graph output.
+  - Grep/ripgrep remains a fallback/complement for exact literals, absence checks, and cases where Semble/Graphify are unavailable or stale.
+- Do not return `package.json`, AGENTS files, or broad README snippets for an exact-file query unless they directly explain that file.
 - Use one canonical `source` pointer; do not duplicate path/line/url fields.
 - Inline only small snippets that are directly useful.
 - Use `catalog.csv` as the sole navigation surface. It is the semantic registry.
