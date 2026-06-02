@@ -169,6 +169,105 @@ function getEntryCount(root: string, target: NudgeTarget): number {
 
 // ── Main API ────────────────────────────────────────────────────────
 
+type WriteNudgeOptions = {
+  /** Optional dedup key to combine with content for dedup. Default: content itself */
+  dedupKey?: string;
+  /** Skip dedup check. Default: false */
+  skipDedup?: boolean;
+};
+
+type NudgeRuntime = {
+  root: string;
+  warnBytes: number;
+  compactBytes: number;
+  compactTarget: number;
+  path: string;
+  currentSize: number;
+  usagePercent: number;
+};
+
+function nudgeRuntime(target: NudgeTarget, config: NudgeConfig): NudgeRuntime {
+  const root = config.scratchpadRoot;
+  const sectionsDir = path.join(root, "sections");
+  if (!existsSync(sectionsDir)) mkdirSync(sectionsDir, { recursive: true });
+  const warnBytes = config.warnThresholdBytes ?? DEFAULT_WARN_THRESHOLD;
+  return {
+    root,
+    warnBytes,
+    compactBytes: config.compactThresholdBytes ?? DEFAULT_COMPACT_THRESHOLD,
+    compactTarget: config.compactTargetBytes ?? DEFAULT_COMPACT_TARGET,
+    path: sectionPath(root, target),
+    currentSize: getSectionSize(root, target),
+    usagePercent: Math.round((getSectionSize(root, target) / warnBytes) * 100),
+  };
+}
+
+function nudgeDigestKey(content: string, options?: WriteNudgeOptions): string {
+  return options?.dedupKey ? `${content}||${options.dedupKey}` : content;
+}
+
+function dedupedNudgeResult(runtime: NudgeRuntime, target: NudgeTarget): NudgeResult {
+  return {
+    written: false,
+    deduped: true,
+    nearDuplicate: false,
+    capacityWarning: null,
+    autoCompacted: false,
+    path: runtime.path,
+    entryCount: getEntryCount(runtime.root, target),
+    usagePercent: runtime.usagePercent,
+  };
+}
+
+function contentHasNearDuplicate(root: string, target: NudgeTarget, content: string): boolean {
+  for (const entry of readSectionEntries(root, target).slice(-20)) {
+    const entryText = entry.replace(/^###\s+.*\n/, "").replace(/^-{3,}/, "").trim();
+    if (entryText && tokenOverlapSimilarity(content, entryText) >= 0.8) return true;
+  }
+  return false;
+}
+
+function capacityWarningFor(newSize: number, warnBytes: number): string | null {
+  if (newSize < warnBytes) return null;
+  const pct = Math.round((newSize / warnBytes) * 100);
+  return `Section at ${pct}% capacity (${Math.round(newSize / 1024)}KB/${Math.round(warnBytes / 1024)}KB). Consider consolidating.`;
+}
+
+function compactNudgeSection(root: string, target: NudgeTarget, sp: string, compactTarget: number): boolean {
+  const archiveDir = sectionArchiveDir(root);
+  if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
+
+  const entries = readSectionEntries(root, target);
+  const kept: string[] = [];
+  let keptSize = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]!;
+    const entrySize = Buffer.byteLength(entry, "utf8");
+    if (keptSize + entrySize <= compactTarget || kept.length === 0) {
+      kept.unshift(entry);
+      keptSize += entrySize;
+      if (keptSize > compactTarget) break;
+    } else {
+      break;
+    }
+  }
+
+  const archiveStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const archivePath = path.join(archiveDir, `${archiveStamp}-${target}-nudge-archive.md`);
+  const archived = entries.slice(0, entries.length - kept.length);
+  if (archived.length > 0) {
+    writeFileSync(archivePath, `# Archived ${target} entries — ${archiveStamp}\n\n${archived.join("\n\n---\n\n")}\n`, "utf8");
+  }
+
+  const header = `# ${target} — compacted\n\nOlder entries archived to \`archive/${path.basename(archivePath)}\`.\n\n`;
+  writeFileSync(sp, header + kept.join("\n\n"), "utf8");
+  return true;
+}
+
+function appendNudgeEntry(sp: string, content: string): void {
+  appendFileSync(sp, `\n\n### Nudge — ${new Date().toISOString()}\n\n${content.trim()}`, "utf8");
+}
+
 /**
  * Write a nudge entry to the scratchpad.
  *
@@ -183,136 +282,34 @@ export function writeNudge(
   target: NudgeTarget,
   content: string,
   config: NudgeConfig,
-  options?: {
-    /** Optional dedup key to combine with content for dedup. Default: content itself */
-    dedupKey?: string;
-    /** Skip dedup check. Default: false */
-    skipDedup?: boolean;
-  },
+  options?: WriteNudgeOptions,
 ): NudgeResult {
-  const root = config.scratchpadRoot;
-  const warnBytes = config.warnThresholdBytes ?? DEFAULT_WARN_THRESHOLD;
-  const compactBytes = config.compactThresholdBytes ?? DEFAULT_COMPACT_THRESHOLD;
-  const compactTarget = config.compactTargetBytes ?? DEFAULT_COMPACT_TARGET;
+  const runtime = nudgeRuntime(target, config);
+  const digest = computeDigest(nudgeDigestKey(content, options));
 
-  // Ensure sections dir exists
-  const sectionsDir = path.join(root, "sections");
-  if (!existsSync(sectionsDir)) mkdirSync(sectionsDir, { recursive: true });
-
-  const sp = sectionPath(root, target);
-  const currentSize = getSectionSize(root, target);
-  const usagePercent = Math.round((currentSize / warnBytes) * 100);
-
-  let written = false;
-  let deduped = false;
-  let nearDuplicate = false;
-  let capacityWarning: string | null = null;
-  let autoCompacted = false;
-
-  // ── Dedup check ──
-  if (!options?.skipDedup) {
-    const digestKey = options?.dedupKey ? `${content}||${options.dedupKey}` : content;
-    const digest = computeDigest(digestKey);
-    const existing = loadDigests(root, config.digestPath);
-
-    if (existing.has(digest)) {
-      return {
-        written: false,
-        deduped: true,
-        nearDuplicate: false,
-        capacityWarning: null,
-        autoCompacted: false,
-        path: sp,
-        entryCount: getEntryCount(root, target),
-        usagePercent,
-      };
-    }
-
-    // Near-duplicate check
-    const recent = readSectionEntries(root, target);
-    for (const entry of recent.slice(-20)) {
-      // Extract just the text portion after the header markers
-      const entryText = entry.replace(/^###\s+.*\n/, "").replace(/^-{3,}/, "").trim();
-      if (entryText && tokenOverlapSimilarity(content, entryText) >= 0.8) {
-        nearDuplicate = true;
-        break;
-      }
-    }
-
+  if (!options?.skipDedup && loadDigests(runtime.root, config.digestPath).has(digest)) {
+    return dedupedNudgeResult(runtime, target);
   }
 
-  // ── Capacity check ──
-  const newSize = currentSize + Buffer.byteLength(content, "utf8");
-  if (newSize >= warnBytes) {
-    const pct = Math.round((newSize / warnBytes) * 100);
-    capacityWarning = `Section at ${pct}% capacity (${Math.round(newSize / 1024)}KB/${Math.round(warnBytes / 1024)}KB). Consider consolidating.`;
-  }
+  const nearDuplicate = !options?.skipDedup && contentHasNearDuplicate(runtime.root, target, content);
+  const newSize = runtime.currentSize + Buffer.byteLength(content, "utf8");
+  const capacityWarning = capacityWarningFor(newSize, runtime.warnBytes);
+  const autoCompacted = newSize >= runtime.compactBytes
+    ? compactNudgeSection(runtime.root, target, runtime.path, runtime.compactTarget)
+    : false;
 
-  // ── Auto-compact ──
-  if (newSize >= compactBytes) {
-    // Archive oldest entries
-    const archiveDir = sectionArchiveDir(root);
-    if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
-
-    const entries = readSectionEntries(root, target);
-    // Keep the most recent entries that fit within compactTarget
-    const kept: string[] = [];
-    let keptSize = 0;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i]!;
-      const entrySize = Buffer.byteLength(entry, "utf8");
-      if (keptSize + entrySize <= compactTarget) {
-        kept.unshift(entry);
-        keptSize += entrySize;
-      } else if (kept.length === 0) {
-        // Always keep at least one entry
-        kept.unshift(entry);
-        keptSize += entrySize;
-        break;
-      } else {
-        break;
-      }
-    }
-
-    // Write the archive file
-    const archiveStamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const archivePath = path.join(archiveDir, `${archiveStamp}-${target}-nudge-archive.md`);
-    const archived = entries.slice(0, entries.length - kept.length);
-    if (archived.length > 0) {
-      writeFileSync(
-        archivePath,
-        `# Archived ${target} entries — ${archiveStamp}\n\n${archived.join("\n\n---\n\n")}\n`,
-        "utf8",
-      );
-    }
-
-    // Rebuild section with kept entries
-    const header = `# ${target} — compacted\n\nOlder entries archived to \`archive/${path.basename(archivePath)}\`.\n\n`;
-    writeFileSync(sp, header + kept.join("\n\n"), "utf8");
-    autoCompacted = true;
-  }
-
-  // ── Write entry ──
-  const timestamp = new Date().toISOString();
-  const entryHeader = `### Nudge — ${timestamp}`;
-  const entryText = `\n\n${entryHeader}\n\n${content.trim()}`;
-
-  appendFileSync(sp, entryText, "utf8");
-  if (!options?.skipDedup) {
-    const digestKey = options?.dedupKey ? `${content}||${options.dedupKey}` : content;
-    recordDigest(root, computeDigest(digestKey), config.digestPath);
-  }
-  written = true;
+  appendNudgeEntry(runtime.path, content);
+  if (!options?.skipDedup) recordDigest(runtime.root, digest, config.digestPath);
 
   return {
-    written,
+    written: true,
     deduped: false,
     nearDuplicate,
     capacityWarning,
     autoCompacted,
-    path: sp,
-    entryCount: getEntryCount(root, target),
-    usagePercent: Math.round(((currentSize + Buffer.byteLength(content, "utf8")) / warnBytes) * 100),
+    path: runtime.path,
+    entryCount: getEntryCount(runtime.root, target),
+    usagePercent: Math.round((newSize / runtime.warnBytes) * 100),
   };
 }
 

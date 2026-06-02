@@ -8,9 +8,9 @@
  * See: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
  */
 
-import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ const DEFAULT_SESSION_LOG = "hyperpod-tmp/session.jsonl";
 // ── DB wrapper ─────────────────────────────────────────────────────
 
 export class SessionSearchDb {
-  private db: Database;
+  private db: SqliteDatabase;
   private dbPath: string;
   private sessionLogPath: string;
   private maxResults: number;
@@ -70,7 +70,7 @@ export class SessionSearchDb {
     const dir = path.dirname(this.dbPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-    this.db = Database.open(this.dbPath, { create: true });
+    this.db = openSqliteDatabase(this.dbPath, "Sherpa session search");
 
     // Enable WAL for concurrent safety
     this.db.exec("PRAGMA journal_mode=WAL");
@@ -297,35 +297,52 @@ export class SessionSearchDb {
 
 type ParsedSessionLogLine = { sessionId: string; ts: string; kind: string; text: string };
 
+type SessionLogEntry = Record<string, unknown>;
+
+function contentTextParts(content: unknown): string[] {
+  if (!content) return [];
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content
+    .map((item) => typeof item === "object" && item && "text" in item ? String((item as { text?: unknown }).text ?? "") : "")
+    .filter(Boolean);
+}
+
+function payloadTextParts(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const p = payload as { text?: unknown; message?: unknown; content?: unknown };
+  return [p.text, p.message, p.content].filter(Boolean).map(String);
+}
+
+function messageTextParts(messages: unknown): string[] {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .map((message) => typeof message === "object" && message && "content" in message ? String((message as { content?: unknown }).content ?? "") : "")
+    .filter(Boolean);
+}
+
+function sessionEntryText(entry: SessionLogEntry, fallback: string): string {
+  const text = [
+    entry.prompt,
+    entry.response,
+    entry.text,
+    ...contentTextParts(entry.content),
+    ...payloadTextParts(entry.payload),
+    entry.error,
+    ...messageTextParts(entry.messages),
+  ].filter(Boolean).map(String).join("\n").slice(0, 10_000);
+  return text || fallback.slice(0, 10_000);
+}
+
 function parseSessionLogLine(line: string): ParsedSessionLogLine {
   try {
-    const entry = JSON.parse(line);
-    const sessionId = String(entry.sessionId ?? entry.session_id ?? "unknown");
-    const ts = String(entry.ts ?? entry.timestamp ?? new Date().toISOString());
-    const kind = String(entry.kind ?? entry.type ?? "unknown");
-    const textParts: string[] = [];
-    if (entry.prompt) textParts.push(String(entry.prompt));
-    if (entry.response) textParts.push(String(entry.response));
-    if (entry.text) textParts.push(String(entry.text));
-    if (entry.content) {
-      const content = entry.content;
-      if (typeof content === "string") textParts.push(content);
-      else if (Array.isArray(content)) {
-        for (const c of content) if (c?.text) textParts.push(String(c.text));
-      }
-    }
-    if (entry.payload && typeof entry.payload === "object") {
-      const payload = entry.payload;
-      if (payload.text) textParts.push(String(payload.text));
-      if (payload.message) textParts.push(String(payload.message));
-      if (payload.content) textParts.push(String(payload.content));
-    }
-    if (entry.error) textParts.push(String(entry.error));
-    if (Array.isArray(entry.messages)) {
-      for (const m of entry.messages) if (m.content) textParts.push(String(m.content));
-    }
-    const text = textParts.filter(Boolean).join("\n").slice(0, 10_000);
-    return { sessionId, ts, kind, text: text || line.slice(0, 10_000) };
+    const entry = JSON.parse(line) as SessionLogEntry;
+    return {
+      sessionId: String(entry.sessionId ?? entry.session_id ?? "unknown"),
+      ts: String(entry.ts ?? entry.timestamp ?? new Date().toISOString()),
+      kind: String(entry.kind ?? entry.type ?? "unknown"),
+      text: sessionEntryText(entry, line),
+    };
   } catch {
     return { sessionId: "unknown", ts: new Date().toISOString(), kind: "unknown", text: line.slice(0, 10_000) };
   }

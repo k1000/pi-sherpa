@@ -43,6 +43,10 @@ import type { NudgeTarget } from "./lib/nudge";
 import { checkAutoDistill, prepareDistillPayloads, getAutoDistillStatus, markAutoDistillRun } from "./lib/auto-distill";
 import { ensureRouteMap, parseRouteMap } from "./lib/route-map";
 import { searchSemble } from "./lib/semble";
+import { parseRgOutput, rg } from "./lib/rg";
+import { catalogMatches, readGlobalTaxonomy } from "./lib/catalog";
+import { parseGitStatusFiles } from "./lib/common";
+import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
 import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
 import { execFile } from "node:child_process";
@@ -355,11 +359,27 @@ function appendScratchpadSection(state: State, cwd: string, section: ScratchpadS
 function scratchpadRootRelative(state: State, cwd: string, target: string) {
   return path.relative(scratchpadRootPath(state, cwd), target);
 }
-function mergeConfig(base: any, over: any): any {
-  if (!over || typeof over !== "object") return structuredClone(base);
-  const out: any = Array.isArray(base) ? [...base] : { ...base };
-  for (const [k, v] of Object.entries(over)) out[k] = v && typeof v === "object" && !Array.isArray(v) ? mergeConfig(base?.[k] ?? {}, v) : v;
-  return out;
+type DeepPartial<T> = {
+  [K in keyof T]?: T[K] extends Array<infer U>
+    ? Array<U>
+    : T[K] extends object
+      ? DeepPartial<T[K]>
+      : T[K];
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeConfig<T>(base: T, over: DeepPartial<T> | undefined): T {
+  if (!isPlainObject(over)) return structuredClone(base);
+  const baseRecord = isPlainObject(base) ? base : {};
+  const out: Record<string, unknown> = Array.isArray(base) ? [...base] : { ...baseRecord };
+  for (const [key, value] of Object.entries(over)) {
+    const baseValue = baseRecord[key];
+    out[key] = isPlainObject(value) ? mergeConfig(baseValue ?? {}, value) : value;
+  }
+  return out as T;
 }
 
 function approxTokens(s: string) { return Math.ceil(s.length / 4); }
@@ -377,52 +397,6 @@ function score(text: string, focus: string) {
   return words.size ? hits / words.size : 0.1;
 }
 
-function parseCsvLine(line: string) {
-  const cells: string[] = [];
-  let current = "";
-  let quoted = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quoted && ch === '"' && line[i + 1] === '"') { current += '"'; i++; continue; }
-    if (ch === '"') { quoted = !quoted; continue; }
-    if (!quoted && ch === ",") { cells.push(current); current = ""; continue; }
-    current += ch;
-  }
-  cells.push(current);
-  return cells;
-}
-
-type CatalogRow = Record<string, string>;
-function readCsvRows(target: string): CatalogRow[] {
-  if (!existsSync(target)) return [];
-  const lines = readFileSync(target, "utf8").split(/\r?\n/).filter((line) => line.trim());
-  if (lines.length < 2) return [];
-  const header = parseCsvLine(lines[0]!).map((cell) => cell.trim());
-  return lines.slice(1).map((line) => {
-    const cells = parseCsvLine(line);
-    const row: CatalogRow = {};
-    header.forEach((key, index) => { row[key] = cells[index] ?? ""; });
-    return row;
-  });
-}
-function readProjectCatalog(obsidianRoot: string): CatalogRow[] {
-  return readCsvRows(path.join(obsidianRoot, "catalog.csv")).filter((row) => row.id && row.path);
-}
-function catalogMatches(root: string, focus: string, limit = 8) {
-  return readProjectCatalog(root)
-    .map((row) => ({ row, relevance: score([
-      row.id, row.scope, row.project, row.area, row.category, row.type, row.title, row.summary,
-      row.aliases, row.tags, row.related, row.based_on, row.supports, row.implements,
-      row.derives_from, row.applies_research, row.applied_by_project, row.generalizes_from,
-      row.specializes, row.routes, row.keywords,
-    ].filter(Boolean).join("\n"), focus) }))
-    .filter((item) => item.relevance > 0.08)
-    .sort((a, b) => b.relevance - a.relevance)
-    .slice(0, limit);
-}
-function readGlobalTaxonomy(): CatalogRow[] {
-  return readCsvRows("/Users/kamil/Documents/articles/taxonomy.csv").filter((row) => row.kind && row.id);
-}
 function summarize(raw: string, budgetChars = 700) {
   const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const important = lines.filter(l => /error|fail|exception|warning|todo|fixme|export |function |class |describe\(|it\(/i.test(l));
@@ -679,6 +653,23 @@ function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
 }
 
+async function getSherpaModelAuth(state: State, ctx: ExtensionContext): Promise<{ model: any; auth: any } | undefined> {
+  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
+  if (!model) return undefined;
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  return auth.ok && auth.apiKey ? { model, auth } : undefined;
+}
+
+async function completeJsonObjectWithTimeout(state: State, ctx: ExtensionContext, model: any, auth: any, message: UserMessage, timeoutMs: number, timeoutMessage: string) {
+  const response = await Promise.race([
+    complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
+    timeoutAfter<any>(timeoutMs, timeoutMessage),
+  ]);
+  if (response.stopReason === "aborted") return { aborted: true, parsed: null };
+  const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
+  return { aborted: false, parsed: extractJsonObject(text) };
+}
+
 const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "semble", "graphify", "docs", "git", "session", "project_memory", "surreal_memory", "web"];
 
 function normalizeSources(input: string[] | undefined, mode: string): Source[] {
@@ -769,14 +760,9 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   if (state.config.model.heuristicOnly) {
     return { indicators: heuristicIndicators(focus), reason: "heuristic extraction", confidence: 0.3, planner: "heuristic" };
   }
-  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) {
-    return { indicators: heuristicIndicators(focus), reason: "model unavailable, falling back", confidence: 0.3, planner: "heuristic" };
-  }
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
-    return { indicators: heuristicIndicators(focus), reason: "no API key, falling back", confidence: 0.3, planner: "heuristic" };
-  }
+  const modelAuth = await getSherpaModelAuth(state, ctx);
+  if (!modelAuth) return { indicators: heuristicIndicators(focus), reason: "model unavailable or no API key, falling back", confidence: 0.3, planner: "heuristic" };
+  const { model, auth } = modelAuth;
   const message: UserMessage = {
     role: "user",
     timestamp: Date.now(),
@@ -798,15 +784,11 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
     ].join("\\n") }],
   };
   try {
-    const response = await Promise.race([
-      complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
-      timeoutAfter<any>(SOURCE_PLANNER_TIMEOUT_MS, "indicator inference timed out"),
-    ]);
-    if (response.stopReason === "aborted") {
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, message, SOURCE_PLANNER_TIMEOUT_MS, "indicator inference timed out");
+    if (result.aborted) {
       return { indicators: heuristicIndicators(focus), reason: "model aborted, falling back", confidence: 0.2, planner: "heuristic" };
     }
-    const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
-    const parsed = extractJsonObject(text) as any;
+    const parsed = result.parsed as any;
     if (parsed && Array.isArray(parsed.indicators) && parsed.indicators.length > 0) {
       const indicators = parsed.indicators
         .filter((s: unknown): s is string => typeof s === "string" && s.length >= 2)
@@ -824,38 +806,23 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   }
 }
 
-async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
-  // Returns BOTH source plan (Stage 0/2) and inferred search indicators (Stage 1).
-  const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
-  const overridden = normalizeSources(sourceOverride, mode);
-  if (overridden.length) {
-    const sourcePlan: SourcePlan = { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan };
-    const indicators = await inferSearchIndicators(state, ctx, focus);
-    return { sourcePlan, indicators };
-  }
+function heuristicSearchIndicators(focus: string): SearchIndicators {
+  return { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" };
+}
 
+function routedFallbackPlan(state: State, ctx: ExtensionContext, focus: string, mode: string, routePlan?: RoutePlan): SourcePlan {
   const fallbackPlan = { ...heuristicSourcePlan(focus, mode), routePlan };
   if (routePlan) {
-    const routedSources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
-    fallbackPlan.sources = routedSources;
+    fallbackPlan.sources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
     fallbackPlan.reason = `route ${routePlan.name}: ${fallbackPlan.reason}`;
     fallbackPlan.confidence = Math.max(fallbackPlan.confidence, 0.8);
   }
-  const heuristicInds = { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" as const };
-
   fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
+  return fallbackPlan;
+}
 
-  if (state.config.model.heuristicOnly || mode !== "front-door") {
-    return { sourcePlan: fallbackPlan, indicators: heuristicInds };
-  }
-
-  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
-
-  // Single model call: infer both indicators (Stage 1) AND source selection.
-  const message: UserMessage = {
+function sourcePlanningMessage(focus: string): UserMessage {
+  return {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: [
@@ -879,157 +846,114 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
       'Also return as JSON: {"sources":{"sources":["..."],"reason":"...","confidence":0.0}}',
       "",
       `Return ONLY a single JSON object with both "indicators" and "sources" keys.`,
-    ].join("\\n") }],
+    ].join("\n") }],
   };
+}
+
+function parsePlannedIndicators(parsed: any, fallback: SearchIndicators): SearchIndicators {
+  if (!parsed?.indicators || !Array.isArray(parsed.indicators.indicators) || parsed.indicators.indicators.length === 0) return fallback;
+  return {
+    indicators: parsed.indicators.indicators.filter((s: unknown): s is string => typeof s === "string" && s.length >= 2).slice(0, 12),
+    reason: String(parsed.indicators.reason ?? "").slice(0, 240) || "model inference",
+    confidence: Math.max(0.1, Math.min(1, Number(parsed.indicators.confidence ?? 0.5))),
+    planner: "llm",
+  };
+}
+
+function parsePlannedSourcePlan(state: State, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
+  if (!parsed?.sources) return null;
+  const sourcePlan = parseSourcePlan(JSON.stringify(parsed.sources), mode);
+  if (!sourcePlan?.sources.length) return null;
+  const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
+  return { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan };
+}
+
+async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
+  const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
+  const overridden = normalizeSources(sourceOverride, mode);
+  if (overridden.length) return { sourcePlan: { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan }, indicators: await inferSearchIndicators(state, ctx, focus) };
+
+  const fallbackPlan = routedFallbackPlan(state, ctx, focus, mode, routePlan);
+  const heuristicInds = heuristicSearchIndicators(focus);
+  if (state.config.model.heuristicOnly || mode !== "front-door") return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+
+  const modelAuth = await getSherpaModelAuth(state, ctx);
+  if (!modelAuth) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+  const { model, auth } = modelAuth;
 
   try {
-    const response = await Promise.race([
-      complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
-      timeoutAfter<any>(SOURCE_PLANNER_TIMEOUT_MS, "source + indicator planning timed out"),
-    ]);
-    if (response.stopReason === "aborted") {
-      return { sourcePlan: fallbackPlan, indicators: heuristicInds };
-    }
-    const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
-    const parsed = extractJsonObject(text) as any;
-
-    let indicators: SearchIndicators = heuristicInds;
-    if (parsed?.indicators && Array.isArray(parsed.indicators.indicators) && parsed.indicators.indicators.length > 0) {
-      const inds = parsed.indicators.indicators
-        .filter((s: unknown): s is string => typeof s === "string" && s.length >= 2)
-        .slice(0, 12);
-      indicators = {
-        indicators: inds,
-        reason: String(parsed.indicators.reason ?? "").slice(0, 240) || "model inference",
-        confidence: Math.max(0.1, Math.min(1, Number(parsed.indicators.confidence ?? 0.5))),
-        planner: "llm",
-      };
-    }
-
-    if (parsed?.sources) {
-      const rawSources = JSON.stringify(parsed.sources);
-      const sourcePlan = parseSourcePlan(rawSources, mode);
-      if (sourcePlan?.sources.length) {
-        const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
-        return { sourcePlan: { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan }, indicators };
-      }
-    }
-    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner fallback: ${fallbackPlan.reason}` }, indicators };
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, sourcePlanningMessage(focus), SOURCE_PLANNER_TIMEOUT_MS, "source + indicator planning timed out");
+    if (result.aborted) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+    const parsed = result.parsed as any;
+    const indicators = parsePlannedIndicators(parsed, heuristicInds);
+    const sourcePlan = parsePlannedSourcePlan(state, focus, mode, parsed, routePlan);
+    return { sourcePlan: sourcePlan ?? { ...fallbackPlan, planner: "fallback", reason: `planner fallback: ${fallbackPlan.reason}` }, indicators };
   } catch {
     return { sourcePlan: fallbackPlan, indicators: heuristicInds };
   }
 }
 
 
-async function curateCandidates(
-  state: State,
-  ctx: ExtensionContext,
-  candidates: ContextItem[],
-  focus: string,
-  mode: string,
-  indicators: SearchIndicators,
-): Promise<CurateResult> {
-  // Stage 3: model judges whether each candidate actually corresponds to the user's intent.
-  // HARD GATE: if no candidates are relevant, the result is abstain — nothing goes to the main agent.
-  const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
+const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operations, bash commands, "
+  + "pi extensions, pi skills, Sherpa memory, Obsidian knowledge bases, coding tasks, "
+  + "alphabot trading strategies, backtesting, and workspace operations.";
 
-  if (mode === "front-door" && heuristicOrdered.length === 0) {
-    return {
-      items: [],
-      abstain: true,
-      abstainReason: "no curated candidates correspond to the query after suppression",
-      rejected: [],
-      confidence: 0.3,
-      planner: "heuristic",
-    };
+const OOD_PATTERNS = [
+  /\bcapital of\b|\bpresident of\b|\bgovernment\b/i,
+  /\bphotosynthesis\b|\bquantum physics\b|\bevolution\b/i,
+  /\bpoem\b|\bpoetry\b|\bwrite (me )?a (story|poem|song)\b/i,
+  /\bmeaning of life\b/i,
+  /\brestaurant\b|\brecipe\b|\bbrew\b/i,
+  /\bmy (dog|cat|pet|horse|fish)\b/i,
+  /\b(wedding|honeymoon|anniversary)\b/i,
+  /\bdinner\b|\blunch\b|\bbreakfast\b|\bwhat do I make for\b/i,
+  /\blearning (to play )?(guitar|piano|drums)\b|\b(play|learn) guitar at\b/i,
+  /\bbirthday card for (my |her |his )?mom\b|\bbirthday message\b/i,
+  /\bmy (wife|husband|girlfriend|boyfriend|family|friends?)\b/i,
+  /\b(is it worth|should I) learning\b/i,
+];
+
+const NOISY_CURATION_TYPES = new Set(["session_recent", "session_event", "audit_log", "system_log"]);
+const NOISY_CURATION_PATTERNS = [
+  /session_compact|audit event|session event/i,
+  /No durable structural learning|no actionable/i,
+  /proactive|session_compact/i,
+];
+
+function heuristicCurateResult(items: ContextItem[], confidence = 0.3): CurateResult {
+  return { items: items.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic" };
+}
+
+function curationCandidateIsNoisy(c: { type: string; summary: string; raw?: string }) {
+  return NOISY_CURATION_TYPES.has(c.type) || NOISY_CURATION_PATTERNS.some(p => p.test(c.summary) || (c.raw && p.test(c.raw)));
+}
+
+function curationManifest(curationPool: ContextItem[], focus: string, mode: string) {
+  return curationPool.map((c, i) => ({
+    index: i,
+    type: c.type,
+    source: c.source,
+    relevance: Number(candidateSortKey(c, focus, mode).toFixed(2)),
+    summary: c.summary.slice(0, 500),
+    rawExcerpt: (c.raw ?? "").slice(0, 200),
+  }));
+}
+
+function pickCuratedItems(selected: unknown[], curationPool: ContextItem[]): ContextItem[] {
+  const picked: ContextItem[] = [];
+  const seen = new Set<number>();
+  for (const idx of selected) {
+    const n = typeof idx === "number" ? idx : Number(idx);
+    if (!Number.isInteger(n) || n < 0 || n >= curationPool.length || seen.has(n)) continue;
+    seen.add(n);
+    picked.push(curationPool[n]);
+    if (picked.length >= 8) break;
   }
+  return picked;
+}
 
-  if (mode !== "front-door" || state.config.model.heuristicOnly || heuristicOrdered.length <= 1) {
-    return {
-      items: heuristicOrdered.slice(0, 8),
-      abstain: false,
-      abstainReason: "",
-      rejected: [],
-      confidence: 0.3,
-      planner: "heuristic",
-    };
-  }
-
-  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) {
-    return {
-      items: heuristicOrdered.slice(0, 8),
-      abstain: false,
-      abstainReason: "",
-      rejected: [],
-      confidence: 0.3,
-      planner: "heuristic",
-    };
-  }
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
-    return {
-      items: heuristicOrdered.slice(0, 8),
-      abstain: false,
-      abstainReason: "",
-      rejected: [],
-      confidence: 0.3,
-      planner: "heuristic",
-    };
-  }
-
-    // Project domain — the model uses this to judge whether the QUERY belongs here.
-  const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operations, bash commands, "
-    + "pi extensions, pi skills, Sherpa memory, Obsidian knowledge bases, coding tasks, "
-    + "alphabot trading strategies, backtesting, and workspace operations.";
-
-  // Conservative OOD patterns — only the most obvious non-project queries.
-  // These are a safety net; the LLM is the primary domain gate.
-  // Hard out-of-domain patterns — obvious non-project queries that need no retrieval.
-  // These fire BEFORE calling the LLM, so they save latency and prevent false positives.
-  const OOD_PATTERNS = [
-    // General world knowledge — never requires project context
-    /\bcapital of\b|\bpresident of\b|\bgovernment\b/i,
-    /\bphotosynthesis\b|\bquantum physics\b|\bevolution\b/i,
-    /\bpoem\b|\bpoetry\b|\bwrite (me )?a (story|poem|song)\b/i,
-    /\bmeaning of life\b/i,
-    /\brestaurant\b|\brecipe\b|\bbrew\b/i,
-    // Personal life advice — never requires project context
-    /\bmy (dog|cat|pet|horse|fish)\b/i,
-    /\b(wedding|honeymoon|anniversary)\b/i,
-    /\bdinner\b|\blunch\b|\bbreakfast\b|\bwhat do I make for\b/i,
-    /\blearning (to play )?(guitar|piano|drums)\b|\b(play|learn) guitar at\b/i,
-    /\bbirthday card for (my |her |his )?mom\b|\bbirthday message\b/i,
-    /\bmy (wife|husband|girlfriend|boyfriend|family|friends?)\b/i,
-    /\b(is it worth|should I) learning\b/i,
-  ];
-  const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
-
-  // Filter out generic/noisy candidates that always appear but never help answer specific queries.
-  // Session recent entries are JSON session events — they contain many keywords but are too
-  // generic to help answer any specific query. Remove them so Stage 3 isn't tricked by keyword collision.
-  const NOISY_TYPES = new Set(["session_recent", "session_event", "audit_log", "system_log"]);
-  const NOISY_PATTERNS = [
-    /session_compact|audit event|session event/i,
-    /No durable structural learning|no actionable/i,
-    /proactive|session_compact/i,
-  ];
-  const isNoisy = (c: { type: string; summary: string; raw?: string }) =>
-    NOISY_TYPES.has(c.type) ||
-    NOISY_PATTERNS.some(p => p.test(c.summary) || (c.raw && p.test(c.raw)));
-
-  const curationPool = heuristicOrdered.filter(c => !isNoisy(c)).slice(0, 30);
-  const manifest = curationPool
-    .map((c, i) => ({
-      index: i,
-      type: c.type,
-      source: c.source,
-      relevance: Number(candidateSortKey(c, focus, mode).toFixed(2)),
-      summary: c.summary.slice(0, 500),
-      rawExcerpt: (c.raw ?? "").slice(0, 200),
-    }));
-
-  const message: UserMessage = {
+function curationMessage(focus: string, indicators: SearchIndicators, manifest: ReturnType<typeof curationManifest>): UserMessage {
+  return {
     role: "user",
     timestamp: Date.now(),
     content: [{ type: "text", text: [
@@ -1067,82 +991,68 @@ async function curateCandidates(
       '}',
       "",
       JSON.stringify(manifest, null, 2),
-    ].join("\\n") }],
+    ].join("\n") }],
   };
+}
 
+function parseCurationRejected(parsed: any, manifest: ReturnType<typeof curationManifest>): Array<{ index: number; reason: string; source: string }> {
+  if (!Array.isArray(parsed?.rejected)) return [];
+  return parsed.rejected.filter((r: any) => typeof r?.index === "number").map((r: any) => ({
+    index: Number(r.index),
+    reason: String(r.reason ?? ""),
+    source: String(manifest[r.index]?.source ?? ""),
+  }));
+}
+
+function curationAbstainResult(abstainReason: string, rejected: CurateResult["rejected"], confidence: number): CurateResult {
+  return { items: [], abstain: true, abstainReason, rejected, confidence, planner: "llm" };
+}
+
+function curationResultFromParsed(parsed: any, curationPool: ContextItem[], manifest: ReturnType<typeof curationManifest>, focus: string, isLikelyOod: boolean): CurateResult {
+  const selected: number[] = Array.isArray(parsed.selected) ? parsed.selected : [];
+  const rejected = parseCurationRejected(parsed, manifest);
+  const confidence = Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.4)));
+  if (isLikelyOod || parsed.queryInDomain === false) {
+    const reason = isLikelyOod
+      ? `obvious out-of-domain query — pattern matched '${focus.slice(0, 40)}'`
+      : `query is outside project domain — ${String(parsed.reason ?? "model gated it out").slice(0, 200)}`;
+    return curationAbstainResult(reason, rejected, confidence);
+  }
+  if (selected.length === 0) return curationAbstainResult(String(parsed.reason ?? "no relevant candidates found for in-domain query").slice(0, 240), rejected, confidence);
+  const picked = pickCuratedItems(selected, curationPool);
+  return picked.length
+    ? { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm" }
+    : curationAbstainResult("model returned selected indexes but none were valid", rejected, confidence);
+}
+
+async function curateCandidates(
+  state: State,
+  ctx: ExtensionContext,
+  candidates: ContextItem[],
+  focus: string,
+  mode: string,
+  indicators: SearchIndicators,
+): Promise<CurateResult> {
+  const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
+  if (mode === "front-door" && heuristicOrdered.length === 0) {
+    return { items: [], abstain: true, abstainReason: "no curated candidates correspond to the query after suppression", rejected: [], confidence: 0.3, planner: "heuristic" };
+  }
+  if (mode !== "front-door" || state.config.model.heuristicOnly || heuristicOrdered.length <= 1) return heuristicCurateResult(heuristicOrdered);
+
+  const modelAuth = await getSherpaModelAuth(state, ctx);
+  if (!modelAuth) return heuristicCurateResult(heuristicOrdered);
+  const { model, auth } = modelAuth;
+
+  const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
+  const curationPool = heuristicOrdered.filter(c => !curationCandidateIsNoisy(c)).slice(0, 30);
+  const manifest = curationManifest(curationPool, focus, mode);
 
   try {
-    const abort = new AbortController();
-    const timeout = setTimeout(() => abort.abort(), CURATION_TIMEOUT_MS);
-    const response = await complete(
-      model,
-      { systemPrompt: state.retrievalPrompt, messages: [message] },
-      { apiKey: auth.apiKey, headers: auth.headers, signal: abort.signal },
-    ).finally(() => clearTimeout(timeout));
-    if (response.stopReason === "aborted") {
-      return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
-    }
-    const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\\n");
-    const parsed = extractJsonObject(text) as any;
-    if (!parsed) {
-      return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
-    }
-
-    const selected: number[] = Array.isArray(parsed.selected) ? parsed.selected : [];
-    const queryInDomain = parsed.queryInDomain !== false; // default true, only false if explicitly set
-    const rejected: Array<{ index: number; reason: string; source: string }> = Array.isArray(parsed.rejected)
-      ? parsed.rejected.filter((r: any) => typeof r?.index === "number").map((r: any) => ({
-          index: Number(r.index),
-          reason: String(r.reason ?? ""),
-          source: String(manifest[r.index]?.source ?? ""),
-        }))
-      : [];
-    const confidence = Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.4)));
-
-    // HARD GATE: if query is out-of-domain, suppress everything — let the model answer from its own knowledge.
-    // If in-domain but no candidates match, also suppress.
-    // The model is the judge — we trust its semantic domain judgment.
-    // Additionally, a fast pattern-based pre-filter catches obvious OOD queries before calling the model.
-    if (isLikelyOod || !queryInDomain) {
-      return {
-        items: [],
-        abstain: true,
-        abstainReason: isLikelyOod
-          ? `obvious out-of-domain query — pattern matched '${focus.slice(0, 40)}'`
-          : `query is outside project domain — ${String(parsed.reason ?? "model gated it out").slice(0, 200)}`,
-        rejected,
-        confidence,
-        planner: "llm",
-      };
-    }
-    if (selected.length === 0) {
-      return {
-        items: [],
-        abstain: true,
-        abstainReason: String(parsed.reason ?? "no relevant candidates found for in-domain query").slice(0, 240),
-        rejected,
-        confidence,
-        planner: "llm",
-      };
-    }
-
-    const picked: ContextItem[] = [];
-    const seen = new Set<number>();
-    for (const idx of selected) {
-      const n = typeof idx === "number" ? idx : Number(idx);
-      if (!Number.isInteger(n) || n < 0 || n >= curationPool.length || seen.has(n)) continue;
-      seen.add(n);
-      picked.push(curationPool[n]);
-      if (picked.length >= 8) break;
-    }
-
-    if (!picked.length) {
-      return { items: [], abstain: true, abstainReason: "model returned selected indexes but none were valid", rejected, confidence, planner: "llm" };
-    }
-
-    return { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm" };
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, curationMessage(focus, indicators, manifest), CURATION_TIMEOUT_MS, "candidate curation timed out");
+    if (result.aborted || !result.parsed) return heuristicCurateResult(heuristicOrdered, 0.2);
+    return curationResultFromParsed(result.parsed as any, curationPool, manifest, focus, isLikelyOod);
   } catch {
-    return { items: heuristicOrdered.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence: 0.2, planner: "heuristic" };
+    return heuristicCurateResult(heuristicOrdered, 0.2);
   }
 }
 
@@ -1223,21 +1133,36 @@ function isSmallEditCandidate(focus: string, items: ContextItem[]) {
   return fileItems.length > 0 && fileItems.length <= 3 && items[0].relevance >= 0.35;
 }
 
+const GENERIC_NOISE_PATHS = [
+  "/readme.md",
+  "docs/mission_prompt.md",
+  "docs/missions.md",
+  "documentation-drift",
+  "archivist_actionable_solutions.md",
+  "/.pi/agent/skills/",
+];
+
+const GENERIC_NOISE_NEEDED: Array<{ path: string; focusRe: RegExp }> = [
+  { path: "docs/mission_prompt.md", focusRe: /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/i },
+  { path: "docs/missions.md", focusRe: /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/i },
+  { path: "documentation-drift", focusRe: /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/i },
+  { path: "archivist_actionable_solutions.md", focusRe: /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/i },
+  { path: "/.pi/agent/skills/", focusRe: /\b(skill|skills|agent skill|load skill)\b/i },
+  { path: "/readme.md", focusRe: /\b(readme|overview|onboard|onboarding|project summary)\b/i },
+];
+
+function isGenericNoiseExplicitlyNeeded(source: string, focus: string): boolean {
+  return GENERIC_NOISE_NEEDED.some((n) => source.includes(n.path) && n.focusRe.test(focus));
+}
+
+function isGenericNoisePath(source: string): boolean {
+  return GENERIC_NOISE_PATHS.some((p) => source.endsWith(p) || source.includes(p));
+}
+
 function isLikelyGenericOpeningNoise(item: ContextSignalItem, focus = ""): boolean {
   const source = item.source.toLowerCase();
-  const f = focus.toLowerCase();
-  const explicitlyNeeded = (source.includes("docs/mission_prompt.md") || source.includes("docs/missions.md")) && /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/.test(f)
-    || (source.includes("documentation-drift") || source.includes("archivist_actionable_solutions.md")) && /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/.test(f)
-    || source.includes("/.pi/agent/skills/") && /\b(skill|skills|agent skill|load skill)\b/.test(f)
-    || source.endsWith("/readme.md") && /\b(readme|overview|onboard|onboarding|project summary)\b/.test(f);
-  if (explicitlyNeeded) return false;
-  return item.relevance < 0.25
-    || source.endsWith("/readme.md")
-    || source.includes("docs/mission_prompt.md")
-    || source.includes("docs/missions.md")
-    || source.includes("documentation-drift")
-    || source.includes("archivist_actionable_solutions.md")
-    || source.includes("/.pi/agent/skills/");
+  if (isGenericNoiseExplicitlyNeeded(source, focus.toLowerCase())) return false;
+  return item.relevance < 0.25 || isGenericNoisePath(source);
 }
 
 function buildOpeningRecommendation(signal: Omit<ContextSignalV1, "openingRecommendation">): ContextSignalV1["openingRecommendation"] | undefined {
@@ -1322,36 +1247,64 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
   return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
 }
 
-function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan) {
-  if (signal.disposition.kind === "abstain") return `## Sherpa Context\nNo high-confidence context found for: ${signal.focus}`;
-  const routeLine = sourcePlan?.routePlan
+function signalRouteLine(sourcePlan?: SourcePlan): string {
+  return sourcePlan?.routePlan
     ? `\nRoute: ${sourcePlan.routePlan.name} (${sourcePlan.routePlan.score} trigger matches)\nSources: ${sourcePlan.sources.join(", ")}\n`
     : "";
-  const dispositionLine = `\nDisposition: **${signal.disposition.kind}** — ${signal.disposition.reason}\n`;
-  const proposal = signal.proposedResponse
-    ? `\n### Sherpa proposal for main-agent review\n${signal.proposedResponse.content}\n${signal.proposedResponse.citations.length ? `\nCitations: ${signal.proposedResponse.citations.map(c => c.handle ? `${c.handle} ${c.source}` : c.source).join("; ")}` : ""}\n${signal.proposedResponse.caveats.length ? `\nCaveats: ${signal.proposedResponse.caveats.join("; ")}` : ""}\n`
+}
+
+function signalProposalSection(signal: ContextSignalV1): string {
+  if (!signal.proposedResponse) return "";
+  const p = signal.proposedResponse;
+  const citations = p.citations.length
+    ? `\nCitations: ${p.citations.map(c => c.handle ? `${c.handle} ${c.source}` : c.source).join("; ")}`
     : "";
-  const riskBlock = signal.risks.length || signal.missingInfo.length
-    ? `\n### Risks / missing info\n${[...signal.risks.map(r => `- Risk: ${r}`), ...signal.missingInfo.map(m => `- Missing: ${m}`)].join("\n")}\n`
-    : "";
-  const commandBlock = signal.suggestedCommands.length
-    ? `\n### Suggested validation\n${signal.suggestedCommands.map(c => `- \`${c.command}\` — ${c.reason}`).join("\n")}\n`
-    : "";
+  const caveats = p.caveats.length ? `\nCaveats: ${p.caveats.join("; ")}` : "";
+  return `\n### Sherpa proposal for main-agent review\n${p.content}${citations}${caveats}\n`;
+}
+
+function signalRiskSection(signal: ContextSignalV1): string {
+  if (!signal.risks.length && !signal.missingInfo.length) return "";
+  const lines = [
+    ...signal.risks.map(r => `- Risk: ${r}`),
+    ...signal.missingInfo.map(m => `- Missing: ${m}`),
+  ];
+  return `\n### Risks / missing info\n${lines.join("\n")}\n`;
+}
+
+function signalCommandSection(signal: ContextSignalV1): string {
+  if (!signal.suggestedCommands.length) return "";
+  return `\n### Suggested validation\n${signal.suggestedCommands.map(c => `- \`${c.command}\` — ${c.reason}`).join("\n")}\n`;
+}
+
+function signalRecommendationSection(signal: ContextSignalV1): string {
   const rec = signal.openingRecommendation;
-  const openingRecommendationBlock = rec && (rec.likelyUseful.length || rec.likelyNoise.length || rec.missingInfoNeeded.length)
-    ? `\n### Opening recommendation\n${[
-        rec.likelyUseful.length ? `- Likely useful: ${rec.likelyUseful.join("; ")}` : "",
-        rec.likelyNoise.length ? `- Treat as likely noise unless task explicitly needs it: ${rec.likelyNoise.join("; ")}` : "",
-        rec.missingInfoNeeded.length ? `- Missing info likely needed: ${rec.missingInfoNeeded.join("; ")}` : "",
-      ].filter(Boolean).join("\n")}\n`
-    : "";
-  const items = signal.items.map(i => {
-    const body = i.inline
-      ? `\n\`\`\`\n${i.inline}\n\`\`\``
-      : `\n  ${i.summary}\n  Why: ${i.why}\n  Pointer: ${i.source}. Expand: /sherpa:expand ${i.handle}`;
-    return `- **${i.handle}** [${i.type}, ${(i.relevance * 100).toFixed(0)}%] ${i.source}${body}`;
-  }).join("\n");
-  return `## Sherpa Context (${mode}, ~${budgetUsedTokens} tokens)${routeLine}${dispositionLine}${proposal}${riskBlock}${commandBlock}${openingRecommendationBlock}\n### Context items\n${items}`;
+  if (!rec || (!rec.likelyUseful.length && !rec.likelyNoise.length && !rec.missingInfoNeeded.length)) return "";
+  const lines = [
+    rec.likelyUseful.length ? `- Likely useful: ${rec.likelyUseful.join("; ")}` : "",
+    rec.likelyNoise.length ? `- Treat as likely noise unless task explicitly needs it: ${rec.likelyNoise.join("; ")}` : "",
+    rec.missingInfoNeeded.length ? `- Missing info likely needed: ${rec.missingInfoNeeded.join("; ")}` : "",
+  ].filter(Boolean);
+  return `\n### Opening recommendation\n${lines.join("\n")}\n`;
+}
+
+function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
+  const body = i.inline
+    ? `\n\`\`\`\n${i.inline}\n\`\`\``
+    : `\n  ${i.summary}\n  Why: ${i.why}\n  Pointer: ${i.source}. Expand: /sherpa:expand ${i.handle}`;
+  return `- **${i.handle}** [${i.type}, ${(i.relevance * 100).toFixed(0)}%] ${i.source}${body}`;
+}
+
+function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan) {
+  if (signal.disposition.kind === "abstain") return `## Sherpa Context\nNo high-confidence context found for: ${signal.focus}`;
+  return `## Sherpa Context (${mode}, ~${budgetUsedTokens} tokens)`
+    + signalRouteLine(sourcePlan)
+    + `\nDisposition: **${signal.disposition.kind}** — ${signal.disposition.reason}\n`
+    + signalProposalSection(signal)
+    + signalRiskSection(signal)
+    + signalCommandSection(signal)
+    + signalRecommendationSection(signal)
+    + `\n### Context items\n${signal.items.map(signalItemMarkdownItem).join("\n")}`;
 }
 
 function bundleMarkdown(bundle: ContextBundle) {
@@ -1379,39 +1332,19 @@ function traceItem(item: ContextItem) {
   };
 }
 
-function traceGenericSourceClass(source: string): string | undefined {
-  const normalized = source.replace(/\\/g, "/").toLowerCase();
-  if (normalized.includes("docs/mission_prompt.md") || normalized.includes("docs/missions.md")) return "mission";
-  if (normalized.includes("documentation-drift") || normalized.includes("archivist_actionable_solutions.md") || normalized.includes("archivist-sherpa-gap-analysis")) return "archivist";
-  if (normalized.includes("/.pi/agent/skills/")) return "skill";
-  if (normalized === "repo://readme.md" || normalized.endsWith("/readme.md") || normalized.includes("/readme.md:")) return "readme";
-  return undefined;
-}
-
-function focusAllowsTraceGenericSource(source: string, focus: string): boolean {
-  const f = focus.toLowerCase();
-  switch (traceGenericSourceClass(source)) {
-    case "mission": return /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/.test(f);
-    case "archivist": return /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/.test(f);
-    case "skill": return /\b(skill|skills|agent skill|load skill)\b/.test(f);
-    case "readme": return /\b(readme|overview|onboard|onboarding|project summary)\b/.test(f);
-    default: return false;
-  }
-}
-
 function traceDecisions(focus: string, candidates: ContextItem[], selected: ContextItem[], curateResult: CurateResult) {
   const selectedSources = new Set(selected.map((item) => item.source));
   const curatedRejected = new Map(curateResult.rejected.map((item) => [item.source, item.reason]));
   return candidates.slice(0, 60).map((candidate) => {
     const reasons: string[] = [];
-    const generic = traceGenericSourceClass(candidate.source);
+    const generic = genericSourceClass(candidate.source);
     if (generic) reasons.push(`generic_source:${generic}`);
-    if (generic && !focusAllowsTraceGenericSource(candidate.source, focus)) reasons.push(`focus_does_not_allow_${generic}`);
+    if (generic && !focusAllowsGenericSource(candidate.source, focus)) reasons.push(`focus_does_not_allow_${generic}`);
     if (candidate.relevance < 0.25) reasons.push("low_relevance");
     const rejectedReason = curatedRejected.get(candidate.source);
     if (rejectedReason) reasons.push(`curator:${rejectedReason}`);
     const isSelected = selectedSources.has(candidate.source);
-    const isSuppressed = !isSelected && Boolean(generic && !focusAllowsTraceGenericSource(candidate.source, focus));
+    const isSuppressed = !isSelected && Boolean(generic && !focusAllowsGenericSource(candidate.source, focus));
     const decision = isSelected ? "selected" : isSuppressed ? "suppressed" : "rejected";
     if (!reasons.length) reasons.push(isSelected ? "selected_by_curator" : "not_selected_by_curator");
     return { source: candidate.source, finalRelevance: Number(candidate.relevance.toFixed(4)), decision, reasons };
@@ -1491,17 +1424,6 @@ function fileSnippetAllowed(sourcePath: string, focus: string, mode: string) {
   return true;
 }
 
-async function rg(cwd: string, query: string | string[], searchPath = cwd) {
-  const queryText = Array.isArray(query) ? query.join(" ") : query;
-  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-  if (!terms.length) return "";
-  const bundledRg = path.join(cwd, "bin", "rg");
-  const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
-  try {
-    const { stdout } = await execFileAsync(rgBin, ["-n", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.next", "--glob", "!dist", terms.join("|"), searchPath], { timeout: 3000, maxBuffer: 500_000 });
-    return stdout;
-  } catch (e: any) { return e.stdout ?? ""; }
-}
 async function gitChanged(cwd: string) {
   try { const { stdout } = await execFileAsync("git", ["-C", cwd, "status", "--short"], { timeout: 1500 }); return stdout; }
   catch { return ""; }
@@ -1577,6 +1499,47 @@ function shouldSearchTranscendentalMemory(focus: string): boolean {
   return /\b(transcendental|cross-project|global\s+memory|universal|principle|doctrine|meta-memory|wisdom)\b/i.test(focus);
 }
 
+function surrealSearchLimits(state: State) {
+  return {
+    constrainedLimit: Math.max(1, Math.min(30, state.config.surrealMemory?.constrainedLimit ?? DEFAULT_CONFIG.surrealMemory.constrainedLimit)),
+    broadFallbackLimit: Math.max(0, Math.min(20, state.config.surrealMemory?.broadFallbackLimit ?? DEFAULT_CONFIG.surrealMemory.broadFallbackLimit)),
+  };
+}
+
+async function safeSurrealSearch(store: MemoryApiStore, query: Parameters<MemoryApiStore["search"]>[0]): Promise<MemoryResult[]> {
+  return store.search(query).catch(() => []);
+}
+
+async function surrealProbeResults(
+  store: MemoryApiStore,
+  probe: string,
+  project: string,
+  types: string[] | undefined,
+  area: string | undefined,
+  includeTranscendental: boolean,
+  embedding: number[] | undefined,
+  limits: ReturnType<typeof surrealSearchLimits>,
+): Promise<MemoryResult[]> {
+  const halfConstrained = Math.max(3, Math.floor(limits.constrainedLimit / 2));
+  const searches = [
+    safeSurrealSearch(store, { text: probe, project, types, embedding, limit: limits.constrainedLimit }),
+    types && limits.broadFallbackLimit ? safeSurrealSearch(store, { text: probe, project, embedding, limit: limits.broadFallbackLimit }) : [],
+    area ? safeSurrealSearch(store, { text: probe, area, types, embedding, limit: halfConstrained }) : [],
+    area && limits.broadFallbackLimit ? safeSurrealSearch(store, { text: probe, area, embedding, limit: limits.broadFallbackLimit }) : [],
+    includeTranscendental ? safeSurrealSearch(store, { text: probe, scope: "transcendental", types, embedding, limit: halfConstrained }) : [],
+  ];
+  return (await Promise.all(searches)).flat();
+}
+
+function mergeSurrealProbeResults(merged: Map<string, MemoryResult>, results: MemoryResult[], probe: string, index: number): void {
+  const scoreBoost = index === 0 ? 0.08 : 0.03;
+  for (const result of results) {
+    const existing = merged.get(result.artifact.id);
+    const scored = { ...result, score: Math.min(1, result.score + scoreBoost), reason: `${result.reason}; associative probe: ${probe}` };
+    if (!existing || scored.score > existing.score) merged.set(result.artifact.id, scored);
+  }
+}
+
 async function searchSurrealAssociativeMemory(state: State, focus: string, indicators: SearchIndicators, project: string): Promise<MemoryResult[]> {
   const store = surrealMemoryStore(state);
   if (!store) return [];
@@ -1585,23 +1548,12 @@ async function searchSurrealAssociativeMemory(state: State, focus: string, indic
   const types = inferSurrealMemoryTypes(focus);
   const area = inferSurrealResearchArea(focus);
   const includeTranscendental = shouldSearchTranscendentalMemory(focus);
-  const constrainedLimit = Math.max(1, Math.min(30, state.config.surrealMemory?.constrainedLimit ?? DEFAULT_CONFIG.surrealMemory.constrainedLimit));
-  const broadFallbackLimit = Math.max(0, Math.min(20, state.config.surrealMemory?.broadFallbackLimit ?? DEFAULT_CONFIG.surrealMemory.broadFallbackLimit));
+  const limits = surrealSearchLimits(state);
   const queryEmbedding = await requestQueryEmbedding(focus);
   for (const [index, probe] of probes.entries()) {
     const embedding = index === 0 ? queryEmbedding : undefined;
-    const projectConstrained = await store.search({ text: probe, project, types, embedding, limit: constrainedLimit }).catch(() => []);
-    const projectBroad = types && broadFallbackLimit ? await store.search({ text: probe, project, embedding, limit: broadFallbackLimit }).catch(() => []) : [];
-    const research = area ? await store.search({ text: probe, area, types, embedding, limit: Math.max(3, Math.floor(constrainedLimit / 2)) }).catch(() => []) : [];
-    const broadResearch = area && broadFallbackLimit ? await store.search({ text: probe, area, embedding, limit: broadFallbackLimit }).catch(() => []) : [];
-    const transcendental = includeTranscendental ? await store.search({ text: probe, scope: "transcendental", types, embedding, limit: Math.max(3, Math.floor(constrainedLimit / 2)) }).catch(() => []) : [];
-    const results = [...projectConstrained, ...projectBroad, ...research, ...broadResearch, ...transcendental];
-    for (const result of results) {
-      const existing = merged.get(result.artifact.id);
-      const scoreBoost = index === 0 ? 0.08 : 0.03;
-      const scored = { ...result, score: Math.min(1, result.score + scoreBoost), reason: `${result.reason}; associative probe: ${probe}` };
-      if (!existing || scored.score > existing.score) merged.set(result.artifact.id, scored);
-    }
+    const results = await surrealProbeResults(store, probe, project, types, area, includeTranscendental, embedding, limits);
+    mergeSurrealProbeResults(merged, results, probe, index);
   }
   return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 8);
 }
@@ -1662,37 +1614,67 @@ async function searchGraphify(cwd: string, focus: string, cfg: SherpaConfig["gra
   }
 }
 
-async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Promise<Array<{ title: string; url: string; snippet: string }>> {
-  if (!webAllowed(state)) return [];
+type WebSearchResult = { title: string; url: string; snippet: string };
+
+function webSearchConfig(state: State, focus: string) {
+  if (!webAllowed(state)) return null;
   const provider = state.config.web.provider || "brave";
   const apiKey = process.env[state.config.web.apiKeyEnv || "BRAVE_SEARCH_API_KEY"];
-  if (!apiKey) return [];
-
   const query = conciseWebQuery(focus);
-  if (!query) return [];
-  const maxResults = Math.max(1, Math.min(10, state.config.web.maxResults ?? 5));
-  const timeoutMs = Math.max(1000, Math.min(10000, state.config.web.timeoutMs ?? 5000));
-  const cachePath = webCachePath(ctx.cwd, query, provider);
+  if (!apiKey || !query) return null;
+  return {
+    provider,
+    apiKey,
+    query,
+    maxResults: Math.max(1, Math.min(10, state.config.web.maxResults ?? 5)),
+    timeoutMs: Math.max(1000, Math.min(10000, state.config.web.timeoutMs ?? 5000)),
+    cacheTtlMs: state.config.web.cacheTtlMs ?? DEFAULT_CONFIG.web.cacheTtlMs,
+  };
+}
+
+function readWebCache(cachePath: string, cacheTtlMs: number): WebSearchResult[] | undefined {
   try {
-    if (existsSync(cachePath)) {
-      const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-      if (Date.now() - cached.at < (state.config.web.cacheTtlMs ?? DEFAULT_CONFIG.web.cacheTtlMs)) return cached.results ?? [];
-    }
-  } catch { /* ignore cache */ }
+    if (!existsSync(cachePath)) return undefined;
+    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+    return Date.now() - cached.at < cacheTtlMs ? cached.results ?? [] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeWebCache(cachePath: string, provider: string, query: string, results: WebSearchResult[]): void {
+  mkdirSync(path.dirname(cachePath), { recursive: true });
+  writeFileSync(cachePath, JSON.stringify({ at: Date.now(), provider, query, results }, null, 2));
+}
+
+async function searchBraveWeb(query: string, apiKey: string, maxResults: number, signal: AbortSignal): Promise<WebSearchResult[]> {
+  const url = `https://api.search.brave.com/res/v1/web/search?${new URLSearchParams({ q: query, count: String(maxResults), text_decorations: "false" })}`;
+  const res = await fetch(url, { headers: { "Accept": "application/json", "X-Subscription-Token": apiKey }, signal });
+  if (!res.ok) return [];
+  const json: any = await res.json();
+  return (json.web?.results ?? [])
+    .slice(0, maxResults)
+    .map((r: any) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.description ?? "" }))
+    .filter((r: WebSearchResult) => r.url);
+}
+
+async function runWebProviderSearch(config: NonNullable<ReturnType<typeof webSearchConfig>>, signal: AbortSignal): Promise<WebSearchResult[]> {
+  if (config.provider === "brave") return searchBraveWeb(config.query, config.apiKey, config.maxResults, signal);
+  return [];
+}
+
+async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Promise<WebSearchResult[]> {
+  const config = webSearchConfig(state, focus);
+  if (!config) return [];
+  const cachePath = webCachePath(ctx.cwd, config.query, config.provider);
+  const cached = readWebCache(cachePath, config.cacheTtlMs);
+  if (cached) return cached;
 
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  const timer = setTimeout(() => abort.abort(), config.timeoutMs);
   try {
-    let results: Array<{ title: string; url: string; snippet: string }> = [];
-    if (provider === "brave") {
-      const url = `https://api.search.brave.com/res/v1/web/search?${new URLSearchParams({ q: query, count: String(maxResults), text_decorations: "false" })}`;
-      const res = await fetch(url, { headers: { "Accept": "application/json", "X-Subscription-Token": apiKey }, signal: abort.signal });
-      if (!res.ok) return [];
-      const json: any = await res.json();
-      results = (json.web?.results ?? []).slice(0, maxResults).map((r: any) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.description ?? "" })).filter((r: any) => r.url);
-    }
-    mkdirSync(path.dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify({ at: Date.now(), provider, query, results }, null, 2));
+    const results = await runWebProviderSearch(config, abort.signal);
+    writeWebCache(cachePath, config.provider, config.query, results);
     return results;
   } catch {
     return [];
@@ -1701,362 +1683,338 @@ async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Pr
   }
 }
 
-async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
-  const enabled = (s: Source) => Boolean(state.config.sources[s]) && (!sourcePlan || sourcePlan.sources.includes(s));
-  const candidates: ContextItem[] = [];
-  const add = (type: string, source: string, raw: string, relBoost = 0) => {
+function createEmptyContextBundle(state: State, focus: string, mode: string, candidates: ContextItem[], sourcePlan: SourcePlan): ContextBundle {
+  state.bundles++;
+  const bundle: ContextBundle = {
+    bundleId: createBundleId(),
+    taskId: `sherpa-${Date.now()}`,
+    focus,
+    mode,
+    budgetUsedTokens: 0,
+    items: [],
+    candidateCount: candidates.length,
+    sourcePlan,
+  };
+  bundle.signal = buildContextSignal(bundle);
+  stashContextBundle(state, bundle);
+  return bundle;
+}
+
+type AddContextItem = (type: string, source: string, raw: string, relBoost?: number) => void;
+
+function addExplicitPathCandidates(ctx: ExtensionContext, focus: string, add: AddContextItem) {
+  for (const p of explicitPathCandidates(focus, ctx.cwd)) {
+    const exact = readExplicitSource(p);
+    if (exact) add("file_exact", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
+  }
+}
+
+async function addRoutedFileCandidates(ctx: ExtensionContext, focus: string, sourcePlan: SourcePlan, add: AddContextItem) {
+  for (const rel of sourcePlan?.routePlan?.read ?? []) {
+    if (routeSkipsPath(sourcePlan?.routePlan, rel)) continue;
+    const p = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
+    try {
+      if (existsSync(p) && statSync(p).isFile()) {
+        add("file_snippet", `repo://${rel}`, readFileSync(p, "utf8").slice(0, 1200), 0.35);
+      } else if (existsSync(p) && statSync(p).isDirectory()) {
+        const routedOut = await rg(ctx.cwd, focus, p);
+        for (const { fileAndLine, content } of parseRgOutput(routedOut, 12)) {
+          if (content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine)) add("file_snippet", `repo://${fileAndLine}`, content, 0.3);
+        }
+      }
+    } catch { /* ignore route file */ }
+  }
+}
+
+async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
+  const indicatorText = indicators.indicators.join(" ");
+  const out = await rg(ctx.cwd, indicators.indicators);
+  for (const { fileAndLine, content } of parseRgOutput(out, 30)) {
+    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicatorText, mode)) continue;
+    add("file_snippet", `repo://${fileAndLine}`, content, 0.15);
+  }
+}
+
+async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
+  addExplicitPathCandidates(ctx, focus, add);
+  await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
+  await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
+}
+
+function addCurrentProjectMemory(root: string, indicatorText: string, add: AddContextItem) {
+  const matches = catalogMatches(root, indicatorText, { limit: 8 });
+  for (const { row, relevance } of matches) {
+    const target = path.join(root, row.path);
+    if (!existsSync(target)) continue;
+    const raw = readFileSync(target, "utf8").slice(0, 3000);
+    add("project_memory", `kb://current-project/${row.path}`, [`Scope: current project`, `Catalog: ${path.join(root, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.25, relevance));
+  }
+  return matches;
+}
+
+function addResearchMemory(vault: string, indicatorText: string, add: AddContextItem) {
+  const researchBase = path.join(vault, "research");
+  if (!existsSync(researchBase)) return;
+  for (const area of readdirSync(researchBase).slice(0, 80)) {
+    const areaRoot = path.join(researchBase, area);
+    try {
+      if (!statSync(areaRoot).isDirectory()) continue;
+      for (const { row, relevance } of catalogMatches(areaRoot, indicatorText, { limit: 5 })) {
+        const target = path.join(areaRoot, row.path);
+        if (!existsSync(target)) continue;
+        const raw = readFileSync(target, "utf8").slice(0, 2600);
+        add("research_memory", `kb://research/${area}/${row.path}`, [`Scope: research`, `Area: ${area}`, `Catalog: ${path.join(areaRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.22, relevance));
+      }
+    } catch { /* ignore research area */ }
+  }
+}
+
+function addOtherProjectMemory(vault: string, currentRoot: string, indicatorText: string, add: AddContextItem) {
+  const projectsBase = path.join(vault, "projects");
+  if (!existsSync(projectsBase)) return;
+  for (const project of readdirSync(projectsBase).slice(0, 120)) {
+    const projectRoot = path.join(projectsBase, project);
+    try {
+      if (!statSync(projectRoot).isDirectory() || path.resolve(projectRoot) === currentRoot) continue;
+      for (const { row, relevance } of catalogMatches(projectRoot, indicatorText, { limit: 4 })) {
+        const target = path.join(projectRoot, row.path);
+        if (!existsSync(target)) continue;
+        const raw = readFileSync(target, "utf8").slice(0, 2200);
+        add("other_project_memory", `kb://project/${project}/${row.path}`, [`Scope: other project`, `Project: ${project}`, `Catalog: ${path.join(projectRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.18, relevance));
+      }
+    } catch { /* ignore project */ }
+  }
+}
+
+function addTaxonomyMemory(focus: string, add: AddContextItem) {
+  const taxonomyMatches = readGlobalTaxonomy()
+    .map((row) => ({ row, relevance: score([
+      row.kind, row.id, row.label, row.description, row.aliases, row.parent,
+      row.examples, row.notes,
+    ].filter(Boolean).join("\n"), focus) }))
+    .filter((item) => item.relevance > 0.08)
+    .sort((a, b) => b.relevance - a.relevance)
+    .slice(0, 10);
+  if (!taxonomyMatches.length) return;
+  add("taxonomy", "taxonomy:///Users/kamil/Documents/articles/taxonomy.csv", [
+    "# Global Knowledge Taxonomy Matches",
+    "Source: /Users/kamil/Documents/articles/taxonomy.csv",
+    "",
+    ...taxonomyMatches.map(({ row }) => [
+      `## ${row.kind}:${row.id} — ${row.label ?? ""}`,
+      row.description ? `Description: ${row.description}` : "",
+      row.aliases ? `Aliases: ${row.aliases}` : "",
+      row.examples ? `Examples: ${row.examples}` : "",
+      row.notes ? `Notes: ${row.notes}` : "",
+    ].filter(Boolean).join("\n")),
+  ].join("\n\n"), 0.16);
+}
+
+function addOntologyFallbackMemory(root: string, focus: string, add: AddContextItem) {
+  const roots = ["systems", "procedures", "decisions", "concepts", "evidence"].map((name) => path.join(root, "wiki", name));
+  roots.push(path.join(root, "journal"), path.join(root, "inbox"));
+  for (const dir of roots) {
+    if (!existsSync(dir)) continue;
+    try {
+      for (const f of readdirSync(dir).filter((n: string) => n.endsWith(".md")).slice(0, 8)) {
+        const raw = readFileSync(path.join(dir, f), "utf8").slice(0, 2000);
+        if (score(raw, focus) > 0.1) add("project_memory", `kb://${path.relative(root, path.join(dir, f))}`, raw, 0.2);
+      }
+    } catch { /* ignore */ }
+  }
+}
+
+async function addProjectMemoryCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem) {
+  const root = obsidianMemoryPath(state);
+  const vault = obsidianVaultPath(state);
+  const indicatorText = indicators.indicators.join(" ");
+  const currentProjectMatches = addCurrentProjectMemory(root, indicatorText, add);
+  addResearchMemory(vault, indicatorText, add);
+  if (options.searchOtherProjects) addOtherProjectMemory(vault, path.resolve(root), indicatorText, add);
+  if (options.includeTaxonomy || /\b(taxonomy|tag|tags|label|labels|category|relationship|nomenclature)\b/i.test(focus)) addTaxonomyMemory(focus, add);
+  // If current project catalog is absent or did not match, fall back to current
+  // project's semantic ontology folders only. Do not scan legacy bucket folders.
+  if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
+}
+
+async function addSembleCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
+  const query = [focus, ...indicators.indicators].join(" ").trim();
+  const results = await searchSemble(ctx.cwd, query, state.config.semble);
+  for (const result of results) {
+    if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
+    add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.4);
+  }
+}
+
+async function addSurrealMemoryCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
+  const store = surrealMemoryStore(state);
+  if (!store) return;
+  const results = await searchSurrealAssociativeMemory(state, focus, indicators, path.basename(ctx.cwd));
+  for (const result of results) {
+    const evidenceDepth = Math.max(1, Math.min(3, state.config.surrealMemory?.evidenceDepth ?? DEFAULT_CONFIG.surrealMemory.evidenceDepth));
+    const evidenceChain = result.evidenceChain?.length ? result.evidenceChain : await store.retrieveEvidenceChain(result.artifact.id, { depth: evidenceDepth, limit: 10 }).catch(() => []);
+    const chainWeight = Math.max(0, ...evidenceChain.map((step) => Number(step.summary?.match(/weight=([0-9.]+)/)?.[1] ?? 0)));
+    const chain = evidenceChain.length
+      ? `\n\nEvidence chain:\n${evidenceChain.map((step) => `- ${step.from} -[${step.relation}]-> ${step.to}${step.summary ? ` (${step.summary})` : ""}`).join("\n")}`
+      : "";
+    const raw = [
+      `Scope: ${result.artifact.scope}`,
+      result.artifact.project ? `Project: ${result.artifact.project}` : "",
+      result.artifact.area ? `Area: ${result.artifact.area}` : "",
+      `Type: ${result.artifact.type}`,
+      `Title: ${result.artifact.title}`,
+      result.artifact.summary ? `Summary: ${result.artifact.summary}` : "",
+      result.artifact.sourcePath ? `Source: ${result.artifact.sourcePath}` : "",
+      "",
+      result.artifact.text ?? "",
+      chain,
+    ].filter(Boolean).join("\n");
+    const chainWeightBoost = Math.max(0, Math.min(1, state.config.surrealMemory?.chainWeightBoost ?? DEFAULT_CONFIG.surrealMemory.chainWeightBoost));
+    add("surreal_memory", `surreal://${result.artifact.id}`, raw, Math.max(0.28, result.score + (chainWeight * chainWeightBoost)));
+  }
+}
+
+function addDocCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
+  const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan);
+  for (const f of docFiles) {
+    const p = path.join(ctx.cwd, f);
+    if (existsSync(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
+  }
+}
+
+function addSessionCandidates(ctx: ExtensionContext, add: AddContextItem) {
+  const recent = ctx.sessionManager.getEntries().slice(-25).map((e: any) => JSON.stringify(e).slice(0, 500)).join("\n");
+  add("session_recent", "session://recent", recent, 0.05);
+}
+
+function addMemoryIndexCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
+  try {
+    const memoryConfig = {
+      scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+      catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+      evaluationRoot: obsidianMemoryPath(state),
+    };
+    indexSherpaMemory(ctx.cwd, memoryConfig);
+    const memoryHits = searchSherpaMemory(ctx.cwd, [focus, ...indicators.indicators].join(" "), 8, memoryConfig);
+    for (const hit of memoryHits) {
+      add("memory_index", `memory-index://${hit.kind}/${path.relative(ctx.cwd, hit.sourcePath)}`, [
+        `Kind: ${hit.kind}`,
+        `Title: ${hit.title}`,
+        hit.summary ? `Summary: ${hit.summary}` : "",
+        `Source: ${hit.sourcePath}`,
+        "",
+        hit.snippet || hit.summary,
+      ].filter(Boolean).join("\n"), 0.24);
+    }
+  } catch { /* memory index recall is opportunistic */ }
+}
+
+async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, candidates: ContextItem[], add: AddContextItem, enabled: (s: Source) => boolean) {
+  if (mode !== "front-door" || !enabled("files") || postProcessCandidates(candidates, focus, mode).length !== 0) return;
+  if (enabled("semble") && state.config.semble?.enabled) {
+    const retrySemble = await searchSemble(ctx.cwd, focus, state.config.semble);
+    for (const result of retrySemble.slice(0, 8)) {
+      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
+      add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
+    }
+  }
+  const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
+  for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
+    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
+    add("file_snippet", `repo://${fileAndLine}`, content, 0.08);
+  }
+}
+
+function createContextAdder(state: State, focus: string, candidates: ContextItem[]): AddContextItem {
+  return (type: string, source: string, raw: string, relBoost = 0) => {
     if (!raw.trim()) return;
     const handle = `ctx-${state.nextHandle++}`;
-    // Precision rule: small content → inline; large → pointer to handle
     const inline = raw.length <= 900 && !type.includes("session");
     const summary = summarize(raw);
     const pointer = inline ? "" : ` (expand with /sherpa:expand ${handle})`;
     const item: ContextItem = { handle, type, source, relevance: Math.min(1, score(raw + " " + source, focus) + relBoost), summary: summary + pointer, raw, inline };
-    state.handles.set(handle, item); candidates.push(item);
+    state.handles.set(handle, item);
+    candidates.push(item);
   };
+}
 
+function addUrlReferences(state: State, focus: string, add: AddContextItem) {
   const urls = state.config.dedupe?.urls?.enabled ? extractUrls(focus) : (focus.match(/https?:\/\/\S+/g) ?? []);
   for (const url of urls) {
-    add(
-      "url_reference",
-      url,
-      state.config.privacy.allowNetwork || state.config.sources.web
-        ? `User provided URL: ${url}. Sherpa did not fetch it yet; the main agent should fetch/read it with an approved web tool if needed.`
-        : `User provided URL: ${url}. Network/web retrieval is disabled in Sherpa privacy settings, so this is passed through as an explicit reference for the main agent.`,
-      0.9,
-    );
+    add("url_reference", url, state.config.privacy.allowNetwork || state.config.sources.web
+      ? `User provided URL: ${url}. Sherpa did not fetch it yet; the main agent should fetch/read it with an approved web tool if needed.`
+      : `User provided URL: ${url}. Network/web retrieval is disabled in Sherpa privacy settings, so this is passed through as an explicit reference for the main agent.`, 0.9);
   }
+}
 
-  const retrievalTasks: Promise<void>[] = [];
+function retrievalEnabled(state: State, sourcePlan: SourcePlan) {
+  return (s: Source) => Boolean(state.config.sources[s]) && sourcePlan.sources.includes(s);
+}
 
-  if (enabled("files")) retrievalTasks.push((async () => {
-    for (const p of explicitPathCandidates(focus, ctx.cwd)) {
-      const exact = readExplicitSource(p);
-      if (exact) add("file_exact", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
-    }
-
-    const routeRead = sourcePlan?.routePlan?.read ?? [];
-    for (const rel of routeRead) {
-      if (routeSkipsPath(sourcePlan?.routePlan, rel)) continue;
-      const p = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
-      try {
-        if (existsSync(p) && statSync(p).isFile()) {
-          add("file_snippet", `repo://${rel}`, readFileSync(p, "utf8").slice(0, 1200), 0.35);
-        } else if (existsSync(p) && statSync(p).isDirectory()) {
-          const routedOut = await rg(ctx.cwd, focus, p);
-          for (const block of routedOut.split("\n").slice(0, 12)) {
-            if (!block.trim()) continue;
-            const firstColon = block.indexOf(":");
-            const secondColon = firstColon >= 0 ? block.indexOf(":", firstColon + 1) : -1;
-            if (firstColon === -1 || secondColon === -1) continue;
-            const fileAndLine = block.slice(0, secondColon);
-            const content = block.slice(secondColon + 1).trim();
-            if (content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine)) add("file_snippet", `repo://${fileAndLine}`, content, 0.3);
-          }
-        }
-      } catch { /* ignore route file */ }
-    }
-    // Stage 2: search using model-inferred indicators, not raw focus text
-    const out = await rg(ctx.cwd, indicators.indicators);
-    for (const block of out.split("\n").slice(0, 30)) {
-      if (!block.trim()) continue;
-      // rg format: file:line:content. Split on the first two separators only so
-      // content containing URLs/JSON colons remains intact.
-      const firstColon = block.indexOf(":");
-      const secondColon = firstColon >= 0 ? block.indexOf(":", firstColon + 1) : -1;
-      if (firstColon === -1 || secondColon === -1) continue;
-      const fileAndLine = block.slice(0, secondColon);
-      const content = block.slice(secondColon + 1).trim();
-      if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicators.indicators.join(" "), mode)) continue;
-      add("file_snippet", `repo://${fileAndLine}`, content, 0.15);
-    }
-  })());
-
-  if (enabled("semble") && state.config.semble?.enabled) retrievalTasks.push((async () => {
-    const query = [focus, ...indicators.indicators].join(" ").trim();
-    const results = await searchSemble(ctx.cwd, query, state.config.semble);
-    for (const result of results) {
-      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
-      add(
-        "semantic_code_snippet",
-        `repo://${result.filePath}:${result.startLine}`,
-        result.content,
-        0.4,
-      );
-    }
-  })());
-
-  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) retrievalTasks.push((async () => {
+function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {
+  const tasks: Promise<void>[] = [];
+  if (enabled("files")) tasks.push(addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("semble") && state.config.semble?.enabled) tasks.push(addSembleCandidates(state, ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) tasks.push((async () => {
     const raw = await searchGraphify(ctx.cwd, focus, state.config.graphify);
     if (raw) add("graphify_code_graph", `graphify://${path.relative(ctx.cwd, graphifyGraphPath(ctx.cwd, state.config.graphify)) || state.config.graphify.graphPath}`, raw, 0.32);
   })());
+  if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
+  if (enabled("git")) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
+  if (enabled("web")) tasks.push((async () => { for (const r of await searchWeb(state, ctx, focus)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
+  if (enabled("surreal_memory")) tasks.push(addSurrealMemoryCandidates(state, ctx, focus, indicators, add));
+  if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
+  if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
+  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(state, ctx, focus, indicators, add)));
+  return tasks;
+}
 
-  if (enabled("docs")) retrievalTasks.push(Promise.resolve().then(() => {
-    // AGENTS.md/CLAUDE.md are already discovered and injected by Pi's main
-    // context-file loader. Sherpa should not duplicate them in front-door or
-    // explicit retrieval bundles; it focuses on project docs and source-grounded
-    // snippets that are not already preloaded.
-    // Stage 2: doc paths filtered by inferred indicators, not raw focus
-    const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan);
-    for (const f of docFiles) {
-      const p = path.join(ctx.cwd, f);
-      if (existsSync(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
-    }
-  }));
-
-  if (enabled("git")) retrievalTasks.push((async () => {
-    add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05);
-  })());
-
-  if (enabled("web")) retrievalTasks.push((async () => {
-    const results = await searchWeb(state, ctx, focus);
-    for (const r of results) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25);
-  })());
-
-  if (enabled("surreal_memory")) retrievalTasks.push((async () => {
-    const store = surrealMemoryStore(state);
-    if (!store) return;
-    const results = await searchSurrealAssociativeMemory(state, focus, indicators, path.basename(ctx.cwd));
-    for (const result of results) {
-      const evidenceDepth = Math.max(1, Math.min(3, state.config.surrealMemory?.evidenceDepth ?? DEFAULT_CONFIG.surrealMemory.evidenceDepth));
-      const evidenceChain = result.evidenceChain?.length ? result.evidenceChain : await store.retrieveEvidenceChain(result.artifact.id, { depth: evidenceDepth, limit: 10 }).catch(() => []);
-      const chainWeight = Math.max(0, ...evidenceChain.map((step) => Number(step.summary?.match(/weight=([0-9.]+)/)?.[1] ?? 0)));
-      const chain = evidenceChain.length
-        ? `\n\nEvidence chain:\n${evidenceChain.map((step) => `- ${step.from} -[${step.relation}]-> ${step.to}${step.summary ? ` (${step.summary})` : ""}`).join("\n")}`
-        : "";
-      const raw = [
-        `Scope: ${result.artifact.scope}`,
-        result.artifact.project ? `Project: ${result.artifact.project}` : "",
-        result.artifact.area ? `Area: ${result.artifact.area}` : "",
-        `Type: ${result.artifact.type}`,
-        `Title: ${result.artifact.title}`,
-        result.artifact.summary ? `Summary: ${result.artifact.summary}` : "",
-        result.artifact.sourcePath ? `Source: ${result.artifact.sourcePath}` : "",
-        "",
-        result.artifact.text ?? "",
-        chain,
-      ].filter(Boolean).join("\n");
-      const chainWeightBoost = Math.max(0, Math.min(1, state.config.surrealMemory?.chainWeightBoost ?? DEFAULT_CONFIG.surrealMemory.chainWeightBoost));
-      add("surreal_memory", `surreal://${result.artifact.id}`, raw, Math.max(0.28, result.score + (chainWeight * chainWeightBoost)));
-    }
-  })());
-
-  if (enabled("project_memory")) retrievalTasks.push((async () => {
-    // Obsidian memory uses catalog.csv as the first-class retrieval surface.
-    // Results are organized by scope: current project first, then research.
-    // Other projects are searched only when explicitly requested.
-    const root = obsidianMemoryPath(state);
-    const currentProjectMatches = catalogMatches(root, indicators.indicators.join(" "), 8);
-
-    for (const { row, relevance } of currentProjectMatches) {
-      const target = path.join(root, row.path);
-      if (!existsSync(target)) continue;
-      const raw = readFileSync(target, "utf8").slice(0, 3000);
-      add("project_memory", `kb://current-project/${row.path}`, [`Scope: current project`, `Catalog: ${path.join(root, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.25, relevance));
-    }
-
-    const vault = obsidianVaultPath(state);
-    const researchBase = path.join(vault, "research");
-    if (existsSync(researchBase)) {
-      for (const area of readdirSync(researchBase).slice(0, 80)) {
-        const areaRoot = path.join(researchBase, area);
-        try {
-          if (!statSync(areaRoot).isDirectory()) continue;
-          for (const { row, relevance } of catalogMatches(areaRoot, indicators.indicators.join(" "), 5)) {
-            const target = path.join(areaRoot, row.path);
-            if (!existsSync(target)) continue;
-            const raw = readFileSync(target, "utf8").slice(0, 2600);
-            add("research_memory", `kb://research/${area}/${row.path}`, [`Scope: research`, `Area: ${area}`, `Catalog: ${path.join(areaRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.22, relevance));
-          }
-        } catch { /* ignore research area */ }
-      }
-    }
-
-    if (options.searchOtherProjects) {
-      const projectsBase = path.join(vault, "projects");
-      const currentRoot = path.resolve(root);
-      if (existsSync(projectsBase)) {
-        for (const project of readdirSync(projectsBase).slice(0, 120)) {
-          const projectRoot = path.join(projectsBase, project);
-          try {
-            if (!statSync(projectRoot).isDirectory() || path.resolve(projectRoot) === currentRoot) continue;
-            for (const { row, relevance } of catalogMatches(projectRoot, indicators.indicators.join(" "), 4)) {
-              const target = path.join(projectRoot, row.path);
-              if (!existsSync(target)) continue;
-              const raw = readFileSync(target, "utf8").slice(0, 2200);
-              add("other_project_memory", `kb://project/${project}/${row.path}`, [`Scope: other project`, `Project: ${project}`, `Catalog: ${path.join(projectRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.18, relevance));
-            }
-          } catch { /* ignore project */ }
-        }
-      }
-    }
-
-    const wantsTaxonomy = options.includeTaxonomy || /\b(taxonomy|tag|tags|label|labels|category|relationship|nomenclature)\b/i.test(focus);
-    if (wantsTaxonomy) {
-      const taxonomy = readGlobalTaxonomy();
-      const taxonomyMatches = taxonomy
-        .map((row) => ({ row, relevance: score([
-          row.kind, row.id, row.label, row.description, row.aliases, row.parent,
-          row.examples, row.notes,
-        ].filter(Boolean).join("\n"), focus) }))
-        .filter((item) => item.relevance > 0.08)
-        .sort((a, b) => b.relevance - a.relevance)
-        .slice(0, 10);
-      if (taxonomyMatches.length) {
-        add("taxonomy", "taxonomy:///Users/kamil/Documents/articles/taxonomy.csv", [
-          "# Global Knowledge Taxonomy Matches",
-          "Source: /Users/kamil/Documents/articles/taxonomy.csv",
-          "",
-          ...taxonomyMatches.map(({ row }) => [
-            `## ${row.kind}:${row.id} — ${row.label ?? ""}`,
-            row.description ? `Description: ${row.description}` : "",
-            row.aliases ? `Aliases: ${row.aliases}` : "",
-            row.examples ? `Examples: ${row.examples}` : "",
-            row.notes ? `Notes: ${row.notes}` : "",
-          ].filter(Boolean).join("\n")),
-        ].join("\n\n"), 0.16);
-      }
-    }
-
-    // If current project catalog is absent or did not match, fall back to current
-    // project's semantic ontology folders only. Do not scan legacy bucket folders.
-    if (currentProjectMatches.length) return;
-    const roots = [
-      path.join(root, "wiki", "systems"),
-      path.join(root, "wiki", "procedures"),
-      path.join(root, "wiki", "decisions"),
-      path.join(root, "wiki", "concepts"),
-      path.join(root, "wiki", "evidence"),
-      path.join(root, "journal"),
-      path.join(root, "inbox"),
-    ];
-    for (const dir of roots) {
-      if (!existsSync(dir)) continue;
-      try {
-        for (const f of readdirSync(dir).filter((n: string) => n.endsWith(".md")).slice(0, 8)) {
-          const raw = readFileSync(path.join(dir, f), "utf8").slice(0, 2000);
-          if (score(raw, focus) > 0.1) add("project_memory", `kb://${path.relative(root, path.join(dir, f))}`, raw, 0.2);
-        }
-      } catch { /* ignore */ }
-    }
-  })());
-
-  if (enabled("session")) retrievalTasks.push(Promise.resolve().then(() => {
-    const recent = ctx.sessionManager.getEntries().slice(-25).map((e: any) => JSON.stringify(e).slice(0, 500)).join("\n");
-    add("session_recent", "session://recent", recent, 0.05);
-  }));
-
-  if (enabled("project_memory")) retrievalTasks.push(Promise.resolve().then(() => {
-    try {
-      const memoryConfig = {
-        scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
-        catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
-        evaluationRoot: obsidianMemoryPath(state),
-      };
-      indexSherpaMemory(ctx.cwd, memoryConfig);
-      const memoryHits = searchSherpaMemory(ctx.cwd, [focus, ...indicators.indicators].join(" "), 8, memoryConfig);
-      for (const hit of memoryHits) {
-        add(
-          "memory_index",
-          `memory-index://${hit.kind}/${path.relative(ctx.cwd, hit.sourcePath)}`,
-          [
-            `Kind: ${hit.kind}`,
-            `Title: ${hit.title}`,
-            hit.summary ? `Summary: ${hit.summary}` : "",
-            `Source: ${hit.sourcePath}`,
-            "",
-            hit.snippet || hit.summary,
-          ].filter(Boolean).join("\n"),
-          0.24,
-        );
-      }
-    } catch { /* memory index recall is opportunistic */ }
-  }));
-
-  await Promise.allSettled(retrievalTasks);
-
-  // Active retry: if first-pass retrieval only produced generic/uncurated context,
-  // try Semble first (the default code-search path), then one bounded raw-query
-  // grep fallback. This gives Stage 3 better candidates without flooding the session.
-  if (mode === "front-door" && enabled("files") && postProcessCandidates(candidates, focus, mode).length === 0) {
-    if (enabled("semble") && state.config.semble?.enabled) {
-      const retrySemble = await searchSemble(ctx.cwd, focus, state.config.semble);
-      for (const result of retrySemble.slice(0, 8)) {
-        if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
-        add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
-      }
-    }
-    const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
-    for (const block of retryOut.split("\n").slice(0, 16)) {
-      if (!block.trim()) continue;
-      const firstColon = block.indexOf(":");
-      const secondColon = firstColon >= 0 ? block.indexOf(":", firstColon + 1) : -1;
-      if (firstColon === -1 || secondColon === -1) continue;
-      const fileAndLine = block.slice(0, secondColon);
-      const content = block.slice(secondColon + 1).trim();
-      if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
-      add("file_snippet", `repo://${fileAndLine}`, content, 0.08);
-    }
-  }
-
-  // Closed-loop feedback: recent post-task evaluations penalize sources that were
-  // repeatedly noise and boost exact filenames that were previously missed.
-  let traceFeedback: { recentEvaluations?: number; qualitySummaryUsed?: boolean } = {};
+function applyRetrievalFeedback(state: State, focus: string, candidates: ContextItem[]) {
   try {
     const memoryRoot = obsidianMemoryPath(state);
     const recentEvaluations = readRecentEvaluations(memoryRoot, 200);
     const qualitySummary = readQualitySummary(memoryRoot);
-    traceFeedback = { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
     const adjusted = applyEvaluationFeedbackToCandidates(candidates, recentEvaluations, qualitySummary, { focus });
     candidates.splice(0, candidates.length, ...adjusted);
-  } catch { /* feedback must never affect retrieval availability */ }
+    return { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
+  } catch { return {}; }
+}
 
-// Stage 3: model judges candidates with hard suppression gate.
-  const curateResult = await curateCandidates(state, ctx, candidates, focus, mode, indicators);
-
-  // HARD GATE: if Stage 3 suppressed everything, return empty bundle (triggers abstain)
-  if (curateResult.abstain) {
-    state.bundles++;
-    const abstainBundle: ContextBundle = {
-      bundleId: createBundleId(),
-      taskId: `sherpa-${Date.now()}`,
-      focus,
-      mode,
-      budgetUsedTokens: 0,
-      items: [],
-      candidateCount: candidates.length,
-      sourcePlan,
-    };
-    abstainBundle.signal = buildContextSignal(abstainBundle);
-    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, curateResult, traceFeedback);
-    stashContextBundle(state, abstainBundle);
-    return abstainBundle;
-  }
-
-  const items: ContextItem[] = []; let used = 0;
-  const finalItems = postProcessCandidates(curateResult.items, focus, mode);
-  if (mode === "front-door" && finalItems.length === 0) {
-    state.bundles++;
-    const abstainBundle: ContextBundle = {
-      bundleId: createBundleId(),
-      taskId: `sherpa-${Date.now()}`,
-      focus,
-      mode,
-      budgetUsedTokens: 0,
-      items: [],
-      candidateCount: candidates.length,
-      sourcePlan,
-    };
-    abstainBundle.signal = buildContextSignal(abstainBundle);
-    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, { ...curateResult, abstain: true, abstainReason: "post-curation suppression removed all selected candidates" }, traceFeedback);
-    stashContextBundle(state, abstainBundle);
-    return abstainBundle;
-  }
+function pickFinalContextItems(finalItems: ContextItem[], tokenBudget: number) {
+  const items: ContextItem[] = [];
+  let used = 0;
   for (const c of finalItems) {
     const t = approxTokens(c.summary) + 30;
     if (used + t <= tokenBudget) { items.push(c); used += t; }
     if (items.length >= 8) break;
   }
+  return { items, used };
+}
+
+async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
+  const enabled = retrievalEnabled(state, sourcePlan);
+  const candidates: ContextItem[] = [];
+  const add = createContextAdder(state, focus, candidates);
+
+  addUrlReferences(state, focus, add);
+  await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled));
+  await retryFrontDoorFileCandidates(state, ctx, focus, mode, sourcePlan, candidates, add, enabled);
+
+  const traceFeedback = applyRetrievalFeedback(state, focus, candidates);
+  const curateResult = await curateCandidates(state, ctx, candidates, focus, mode, indicators);
+  if (curateResult.abstain) {
+    const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
+    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, curateResult, traceFeedback);
+    return abstainBundle;
+  }
+
+  const finalItems = postProcessCandidates(curateResult.items, focus, mode);
+  if (mode === "front-door" && finalItems.length === 0) {
+    const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
+    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, { ...curateResult, abstain: true, abstainReason: "post-curation suppression removed all selected candidates" }, traceFeedback);
+    return abstainBundle;
+  }
+  const { items, used } = pickFinalContextItems(finalItems, tokenBudget);
   state.bundles++;
   const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
   bundle.signal = buildContextSignal(bundle);
@@ -2157,17 +2115,6 @@ function isSourcePath(file: string) {
   return /\.(ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|swift|c|cc|cpp|h|hpp|cs|php|rb|sql|json|ya?ml|toml)$/.test(p);
 }
 
-function parseGitStatusFiles(status: string) {
-  const files: string[] = [];
-  for (const line of status.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const raw = line.slice(3).trim();
-    const file = raw.includes(" -> ") ? raw.split(" -> ").pop()!.trim() : raw;
-    if (file) files.push(file);
-  }
-  return files;
-}
-
 function parseToolArguments(args: unknown): any {
   if (!args) return {};
   if (typeof args === "string") {
@@ -2216,6 +2163,24 @@ function extractMentionedRepoFiles(text: string, cwd: string) {
 
 function recentTurnWrittenFiles(messages: any[] | undefined, cwd: string) {
   return collectRecentTaskFileEvidence(messages, cwd).writtenFiles;
+}
+
+function toolTextResult(text: string, details?: unknown) {
+  return { content: [{ type: "text" as const, text }], details };
+}
+
+function toolErrorResult(prefix: string, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return toolTextResult(`${prefix}: ${message}`, { error: message });
+}
+
+async function runDspyPromptCompile(ctx: ExtensionContext) {
+  const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
+  const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
+  const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
+  const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
+  const result = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+  return { ...result, candidateDir };
 }
 
 function docSearchTerms(files: string[]) {
@@ -2281,11 +2246,7 @@ export default function (pi: ExtensionAPI) {
       if (exported.averageMetric < DSPY_COMPILE_MIN_AVG_METRIC) return { ran: false, reason: `average metric ${exported.averageMetric.toFixed(2)} below ${DSPY_COMPILE_MIN_AVG_METRIC}` };
       if (exported.highScoringExamples < DSPY_COMPILE_MIN_HIGH_EXAMPLES) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_HIGH_EXAMPLES} high-scoring examples; have ${exported.highScoringExamples}` };
     }
-    const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
-    const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
-    const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
-    const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
-    const { stdout } = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+    const { stdout } = await runDspyPromptCompile(ctx);
     state.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state.bundles };
     persist();
     if (notify) ctx.ui.notify([`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
@@ -2303,6 +2264,114 @@ export default function (pi: ExtensionAPI) {
     catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (event !== "bundle") ctx.ui.notify(`Sherpa DSPy auto-compile failed: ${message}`, "warning");
+    }
+  };
+
+  const processAutomationCandidates = (stateObj: State, ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
+    const raw = stringifyForAutoMemory(recentMessages);
+    const automationCandidates = updateAutomationCandidates(stateObj.automation, raw, 3, cwd);
+    for (const candidate of automationCandidates) {
+      appendScratchpadSection(stateObj, cwd, "distill_candidate", `${candidate.markdown}\n\nPolicy source: ${stateObj.automationPromptSource}`, "Automation candidate");
+    }
+    if (automationCandidates.length) {
+      try { ctx.ui.notify(`Sherpa detected ${automationCandidates.length} automation candidate(s)`, "info"); } catch {}
+    }
+  };
+
+  const recordLifecycleObservation = async (stateObj: State, cwd: string, recentMessages: unknown[]) => {
+    const recentText = stringifyForAutoMemory(recentMessages);
+    const outcome = classifyTaskOutcome(recentText);
+    const status = await gitChanged(cwd);
+    const changedFiles = parseGitStatusFiles(status);
+    const lifecycleHash = hashAutoMemory(`lifecycle\n${outcome.outcome}\n${changedFiles.sort().join("\n")}`);
+    if (!stateObj.lifecycleHashes.includes(lifecycleHash) && (changedFiles.length || outcome.outcome !== "unknown")) {
+      const verification = suggestVerificationCommands(changedFiles);
+      appendScratchpadSection(stateObj, cwd, "observation", [
+        `Outcome: ${outcome.outcome}`,
+        `Reason: ${outcome.reason}`,
+        "",
+        changedFiles.length ? "Changed files:" : "Changed files: none detected",
+        ...changedFiles.slice(0, 30).map((file) => `- ${file}`),
+        "",
+        verification.commands.length ? "Suggested verification:" : "Suggested verification: none",
+        ...verification.commands.map((item) => `- \`${item.command}\` — ${item.reason}`),
+        verification.docsReview ? "- Documentation review recommended." : "- Documentation review not required by heuristic.",
+      ].join("\n"), "Task lifecycle summary");
+      stateObj.lifecycleHashes = [...stateObj.lifecycleHashes.slice(-49), lifecycleHash];
+    }
+    return { recentText, outcome, changedFiles };
+  };
+
+  const evaluateRecentBundle = async (stateObj: State, ctx: ExtensionContext, cwd: string, recentMessages: unknown[], recentText: string, outcome: ReturnType<typeof classifyTaskOutcome>, changedFiles: string[]) => {
+    try {
+      const bundle = stateObj.lastBundleId ? getBundle(stateObj, stateObj.lastBundleId) : undefined;
+      if (!bundle || Date.now() - bundle.timestamp >= 2 * 60 * 60 * 1000) return;
+      const evidence = collectRecentTaskFileEvidence(recentMessages, cwd);
+      const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
+      const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
+      if (!hasTaskSignal) return;
+      const evalRecord = evaluatePostTaskContext({
+        bundle,
+        outcome: outcome.outcome,
+        files: { ...evidence, referencedFiles, changedFiles },
+        finalText: recentText.slice(-2000),
+      });
+      const memoryRoot = obsidianMemoryPath(stateObj);
+      const target = writeEvaluation(memoryRoot, evalRecord);
+      writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
+      appendScratchpadSection(stateObj, cwd, "observation", [
+        `Bundle: ${evalRecord.bundleId}`,
+        `Scores: relevance=${evalRecord.scores.relevance} precision=${evalRecord.scores.precision} recall=${evalRecord.scores.recall}`,
+        evalRecord.noise.length ? `Noise: ${evalRecord.noise.slice(0, 8).join(", ")}` : "Noise: none detected",
+        evalRecord.missed.length ? `Missed: ${evalRecord.missed.slice(0, 8).join(", ")}` : "Missed: none detected",
+        `Hint: ${evalRecord.improvementHint}`,
+        `Stored: ${path.relative(memoryRoot, target)}`,
+      ].join("\n"), "Sherpa retrieval evaluation");
+      void recordSurrealRetrievalFeedback(stateObj, bundle, evalRecord);
+      void maybeAutoCompileDspy(ctx, "evaluate");
+    } catch { /* retrieval evaluation must never affect task completion */ }
+  };
+
+  const maybeAutoDistillScratchpad = (stateObj: State, ctx: ExtensionContext, cwd: string, outcome: ReturnType<typeof classifyTaskOutcome>, changedFiles: string[]) => {
+    try {
+      const scratchpadRoot = scratchpadRootPath(stateObj, cwd);
+      const adCheck = checkAutoDistill({ outcome: outcome.outcome, changedFiles: changedFiles.length, hasDistillCandidates: true }, {
+        scratchpadRoot,
+        minChangedFiles: 3,
+        enabled: stateObj.config.enabled,
+      });
+      if (!adCheck.shouldTrigger) return;
+      const payloads = prepareDistillPayloads(adCheck.newCandidates);
+      const writes = payloads.map((payload) => writeDistilledSkill(payload, cwd, obsidianMemoryPath(stateObj)));
+      appendScratchpadSection(stateObj, cwd, "observation", [
+        `Auto-distill completed: ${adCheck.reason}`,
+        `Domains: ${[...new Set(payloads.map((p) => p.domain))].join(", ")}`,
+        `Candidates: ${payloads.length}`,
+        ...writes.map((w, i) => `${i + 1}. [${w.destination}] ${path.relative(ctx.cwd, w.skillPath)}`),
+      ].join("\n"), "Auto-distill completed");
+      markAutoDistillRun(scratchpadRoot);
+      try { ctx.ui.notify(`Sherpa auto-distilled ${writes.length} candidate(s)`, "info"); } catch {}
+    } catch { /* auto-distill is best-effort */ }
+  };
+
+  const compactScratchpadAndNotify = (stateObj: State, ctx: ExtensionContext, cwd: string) => {
+    const compacted = compactScratchpad(scratchpadRootPath(stateObj, cwd));
+    if (compacted.compacted.length) {
+      try { ctx.ui.notify(`Sherpa compacted scratchpad sections: ${compacted.compacted.join(", ")}`, "info"); } catch {}
+    }
+  };
+
+  const runPostTaskWork = async (ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
+    if (!state?.config.enabled) return;
+    const stateObj = state;
+    try {
+      processAutomationCandidates(stateObj, ctx, cwd, recentMessages);
+      const { recentText, outcome, changedFiles } = await recordLifecycleObservation(stateObj, cwd, recentMessages);
+      await evaluateRecentBundle(stateObj, ctx, cwd, recentMessages, recentText, outcome, changedFiles);
+      maybeAutoDistillScratchpad(stateObj, ctx, cwd, outcome, changedFiles);
+      compactScratchpadAndNotify(stateObj, ctx, cwd);
+    } catch (error) {
+      try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
     }
   };
 
@@ -2326,116 +2395,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", (event, ctx) => {
     if (!state?.config.enabled) return;
     if ((event as { willRetry?: boolean }).willRetry === true) return;
-
-    const cwd = ctx.cwd;
     const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
-
-    setTimeout(() => {
-      void (async () => {
-        if (!state?.config.enabled) return;
-        try {
-          // Automation candidates
-          const raw = stringifyForAutoMemory(recentMessages);
-          const automationCandidates = updateAutomationCandidates(state.automation, raw, 3, cwd);
-          for (const candidate of automationCandidates) {
-            appendScratchpadSection(state, cwd, "distill_candidate", `${candidate.markdown}\n\nPolicy source: ${state.automationPromptSource}`, "Automation candidate");
-          }
-          if (automationCandidates.length) {
-            try { ctx.ui.notify(`Sherpa detected ${automationCandidates.length} automation candidate(s)`, "info"); } catch {}
-          }
-
-          // Lifecycle observation
-          const recentText = stringifyForAutoMemory(recentMessages);
-          const outcome = classifyTaskOutcome(recentText);
-          const status = await gitChanged(cwd);
-          const changedFiles = parseGitStatusFiles(status);
-          const lifecycleHash = hashAutoMemory(`lifecycle\n${outcome.outcome}\n${changedFiles.sort().join("\n")}`);
-          if (!state.lifecycleHashes.includes(lifecycleHash) && (changedFiles.length || outcome.outcome !== "unknown")) {
-            const verification = suggestVerificationCommands(changedFiles);
-            appendScratchpadSection(state, cwd, "observation", [
-              `Outcome: ${outcome.outcome}`,
-              `Reason: ${outcome.reason}`,
-              "",
-              changedFiles.length ? "Changed files:" : "Changed files: none detected",
-              ...changedFiles.slice(0, 30).map((file) => `- ${file}`),
-              "",
-              verification.commands.length ? "Suggested verification:" : "Suggested verification: none",
-              ...verification.commands.map((item) => `- \`${item.command}\` — ${item.reason}`),
-              verification.docsReview ? "- Documentation review recommended." : "- Documentation review not required by heuristic.",
-            ].join("\n"), "Task lifecycle summary");
-            state.lifecycleHashes = [...state.lifecycleHashes.slice(-49), lifecycleHash];
-          }
-
-          // Retrieval self-evaluation: compare the most recent Sherpa bundle with the
-          // files the agent actually read/edited plus git-changed files. This creates
-          // durable feedback for DSPy export and immediate relevance/noise weighting.
-          try {
-            const bundle = state.lastBundleId ? getBundle(state, state.lastBundleId) : undefined;
-            if (bundle && Date.now() - bundle.timestamp < 2 * 60 * 60 * 1000) {
-              const evidence = collectRecentTaskFileEvidence(recentMessages, cwd);
-              const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
-              const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
-              if (hasTaskSignal) {
-                const evalRecord = evaluatePostTaskContext({
-                  bundle,
-                  outcome: outcome.outcome,
-                  files: { ...evidence, referencedFiles, changedFiles },
-                  finalText: recentText.slice(-2000),
-                });
-                const memoryRoot = obsidianMemoryPath(state);
-                const target = writeEvaluation(memoryRoot, evalRecord);
-                writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
-                appendScratchpadSection(state, cwd, "observation", [
-                  `Bundle: ${evalRecord.bundleId}`,
-                  `Scores: relevance=${evalRecord.scores.relevance} precision=${evalRecord.scores.precision} recall=${evalRecord.scores.recall}`,
-                  evalRecord.noise.length ? `Noise: ${evalRecord.noise.slice(0, 8).join(", ")}` : "Noise: none detected",
-                  evalRecord.missed.length ? `Missed: ${evalRecord.missed.slice(0, 8).join(", ")}` : "Missed: none detected",
-                  `Hint: ${evalRecord.improvementHint}`,
-                  `Stored: ${path.relative(memoryRoot, target)}`,
-                ].join("\n"), "Sherpa retrieval evaluation");
-                void recordSurrealRetrievalFeedback(state, bundle, evalRecord);
-                void maybeAutoCompileDspy(ctx, "evaluate");
-              }
-            }
-          } catch { /* retrieval evaluation must never affect task completion */ }
-
-          // Auto-distillation check
-          try {
-            const scratchpadRoot = scratchpadRootPath(state, cwd);
-            const adConfig = {
-              scratchpadRoot,
-              minChangedFiles: 3,
-              enabled: state.config.enabled,
-            };
-            const adCheck = checkAutoDistill({
-              outcome: outcome.outcome,
-              changedFiles: changedFiles.length,
-              hasDistillCandidates: true,
-            }, adConfig);
-            if (adCheck.shouldTrigger) {
-              const payloads = prepareDistillPayloads(adCheck.newCandidates);
-              const writes = payloads.map((payload) => writeDistilledSkill(payload, cwd, obsidianMemoryPath(state)));
-              appendScratchpadSection(state, cwd, "observation", [
-                `Auto-distill completed: ${adCheck.reason}`,
-                `Domains: ${[...new Set(payloads.map((p) => p.domain))].join(", ")}`,
-                `Candidates: ${payloads.length}`,
-                ...writes.map((w, i) => `${i + 1}. [${w.destination}] ${path.relative(ctx.cwd, w.skillPath)}`),
-              ].join("\n"), "Auto-distill completed");
-              markAutoDistillRun(scratchpadRoot);
-              try { ctx.ui.notify(`Sherpa auto-distilled ${writes.length} candidate(s)`, "info"); } catch {}
-            }
-          } catch { /* auto-distill is best-effort */ }
-
-          // Compact scratchpad
-          const compacted = compactScratchpad(scratchpadRootPath(state, cwd));
-          if (compacted.compacted.length) {
-            try { ctx.ui.notify(`Sherpa compacted scratchpad sections: ${compacted.compacted.join(", ")}`, "info"); } catch {}
-          }
-        } catch (error) {
-          try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
-        }
-      })();
-    }, 0);
+    setTimeout(() => { void runPostTaskWork(ctx, ctx.cwd, recentMessages); }, 0);
   });
 
   pi.on("session_shutdown", async (event, ctx) => {
@@ -2550,8 +2511,8 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `## Session Search: "${params.query}"\n${results.length} matches\n\n${lines.join("\n")}` }],
           details: { query: params.query, count: results.length, results, indexed },
         };
-      } catch (e: any) {
-        return { content: [{ type: "text" as const, text: `Session search error: ${e?.message ?? String(e)}` }], details: { error: e?.message ?? String(e) } };
+      } catch (e: unknown) {
+        return toolErrorResult("Session search error", e);
       }
     },
   });
@@ -2586,13 +2547,14 @@ export default function (pi: ExtensionAPI) {
         };
         const stats = (params.reindex || params.statusOnly || params.query) ? indexSherpaMemory(ctx.cwd, config) : indexSherpaMemory(ctx.cwd, config);
         if (params.statusOnly || !params.query?.trim()) {
-          return { content: [{ type: "text" as const, text: `## Sherpa Memory Index\nDocuments: ${stats.documents}\nScratchpad entries: ${stats.scratchpadEntries}\nCatalog entries: ${stats.catalogEntries}\nEvaluations: ${stats.evaluations}\nDedup hashes: ${stats.dedupHashes}\nDB: ${stats.dbPath}` }], details: stats };
+          const kindLines = stats.kindCounts.map((k) => `- ${k.kind}: ${k.count}`).join("\n");
+          return { content: [{ type: "text" as const, text: `## Sherpa Memory Index\nDocuments: ${stats.documents}\nSource paths: ${stats.sourcePaths}\nScratchpad entries: ${stats.scratchpadEntries}\nCatalog entries: ${stats.catalogEntries}\nEvaluations: ${stats.evaluations}\nDedup hashes: ${stats.dedupHashes}\nLast indexed: ${stats.lastIndexedAt ?? "unknown"}\nDB: ${stats.dbPath}\n\n### Kinds\n${kindLines || "(none)"}` }], details: stats };
         }
         const results = searchSherpaMemory(ctx.cwd, params.query, params.limit ?? 10, config);
         const lines = results.map((r, i) => `### ${i + 1}. ${r.title}\n**Kind:** ${r.kind}\n**Source:** ${r.sourcePath}\n${r.snippet || r.summary}`).join("\n\n");
         return { content: [{ type: "text" as const, text: `## Sherpa Memory Search: "${params.query}"\n${results.length} result(s)\n\n${lines || "(no matches)"}` }], details: { stats, results } };
-      } catch (e: any) {
-        return { content: [{ type: "text" as const, text: `Sherpa memory search error: ${e?.message ?? String(e)}` }], details: { error: e?.message ?? String(e) } };
+      } catch (e: unknown) {
+        return toolErrorResult("Sherpa memory search error", e);
       }
     },
   });
@@ -2999,12 +2961,8 @@ export default function (pi: ExtensionAPI) {
       ].join("\n"), "warning");
       return;
     }
-    const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
-    const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
-    const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
     try {
-      const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
-      const { stdout, stderr } = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+      const { stdout, stderr, candidateDir } = await runDspyPromptCompile(ctx);
       state = restoreState(ctx, state.config);
       ctx.ui.notify([
         force ? "Sherpa DSPy-style candidate compile complete (forced)" : "Sherpa DSPy-style candidate compile complete",
@@ -3255,6 +3213,17 @@ export default function (pi: ExtensionAPI) {
     if (result.capacityWarning) msg.push(`📊 ${result.capacityWarning}`);
     if (result.autoCompacted) msg.push("📦 Auto-compacted");
     ctx.ui.notify(msg.join(" | "), "info");
+  }});
+
+  pi.registerCommand("sherpa:memory-index:status", { description: "Show SQLite-backed Sherpa memory index status", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const stats = indexSherpaMemory(ctx.cwd, {
+      scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+      catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+      evaluationRoot: obsidianMemoryPath(state),
+    });
+    const kinds = stats.kindCounts.slice(0, 8).map((k) => `${k.kind}:${k.count}`).join(", ") || "none";
+    ctx.ui.notify(`Memory index: ${stats.documents} docs, ${stats.sourcePaths} sources, ${stats.scratchpadEntries} scratchpad, ${stats.catalogEntries} catalog, ${stats.evaluations} evals. Kinds: ${kinds}`, "info");
   }});
 
   pi.registerCommand("sherpa:auto-distill:status", { description: "Show auto-distillation status", handler: async (_args, ctx) => {

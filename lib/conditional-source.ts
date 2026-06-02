@@ -110,58 +110,52 @@ const BUILT_IN_SOURCES: ConditionalSource[] = [
 
 // ── Evaluation ──────────────────────────────────────────────────────
 
+type ConditionEval = () => "active" | "inactive" | null;
+
+function evalTaskType(condition: SourceCondition, context: ActivationContext): ConditionEval {
+  if (!condition.taskType?.length) return () => null;
+  return () => {
+    if (!context.taskType) return "inactive";
+    return condition.taskType.some((t) => context.taskType!.toLowerCase().includes(t.toLowerCase())) ? null : "inactive";
+  };
+}
+
+function evalQueryPattern(condition: SourceCondition, context: ActivationContext): ConditionEval {
+  if (!condition.queryPattern?.length) return () => null;
+  return () => {
+    if (!context.query) return "inactive";
+    return condition.queryPattern.some((p) => context.query!.toLowerCase().includes(p.toLowerCase())) ? null : "inactive";
+  };
+}
+
+function evalRequireSources(condition: SourceCondition, context: ActivationContext): ConditionEval {
+  if (!condition.requireSources?.length) return () => null;
+  return () => condition.requireSources.every((s) => context.enabledSources.has(s)) ? null : "inactive";
+}
+
+function evalExcludeWhenSources(condition: SourceCondition, context: ActivationContext): ConditionEval {
+  if (!condition.excludeWhenSources?.length) return () => null;
+  return () => condition.excludeWhenSources.some((s) => context.enabledSources.has(s)) ? "inactive" : null;
+}
+
+const CONDITION_EVALUATORS: Array<(c: SourceCondition, ctx: ActivationContext) => ConditionEval> = [
+  evalTaskType, evalQueryPattern, evalRequireSources, evalExcludeWhenSources,
+];
+
 /**
  * Evaluate whether a source should be active given the current context.
- *
- * Returns:
- * - "active" — source should be included
- * - "inactive" — conditions not met
- * - "skipped" — source disabled in config
  */
 export function evaluateSource(
   source: ConditionalSource,
   context: ActivationContext,
 ): "active" | "inactive" | "skipped" {
-  // Check if source is enabled in config
   if (!context.enabledSources.has(source.id)) return "skipped";
-
   const condition = source.when;
-  if (!condition) return "active"; // No conditions → always active (if enabled)
-
-  // taskType condition
-  if (condition.taskType && condition.taskType.length > 0) {
-    if (!context.taskType) return "inactive";
-    const match = condition.taskType.some((t) =>
-      context.taskType!.toLowerCase().includes(t.toLowerCase()),
-    );
-    if (!match) return "inactive";
+  if (!condition) return "active";
+  for (const ev of CONDITION_EVALUATORS) {
+    const result = ev(condition, context)();
+    if (result) return result;
   }
-
-  // queryPattern condition
-  if (condition.queryPattern && condition.queryPattern.length > 0) {
-    if (!context.query) return "inactive";
-    const match = condition.queryPattern.some((p) =>
-      context.query!.toLowerCase().includes(p.toLowerCase()),
-    );
-    if (!match) return "inactive";
-  }
-
-  // requireSources condition (AND — all must be present)
-  if (condition.requireSources && condition.requireSources.length > 0) {
-    const allPresent = condition.requireSources.every((s) =>
-      context.enabledSources.has(s),
-    );
-    if (!allPresent) return "inactive";
-  }
-
-  // excludeWhenSources condition (fallback pattern)
-  if (condition.excludeWhenSources && condition.excludeWhenSources.length > 0) {
-    const anyPresent = condition.excludeWhenSources.some((s) =>
-      context.enabledSources.has(s),
-    );
-    if (anyPresent) return "inactive"; // Fallback: skip when premium source available
-  }
-
   return "active";
 }
 

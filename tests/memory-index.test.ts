@@ -73,6 +73,9 @@ test("indexes scratchpad, catalog, evaluations, and nudge digests", () => withTe
   assertEqual(stats.catalogEntries, 1, "catalog entries");
   assertEqual(stats.evaluations, 1, "evaluations");
   assertEqual(stats.dedupHashes, 1, "dedup hashes");
+  assert(stats.sourcePaths >= 3, "source paths counted");
+  assert(stats.kindCounts.some((k) => k.kind.startsWith("scratchpad")), "kind counts include scratchpad");
+  assert(Boolean(stats.lastIndexedAt), "last indexed timestamp set");
 }));
 
 test("searches indexed scratchpad and catalog content", () => withTemp((dir) => {

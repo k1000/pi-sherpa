@@ -205,42 +205,60 @@ function envFirst(...names: Array<string | undefined>): string | undefined {
   return undefined;
 }
 
-function mapApiEvidenceStep(step: any): EvidenceChainStep {
+type ApiObject = Record<string, unknown>;
+
+function firstDefined(input: ApiObject, ...keys: string[]): unknown {
+  for (const key of keys) if (input[key] !== undefined && input[key] !== null) return input[key];
+  return undefined;
+}
+
+function apiString(input: ApiObject, fallback: string, ...keys: string[]): string {
+  return String(firstDefined(input, ...keys) ?? fallback);
+}
+
+function apiStringArray(input: ApiObject, key: string): string[] | undefined {
+  const value = input[key];
+  return Array.isArray(value) ? value.map(String) : undefined;
+}
+
+function mapApiEvidenceStep(step: ApiObject): EvidenceChainStep {
   return {
-    from: String(step.from ?? step.fromId ?? step.from_id ?? ""),
-    relation: String(step.relation ?? step.type ?? "related"),
-    to: String(step.to ?? step.toId ?? step.to_id ?? ""),
-    summary: step.summary ?? undefined,
+    from: apiString(step, "", "from", "fromId", "from_id"),
+    relation: apiString(step, "related", "relation", "type"),
+    to: apiString(step, "", "to", "toId", "to_id"),
+    summary: firstDefined(step, "summary") as string | undefined,
   };
 }
 
-function mapApiArtifact(input: any): MemoryArtifact {
+function mapApiArtifact(input: ApiObject): MemoryArtifact {
+  const id = apiString(input, "", "id", "memory_id", "memoryId");
+  const embedding = input.embedding;
   return {
-    id: String(input.id ?? input.memory_id ?? input.memoryId ?? ""),
-    scope: input.scope ?? "project",
-    project: input.project ?? undefined,
-    area: input.area ?? undefined,
-    category: input.category ?? undefined,
-    type: input.type ?? "evidence",
-    title: input.title ?? input.id ?? "Memory artifact",
-    summary: input.summary ?? undefined,
-    text: input.text ?? undefined,
-    sourcePath: input.sourcePath ?? input.source_path ?? undefined,
-    sourceHash: input.sourceHash ?? input.source_hash ?? undefined,
-    confidence: input.confidence ?? undefined,
-    status: input.status ?? undefined,
-    tags: Array.isArray(input.tags) ? input.tags : undefined,
-    aliases: Array.isArray(input.aliases) ? input.aliases : undefined,
-    routes: Array.isArray(input.routes) ? input.routes : undefined,
-    keywords: Array.isArray(input.keywords) ? input.keywords : undefined,
-    embedding: Array.isArray(input.embedding) ? input.embedding.map(Number) : undefined,
-    createdAt: input.createdAt ?? input.created_at ?? undefined,
-    updatedAt: input.updatedAt ?? input.updated_at ?? undefined,
+    id,
+    scope: apiString(input, "project", "scope") as MemoryArtifact["scope"],
+    project: firstDefined(input, "project") as string | undefined,
+    area: firstDefined(input, "area") as string | undefined,
+    category: firstDefined(input, "category") as string | undefined,
+    type: apiString(input, "evidence", "type") as MemoryArtifact["type"],
+    title: apiString(input, id || "Memory artifact", "title"),
+    summary: firstDefined(input, "summary") as string | undefined,
+    text: firstDefined(input, "text") as string | undefined,
+    sourcePath: firstDefined(input, "sourcePath", "source_path") as string | undefined,
+    sourceHash: firstDefined(input, "sourceHash", "source_hash") as string | undefined,
+    confidence: firstDefined(input, "confidence") as number | undefined,
+    status: firstDefined(input, "status") as string | undefined,
+    tags: apiStringArray(input, "tags"),
+    aliases: apiStringArray(input, "aliases"),
+    routes: apiStringArray(input, "routes"),
+    keywords: apiStringArray(input, "keywords"),
+    embedding: Array.isArray(embedding) ? embedding.map(Number) : undefined,
+    createdAt: firstDefined(input, "createdAt", "created_at") as string | undefined,
+    updatedAt: firstDefined(input, "updatedAt", "updated_at") as string | undefined,
   };
 }
 
 function mapApiSearchResult(item: any): MemoryResult {
-  const artifact = mapApiArtifact(item.artifact ?? item);
+  const artifact = mapApiArtifact((item.artifact ?? item) as ApiObject);
   const chunks = Array.isArray(item.chunks) ? item.chunks : [];
   const firstChunk = chunks.find((chunk: any) => typeof chunk?.text === "string");
   return {

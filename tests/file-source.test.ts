@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { parseRgOutput as parseRgOutputNew, rg } from "../lib/rg";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,20 +29,6 @@ function summarize(raw: string, budgetChars = 700): string {
   const important = lines.filter(l => /error|fail|exception|warning|todo|fixme|export |function |class |describe\(|it\(/i.test(l));
   const picked = (important.length ? important : lines).slice(0, 10).join("\n");
   return picked.length > budgetChars ? picked.slice(0, budgetChars - 1) + "…" : picked;
-}
-
-async function rg(cwd: string, query: string): Promise<string> {
-  const terms = query.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-  if (!terms.length) return "";
-  const bundledRg = path.join(cwd, "bin", "rg");
-  const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
-  try {
-    const { stdout } = await execFileAsync(rgBin, [
-      "-n", "--hidden", "--glob", "!.git", "--glob", "!node_modules",
-      terms.join("|"), cwd
-    ], { timeout: 3000, maxBuffer: 500_000 });
-    return stdout;
-  } catch (e: any) { return e.stdout ?? ""; }
 }
 
 async function gitChanged(cwd: string): Promise<string> {
@@ -64,21 +51,6 @@ function parseRgOutputOld(output: string): Array<{ fileAndLine: string; content:
   return results;
 }
 
-// FIXED PARSER
-function parseRgOutputNew(output: string): Array<{ fileAndLine: string; content: string }> {
-  const results: Array<{ fileAndLine: string; content: string }> = [];
-  for (const block of output.split("\n").slice(0, 30)) {
-    if (!block.trim()) continue;
-    const firstColon = block.indexOf(":");
-    const secondColon = block.indexOf(":", firstColon + 1);
-    if (firstColon === -1) continue;
-    const fileAndLine = block.slice(0, secondColon);
-    const content = block.slice(secondColon + 1).trim();
-    results.push({ fileAndLine, content });
-  }
-  return results;
-}
-
 interface Candidate {
   type: string;
   source: string;
@@ -96,13 +68,7 @@ async function searchSources(
   
   if (sources.files) {
     const out = await rg(cwd, focus);
-    for (const block of out.split("\n").slice(0, 30)) {
-      if (!block.trim()) continue;
-      const firstColon = block.indexOf(":");
-      const secondColon = block.indexOf(":", firstColon + 1);
-      if (firstColon === -1) continue;
-      const fileAndLine = block.slice(0, secondColon);
-      const content = block.slice(secondColon + 1).trim();
+    for (const { fileAndLine, content } of parseRgOutputNew(out, 30)) {
       if (!content) continue;
       const relevance = score(content + " " + fileAndLine, focus) + 0.15;
       if (relevance < 0.08) continue;

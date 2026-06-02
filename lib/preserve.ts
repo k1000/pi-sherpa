@@ -58,45 +58,69 @@ export function routeReflection(entry: PreservationInput): string {
   return "obsidian";
 }
 
-// ── Decision gate ───────────────────────────────────────────────────────────
+type EvalContext = { text: string; length: number; tags: Set<string>; importance: string };
 
-export function evaluatePersistence(entry: PreservationInput): PreservationDecision {
+function evalContext(entry: PreservationInput): EvalContext {
   const text = `${entry.title} ${entry.summary}`.toLowerCase();
-  const summaryLength = entry.summary.length;
-  const tags = new Set(entry.tags.map((t) => t.toLowerCase()));
+  return { text, length: entry.summary.length, tags: new Set(entry.tags.map((t) => t.toLowerCase())), importance: entry.importance };
+}
 
-  if (summaryLength < 80) {
-    return { decision: "discard", reason: "Too brief to contain useful structural knowledge", destination: "none", confidence: "high" };
+type GuardResult = PreservationDecision | null;
+
+function guardTooBrief(ctx: EvalContext): GuardResult {
+  if (ctx.length < 80) return { decision: "discard", reason: "Too brief to contain useful structural knowledge", destination: "none", confidence: "high" };
+  return null;
+}
+
+function guardOneOff(ctx: EvalContext, entry: PreservationInput): GuardResult {
+  if (ONE_OFF_PATTERNS.some((p) => ctx.text.includes(p)) && !STRUCTURAL_SIGNALS.some((s) => ctx.text.includes(s))) {
+    return { decision: "discard", reason: "Looks like a one-off fix, not a structural rule", destination: "none", confidence: "high" };
   }
+  return null;
+}
 
-  if (ONE_OFF_PATTERNS.some((p) => text.includes(p))) {
-    if (!STRUCTURAL_SIGNALS.some((s) => text.includes(s))) {
-      return { decision: "discard", reason: "Looks like a one-off fix, not a structural rule", destination: "none", confidence: "high" };
-    }
+function guardGenericKnowledge(ctx: EvalContext): GuardResult {
+  if (GENERIC_KNOWLEDGE.some((p) => ctx.text.includes(p))) {
+    const isSpecific = ctx.length > 300 || [...ctx.tags].some((t) => PROJECT_TAGS.has(t));
+    if (!isSpecific) return { decision: "discard", reason: "Generic knowledge the model already knows", destination: "none", confidence: "medium" };
   }
+  return null;
+}
 
-  if (GENERIC_KNOWLEDGE.some((p) => text.includes(p))) {
-    const isSpecific = summaryLength > 300 || [...tags].some((t) => PROJECT_TAGS.has(t));
-    if (!isSpecific) {
-      return { decision: "discard", reason: "Generic knowledge the model already knows", destination: "none", confidence: "medium" };
-    }
-  }
-
-  if ((entry.importance === "medium" || entry.importance === "low") && !STRUCTURAL_SIGNALS.some((s) => text.includes(s))) {
+function guardLowImportance(ctx: EvalContext): GuardResult {
+  if ((ctx.importance === "medium" || ctx.importance === "low") && !STRUCTURAL_SIGNALS.some((s) => ctx.text.includes(s))) {
     return { decision: "discard", reason: "Medium/low importance without structural value — ephemeral", destination: "scratchpad", confidence: "medium" };
   }
+  return null;
+}
 
-  const genericTagCount = [...tags].filter((t) => GENERIC_TAGS.has(t)).length;
-  if (genericTagCount >= 2 && summaryLength < 300) {
+function guardGenericTags(ctx: EvalContext): GuardResult {
+  const genericTagCount = [...ctx.tags].filter((t) => GENERIC_TAGS.has(t)).length;
+  if (genericTagCount >= 2 && ctx.length < 300) {
     return { decision: "discard", reason: "Tags too generic and summary too short — not actionable", destination: "none", confidence: "medium" };
   }
+  return null;
+}
 
+function persistDecision(entry: PreservationInput, ctx: EvalContext): PreservationDecision {
   const destination = routeReflection(entry);
-  const hasStructural = STRUCTURAL_SIGNALS.some((s) => text.includes(s));
+  const hasStructural = STRUCTURAL_SIGNALS.some((s) => ctx.text.includes(s));
   const confidence: PreservationDecision["confidence"] =
-    (entry.importance === "critical" || entry.importance === "high") && hasStructural ? "high"
-    : entry.importance === "high" || entry.importance === "critical" ? "medium"
+    (ctx.importance === "critical" || ctx.importance === "high") && hasStructural ? "high"
+    : ctx.importance === "high" || ctx.importance === "critical" ? "medium"
     : "low";
-
   return { decision: "persist", reason: "Contains structural knowledge worth preserving", destination, confidence };
+}
+
+const PERSISTENCE_GUARDS: Array<(ctx: EvalContext, entry: PreservationInput) => GuardResult> = [
+  guardTooBrief, guardOneOff, guardGenericKnowledge, guardLowImportance, guardGenericTags,
+];
+
+export function evaluatePersistence(entry: PreservationInput): PreservationDecision {
+  const ctx = evalContext(entry);
+  for (const guard of PERSISTENCE_GUARDS) {
+    const result = guard(ctx, entry);
+    if (result) return result;
+  }
+  return persistDecision(entry, ctx);
 }

@@ -6,11 +6,11 @@
  * and future analytics.
  */
 
-import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { parseCsvRows } from "./catalog";
+import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
 export type MemoryIndexConfig = {
   dbPath?: string;
@@ -26,6 +26,9 @@ export type MemoryIndexStats = {
   catalogEntries: number;
   evaluations: number;
   dedupHashes: number;
+  sourcePaths: number;
+  kindCounts: Array<{ kind: string; count: number }>;
+  lastIndexedAt?: string;
   dbPath: string;
 };
 
@@ -43,13 +46,13 @@ const DEFAULT_DB_PATH = ".pi-memory/memory-index.db";
 const SCRATCHPAD_SECTIONS = ["todo", "observation", "issue", "next", "distill_candidate"];
 
 export class SherpaMemoryIndex {
-  private db: Database;
+  private db: SqliteDatabase;
   readonly dbPath: string;
 
   constructor(baseDir: string, config: MemoryIndexConfig = {}) {
     this.dbPath = path.resolve(baseDir, config.dbPath ?? DEFAULT_DB_PATH);
     mkdirSync(path.dirname(this.dbPath), { recursive: true });
-    this.db = Database.open(this.dbPath, { create: true });
+    this.db = openSqliteDatabase(this.dbPath, "Sherpa memory indexing");
     this.db.exec("PRAGMA journal_mode=WAL");
     this.ensureSchema();
   }
@@ -236,12 +239,18 @@ export class SherpaMemoryIndex {
 
   stats(): MemoryIndexStats {
     const count = (table: string) => Number((this.db.query(`SELECT COUNT(*) as count FROM ${table}`).get() as { count: number }).count ?? 0);
+    const sourcePaths = Number((this.db.query("SELECT COUNT(DISTINCT source_path) as count FROM documents").get() as { count: number }).count ?? 0);
+    const kindCounts = this.db.query("SELECT kind, COUNT(*) as count FROM documents GROUP BY kind ORDER BY count DESC, kind ASC LIMIT 20").all() as Array<{ kind: string; count: number }>;
+    const lastIndexed = this.db.query("SELECT value FROM state WHERE key = 'last_indexed_at'").get() as { value: string } | null;
     return {
       documents: count("documents"),
       scratchpadEntries: count("scratchpad_entries"),
       catalogEntries: count("catalog_entries"),
       evaluations: count("evaluations"),
       dedupHashes: count("dedup_hashes"),
+      sourcePaths,
+      kindCounts,
+      lastIndexedAt: lastIndexed?.value,
       dbPath: this.dbPath,
     };
   }

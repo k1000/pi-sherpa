@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { catalogRowsToRouteEntries, parseCsvRows } from "./catalog";
+import { catalogRowsToRouteEntries, csvCell, parseCsvLine, parseCsvRows } from "./catalog";
 
 export type RoutePlan = {
   name: string;
@@ -259,10 +259,6 @@ function parseTablePath(line: string): string | null {
   return normalizeRouteSource(firstCell);
 }
 
-function csvEscape(value: string) {
-  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
-}
-
 function routePlansToCsv(routes: RoutePlan[]) {
   const header = ["name", "triggers", "read", "docs", "skip"];
   const rows = routes.map((route) => [
@@ -272,22 +268,7 @@ function routePlansToCsv(routes: RoutePlan[]) {
     route.docs.join("|"),
     route.skip.join("|"),
   ]);
-  return [header, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n") + "\n";
-}
-
-function parseCsvLine(line: string) {
-  const cells: string[] = [];
-  let current = "";
-  let quoted = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quoted && ch === '"' && line[i + 1] === '"') { current += '"'; i++; continue; }
-    if (ch === '"') { quoted = !quoted; continue; }
-    if (!quoted && ch === ",") { cells.push(current); current = ""; continue; }
-    current += ch;
-  }
-  cells.push(current);
-  return cells;
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n") + "\n";
 }
 
 function splitListCell(value: string) {
