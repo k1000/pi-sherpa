@@ -2174,12 +2174,18 @@ function toolErrorResult(prefix: string, error: unknown) {
   return toolTextResult(`${prefix}: ${message}`, { error: message });
 }
 
-async function runDspyPromptCompile(ctx: ExtensionContext) {
+function safeNotify(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error") {
+  try {
+    if (ctx?.hasUI) ctx.ui.notify(message, level);
+  } catch { /* stale extension contexts must not break background work */ }
+}
+
+async function runDspyPromptCompile(cwd: string) {
   const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
-  const projectPrompt = path.join(ctx.cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
+  const projectPrompt = path.join(cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
   const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
   const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
-  const result = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+  const result = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd, timeout: 120_000, maxBuffer: 1_000_000 });
   return { ...result, candidateDir };
 }
 
@@ -2237,19 +2243,20 @@ export default function (pi: ExtensionAPI) {
 
   const compileDspyCandidate = async (ctx: ExtensionContext, reason: string, notify: boolean, options: { force?: boolean } = {}) => {
     if (!state?.config.dspy.autoCompile.enabled && !options.force) return { ran: false, reason: "auto compile disabled" };
+    const cwd = ctx.cwd;
     const limit = 2000;
     const evals = readRecentEvaluations(obsidianMemoryPath(state), limit);
-    const exported = exportDspyDataset(ctx.cwd, evals, { limit });
+    const exported = exportDspyDataset(cwd, evals, { limit });
     if (exported.traces < state.config.dspy.autoCompile.minTraces) return { ran: false, reason: `need ${state.config.dspy.autoCompile.minTraces} traces; have ${exported.traces}` };
     if (!options.force) {
       if (exported.matchedEvaluations < DSPY_COMPILE_MIN_EVALUATIONS) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_EVALUATIONS} matched evaluations; have ${exported.matchedEvaluations}` };
       if (exported.averageMetric < DSPY_COMPILE_MIN_AVG_METRIC) return { ran: false, reason: `average metric ${exported.averageMetric.toFixed(2)} below ${DSPY_COMPILE_MIN_AVG_METRIC}` };
       if (exported.highScoringExamples < DSPY_COMPILE_MIN_HIGH_EXAMPLES) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_HIGH_EXAMPLES} high-scoring examples; have ${exported.highScoringExamples}` };
     }
-    const { stdout } = await runDspyPromptCompile(ctx);
+    const { stdout } = await runDspyPromptCompile(cwd);
     state.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state.bundles };
     persist();
-    if (notify) ctx.ui.notify([`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
+    if (notify) safeNotify(ctx, [`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
     return { ran: true, reason, exported };
   };
 
@@ -2263,7 +2270,7 @@ export default function (pi: ExtensionAPI) {
     try { await compileDspyCandidate(ctx, event, event !== "bundle"); }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (event !== "bundle") ctx.ui.notify(`Sherpa DSPy auto-compile failed: ${message}`, "warning");
+      if (event !== "bundle") safeNotify(ctx, `Sherpa DSPy auto-compile failed: ${message}`, "warning");
     }
   };
 
@@ -2962,7 +2969,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     try {
-      const { stdout, stderr, candidateDir } = await runDspyPromptCompile(ctx);
+      const { stdout, stderr, candidateDir } = await runDspyPromptCompile(ctx.cwd);
       state = restoreState(ctx, state.config);
       ctx.ui.notify([
         force ? "Sherpa DSPy-style candidate compile complete (forced)" : "Sherpa DSPy-style candidate compile complete",
