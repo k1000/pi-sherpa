@@ -7,3 +7,10 @@ memory/.l2_facts/*.md
 memory/.l3_skills/*.md
 memory/.l1_index/*.json
 memory/.l0_meta/*.md
+
+# Local runtime/tool output (never tracked; .pi/sherpa.md stays tracked via trailing slash)
+.pi-memory/
+.pi/sherpa/
+.fallow/
+.ralph/
+graphify-out/
