@@ -1,11 +1,17 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
 export type RgMatch = { fileAndLine: string; content: string };
+
+export function isUnsafeBroadSearchRoot(searchPath: string): boolean {
+  const resolved = path.resolve(searchPath);
+  return resolved === path.parse(resolved).root || resolved === os.homedir();
+}
 
 /**
  * Parse ripgrep `-n` output in `file:line:content` form.
@@ -29,7 +35,7 @@ export function parseRgOutput(output: string, limit = 30): RgMatch[] {
 export async function rg(cwd: string, query: string | string[], searchPath = cwd): Promise<string> {
   const queryText = Array.isArray(query) ? query.join(" ") : query;
   const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-  if (!terms.length) return "";
+  if (!terms.length || isUnsafeBroadSearchRoot(searchPath)) return "";
   const bundledRg = path.join(cwd, "bin", "rg");
   const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
   try {

@@ -7,7 +7,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { parseRgOutput, rg } from "../lib/rg";
+import { parseRgOutput, rg, isUnsafeBroadSearchRoot } from "../lib/rg";
 
 const execFileAsync = promisify(execFile);
 
@@ -142,6 +142,12 @@ test("gitChanged: returns status in git repo", async () => {
 test("gitChanged: returns empty in non-git dir", async () => {
     const result = await gitChanged("/tmp");
     assert(result === "", `Expected empty string, got: ${result}`);
+});
+
+test("rg: detects unsafe broad search roots", async () => {
+    assert(isUnsafeBroadSearchRoot("/"), "filesystem root should be unsafe");
+    assert(isUnsafeBroadSearchRoot(process.env.HOME || "/Users/kamil"), "home directory should be unsafe");
+    assert(!isUnsafeBroadSearchRoot("/Users/kamil/.pi/agent"), "nested project directory should be safe");
 });
 
 // TEST 9: rg function returns results for known query

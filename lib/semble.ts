@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -77,6 +78,11 @@ async function currentGitHead(cwd: string): Promise<string | undefined> {
   }
 }
 
+export function isUnsafeBroadSembleRoot(cwd: string): boolean {
+  const resolved = path.resolve(cwd);
+  return resolved === path.parse(resolved).root || resolved === os.homedir();
+}
+
 export async function searchSemble(
   cwd: string,
   query: string,
@@ -86,6 +92,15 @@ export async function searchSemble(
   const topK = String(Math.max(1, Math.min(20, Math.floor(config.topK || 8))));
   const timeout = Math.max(500, Math.min(15000, Math.floor(config.timeoutMs || 3000)));
   const head = await currentGitHead(cwd);
+  if (isUnsafeBroadSembleRoot(cwd)) {
+    writeSembleState(cwd, {
+      lastHead: head,
+      lastCheckedAt: new Date().toISOString(),
+      lastResultCount: 0,
+      lastError: `skipped unsafe broad Semble root: ${path.resolve(cwd)}`,
+    });
+    return [];
+  }
   try {
     const { stdout } = await execFileAsync(
       config.command || "semble",

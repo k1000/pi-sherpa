@@ -1,7 +1,7 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { searchSemble, readSembleState } from "../lib/semble";
+import { searchSemble, readSembleState, isUnsafeBroadSembleRoot } from "../lib/semble";
 
 const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [];
 let passed = 0;
@@ -44,6 +44,12 @@ process.stdout.write(${JSON.stringify(fakeSearchOutput)});
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("unsafe broad roots are detected before invoking Semble", () => {
+  assert(isUnsafeBroadSembleRoot(os.homedir()), "expected home directory to be unsafe");
+  assert(isUnsafeBroadSembleRoot(path.parse(os.homedir()).root), "expected filesystem root to be unsafe");
+  assert(!isUnsafeBroadSembleRoot(path.join(os.homedir(), "Development", "example-project")), "expected nested project path to be safe");
 });
 
 test("searchSemble records failure state and returns empty results", async () => {
