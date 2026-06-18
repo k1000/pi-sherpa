@@ -221,14 +221,9 @@ function maxSignal(map: Map<string, number>, key: string, count: number): void {
 
 function addMissedPattern(signals: FeedbackSignals, pattern: string, count: number, mode: "increment" | "max"): void {
   const normalizedMiss = normalizedPathFragment(pattern);
-  if (normalizedMiss) {
-    const update = mode === "increment" ? incrementSignal : maxSignal;
-    update(signals.missedPaths, normalizedMiss, count);
-  }
-  for (const term of basenameTerms(pattern)) {
-    const update = mode === "increment" ? incrementSignal : maxSignal;
-    update(signals.missedTerms, term, count);
-  }
+  const update = mode === "increment" ? incrementSignal : maxSignal;
+  if (normalizedMiss) update(signals.missedPaths, normalizedMiss, count);
+  for (const term of basenameTerms(pattern)) update(signals.missedTerms, term, count);
 }
 
 function feedbackSignals(evals: ContextEvaluation[], quality?: SherpaQualitySummary): FeedbackSignals {
@@ -245,7 +240,7 @@ function feedbackSignals(evals: ContextEvaluation[], quality?: SherpaQualitySumm
 function missedSignalDelta(source: string, signals: FeedbackSignals): number {
   let delta = 0;
   for (const [missedPath, count] of signals.missedPaths) {
-    if (source.includes(missedPath)) delta += Math.min(0.5, 0.25 * count);
+    if (source.includes(missedPath)) delta += Math.min(0.6, 0.3 * count);
   }
   for (const [term, count] of signals.missedTerms) {
     if (source.includes(term)) delta += Math.min(0.35, 0.12 * count);
@@ -255,8 +250,8 @@ function missedSignalDelta(source: string, signals: FeedbackSignals): number {
 
 function candidateFeedbackDelta(candidate: { source: string }, signals: FeedbackSignals, focus?: string): number {
   const exactNoise = signals.noisy.get(candidate.source) ?? 0;
-  const noiseDelta = exactNoise ? -Math.min(0.6, 0.2 * exactNoise) : 0;
-  const genericDelta = isGenericNoiseSource(candidate.source) && !focusAllowsGenericSource(candidate.source, focus) ? -0.45 : 0;
+  const noiseDelta = exactNoise ? -Math.min(0.9, 0.25 * exactNoise) : 0;
+  const genericDelta = isGenericNoiseSource(candidate.source) && !focusAllowsGenericSource(candidate.source, focus) ? -0.55 : 0;
   return noiseDelta + genericDelta + missedSignalDelta(candidate.source.toLowerCase(), signals);
 }
 

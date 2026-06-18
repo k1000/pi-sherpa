@@ -33,7 +33,7 @@ import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./l
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { writeDistilledSkill } from "./lib/distillation";
-import { assignTiers } from "./lib/progressive-context";
+
 import { filterActiveSources } from "./lib/conditional-source";
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
@@ -131,6 +131,7 @@ type CurateResult = {
   rejected: Array<{ index: number; reason: string; source: string }>;
   confidence: number;
   planner: "heuristic" | "llm";
+  plannerReason?: string;
 };
 type ContextBundle = { bundleId: string; taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
 
@@ -544,6 +545,47 @@ function routeSkipsPath(routePlan: RoutePlan | undefined, p: string) {
   return routePlan.skip.some(s => s && normalized.includes(s.replace(/\\/g, "/").toLowerCase()));
 }
 
+const GLOBAL_NOISY_SOURCE_PATTERNS = [
+  /(?:^|\/)\.zcompdump[^/]*$/i,
+  /(?:^|\/)\.zsh_history(?::\d+)?$/i,
+  /(?:^|\/)\.(?:zshrc|bashrc|bash_profile|zprofile|profile|zshenv)(?::\d+)?$/i,
+  /(?:^|\/)\.bun\//i,
+  /(?:^|\/)\.cdk\/cache\//i,
+  /(?:^|\/)library\/caches\//i,
+  /(?:^|\/)\.omp\/logs\//i,
+  /(?:^|\/)agent-disabled-extension-backups\//i,
+  /(?:^|\/)extensions-disabled\//i,
+  /(?:^|\/)extensions\.disabled\//i,
+  /(?:^|\/)\.pi\/revolver\//i,
+  /(?:^|\/)\.pi\/sherpa\//i,
+  /(?:^|\/)graphify-out\//i,
+  /(?:^|\/)\.fallow\//i,
+  /(?:^|\/)\.pi-memory\/(?:session-search|memory-index).*\.(?:db|sqlite)/i,
+  /(?:^|\/)(?:dist|build|coverage)\//i,
+  /(?:^|\/)public\/.*\.bundle\.js(?::\d+)?$/i,
+  /\.min\.js(?::\d+)?$/i,
+  /\.(?:db|sqlite)(?::\d+)?$/i,
+];
+
+export function isGloballyNoisySource(source: string) {
+  const normalized = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/\\/g, "/").toLowerCase();
+  return GLOBAL_NOISY_SOURCE_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+function isPackageManifestSource(source: string) {
+  return /(?:^|\/)package\.json(?::\d+)?$/i.test(source.replace(/^repo:\/\//, ""))
+    || /(?:^|\/)pnpm-workspace\.ya?ml(?::\d+)?$/i.test(source.replace(/^repo:\/\//, ""))
+    || /(?:^|\/)\.fallowrc\.json(?::\d+)?$/i.test(source.replace(/^repo:\/\//, ""));
+}
+
+function focusAllowsPackageManifest(focus: string) {
+  return /\b(package\.json|pnpm|workspace|dependency|dependencies|script|scripts|npm|yarn|bun|fallow|manifest)\b/i.test(focus);
+}
+
+function focusAllowsGitStatus(focus: string) {
+  return /\b(git status|dirty|changed files?|uncommitted|commit|diff|staged|unstaged|review changes?|what changed)\b/i.test(focus);
+}
+
 function isSourceLookupPrompt(focus: string) {
   return /\b(where|which file|what file|implemented|implementation|tested|test covers|exact files?|function names?|code generates|served|stored|configured|connects|downloads|display)\b/i.test(focus);
 }
@@ -593,6 +635,9 @@ function candidateSortKey(item: ContextItem, focus: string, mode: string) {
       : item.type === "doc_snippet" ? -0.25
       : 0;
   }
+  if (isGloballyNoisySource(item.source)) value -= 2.0;
+  if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= wantsSource ? 0.75 : 0.35;
+  if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus)) value -= wantsSource ? 0.65 : 0.25;
   if (isRootReadmeSource(item.source) && !permitsRootReadme(focus)) value -= 1.0;
   if (item.source === "repo://README.md") value -= wantsSource ? 0.35 : 0.15;
   if (isGenericNoiseSource(item.source)) value -= wantsSource ? 0.3 : 0.12;
@@ -606,10 +651,33 @@ function sessionText(ctx: ExtensionContext) {
   catch { return ""; }
 }
 
-function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[]) {
+function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[], state?: State) {
   const text = sessionText(ctx);
-  if (!text) return items;
-  return items.filter(i => !text.includes(i.source));
+
+  // Collect all previously shown sources from state handles (across all bundles in this session)
+  const previouslyShownSources = new Set<string>();
+  if (state) {
+    for (const item of state.handles.values()) {
+      if (item.source) {
+        previouslyShownSources.add(item.source);
+        // Also add a normalized version without line numbers for fuzzy matching
+        const noLines = item.source.replace(/:\d+(-\d+)?$/g, "");
+        if (noLines !== item.source) previouslyShownSources.add(noLines);
+      }
+    }
+  }
+
+  return items.filter(i => {
+    // 1. Skip sources already shown in a previous Sherpa bundle
+    if (previouslyShownSources.has(i.source)) return false;
+    const normalized = i.source.replace(/:\d+(-\d+)?$/g, "");
+    if (normalized !== i.source && previouslyShownSources.has(normalized)) return false;
+
+    // 2. Skip sources already visible in session text (the raw conversation)
+    if (text && text.includes(i.source)) return false;
+
+    return true;
+  });
 }
 
 function postProcessCandidates(candidates: ContextItem[], focus: string, mode: string) {
@@ -619,6 +687,9 @@ function postProcessCandidates(candidates: ContextItem[], focus: string, mode: s
   const seen = new Set<string>();
   let readmeCount = 0;
   for (const item of sorted) {
+    if (isGloballyNoisySource(item.source)) continue;
+    if (item.type === "git_status" && !focusAllowsGitStatus(focus) && candidateSortKey(item, focus, mode) < 0.2) continue;
+    if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
     const key = sourceDedupeKey(item.source);
     if (seen.has(key)) continue;
     if (isRootReadmeSource(item.source)) {
@@ -653,11 +724,23 @@ function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
 }
 
-async function getSherpaModelAuth(state: State, ctx: ExtensionContext): Promise<{ model: any; auth: any } | undefined> {
+type SherpaModelAuth = { model: any; auth: any };
+
+async function getSherpaModelAuthWithReason(state: State, ctx: ExtensionContext): Promise<{ ok: true; value: SherpaModelAuth } | { ok: false; reason: string }> {
+  if (!state.config.privacy.allowRemoteModel && !state.config.model.useMainPiModel) {
+    return { ok: false, reason: "remote model disabled by privacy.allowRemoteModel=false" };
+  }
   const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) return undefined;
+  if (!model) return { ok: false, reason: `model not found: ${state.config.model.provider}/${state.config.model.id}` };
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  return auth.ok && auth.apiKey ? { model, auth } : undefined;
+  if (!auth.ok) return { ok: false, reason: `auth failed: ${(auth as any).error ?? model.provider}` };
+  if (!auth.apiKey) return { ok: false, reason: `missing API key for ${model.provider}` };
+  return { ok: true, value: { model, auth } };
+}
+
+async function getSherpaModelAuth(state: State, ctx: ExtensionContext): Promise<SherpaModelAuth | undefined> {
+  const result = await getSherpaModelAuthWithReason(state, ctx);
+  return result.ok ? result.value : undefined;
 }
 
 async function completeJsonObjectWithTimeout(state: State, ctx: ExtensionContext, model: any, auth: any, message: UserMessage, timeoutMs: number, timeoutMessage: string) {
@@ -722,6 +805,7 @@ export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   if (/\b(doc|docs|readme|guide|explain|overview|architecture|design|how\s+to|reference|manual)\b/.test(f)) add("docs");
   if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory", "surreal_memory");
   if (/\b(git|diff|changed|changes|status|staged|unstaged|commit|branch|recent)\b/.test(f)) add("git");
+  if (/\b(sherpa|performance|health|trace|traces|retrieval|evaluation|evaluations|quality|useful|usefull|working|correctly|corectly)\b/.test(f)) add("docs", "project_memory", "files");
   if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory", "surreal_memory");
   if (/\b(internet|web|online|search\s+web|latest|current|today|recent\s+news|external\s+source|documentation\s+online)\b/.test(f)) add("web");
   if (mode !== "front-door" && /\b(previous|earlier|continue|session|conversation|last\s+time|we\s+discussed)\b/.test(f)) add("session");
@@ -760,9 +844,9 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   if (state.config.model.heuristicOnly) {
     return { indicators: heuristicIndicators(focus), reason: "heuristic extraction", confidence: 0.3, planner: "heuristic" };
   }
-  const modelAuth = await getSherpaModelAuth(state, ctx);
-  if (!modelAuth) return { indicators: heuristicIndicators(focus), reason: "model unavailable or no API key, falling back", confidence: 0.3, planner: "heuristic" };
-  const { model, auth } = modelAuth;
+  const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
+  if (!modelAuth.ok) return { indicators: heuristicIndicators(focus), reason: `${modelAuth.reason}, falling back`, confidence: 0.3, planner: "heuristic" };
+  const { model, auth } = modelAuth.value;
   const message: UserMessage = {
     role: "user",
     timestamp: Date.now(),
@@ -875,21 +959,22 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
 
   const fallbackPlan = routedFallbackPlan(state, ctx, focus, mode, routePlan);
   const heuristicInds = heuristicSearchIndicators(focus);
-  if (state.config.model.heuristicOnly || mode !== "front-door") return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+  if (state.config.model.heuristicOnly) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: model.heuristicOnly=true; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+  if (mode !== "front-door") return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: mode=${mode}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
 
-  const modelAuth = await getSherpaModelAuth(state, ctx);
-  if (!modelAuth) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
-  const { model, auth } = modelAuth;
+  const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
+  if (!modelAuth.ok) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: ${modelAuth.reason}; ${fallbackPlan.reason}` }, indicators: { ...heuristicInds, reason: `${modelAuth.reason}; ${heuristicInds.reason}` } };
+  const { model, auth } = modelAuth.value;
 
   try {
     const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, sourcePlanningMessage(focus), SOURCE_PLANNER_TIMEOUT_MS, "source + indicator planning timed out");
-    if (result.aborted) return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+    if (result.aborted) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner aborted; ${fallbackPlan.reason}` }, indicators: heuristicInds };
     const parsed = result.parsed as any;
     const indicators = parsePlannedIndicators(parsed, heuristicInds);
     const sourcePlan = parsePlannedSourcePlan(state, focus, mode, parsed, routePlan);
-    return { sourcePlan: sourcePlan ?? { ...fallbackPlan, planner: "fallback", reason: `planner fallback: ${fallbackPlan.reason}` }, indicators };
-  } catch {
-    return { sourcePlan: fallbackPlan, indicators: heuristicInds };
+    return { sourcePlan: sourcePlan ?? { ...fallbackPlan, planner: "fallback", reason: `planner returned invalid source plan; ${fallbackPlan.reason}` }, indicators };
+  } catch (error) {
+    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner error: ${error instanceof Error ? error.message : String(error)}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
   }
 }
 
@@ -920,8 +1005,8 @@ const NOISY_CURATION_PATTERNS = [
   /proactive|session_compact/i,
 ];
 
-function heuristicCurateResult(items: ContextItem[], confidence = 0.3): CurateResult {
-  return { items: items.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic" };
+function heuristicCurateResult(items: ContextItem[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResult {
+  return { items: items.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
 }
 
 function curationCandidateIsNoisy(c: { type: string; summary: string; raw?: string }) {
@@ -1005,7 +1090,7 @@ function parseCurationRejected(parsed: any, manifest: ReturnType<typeof curation
 }
 
 function curationAbstainResult(abstainReason: string, rejected: CurateResult["rejected"], confidence: number): CurateResult {
-  return { items: [], abstain: true, abstainReason, rejected, confidence, planner: "llm" };
+  return { items: [], abstain: true, abstainReason, rejected, confidence, planner: "llm", plannerReason: abstainReason };
 }
 
 function curationResultFromParsed(parsed: any, curationPool: ContextItem[], manifest: ReturnType<typeof curationManifest>, focus: string, isLikelyOod: boolean): CurateResult {
@@ -1021,7 +1106,7 @@ function curationResultFromParsed(parsed: any, curationPool: ContextItem[], mani
   if (selected.length === 0) return curationAbstainResult(String(parsed.reason ?? "no relevant candidates found for in-domain query").slice(0, 240), rejected, confidence);
   const picked = pickCuratedItems(selected, curationPool);
   return picked.length
-    ? { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm" }
+    ? { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm", plannerReason: String(parsed.reason ?? "model selected candidates").slice(0, 240) }
     : curationAbstainResult("model returned selected indexes but none were valid", rejected, confidence);
 }
 
@@ -1035,13 +1120,15 @@ async function curateCandidates(
 ): Promise<CurateResult> {
   const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
   if (mode === "front-door" && heuristicOrdered.length === 0) {
-    return { items: [], abstain: true, abstainReason: "no curated candidates correspond to the query after suppression", rejected: [], confidence: 0.3, planner: "heuristic" };
+    return { items: [], abstain: true, abstainReason: "no curated candidates correspond to the query after suppression", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "all candidates suppressed by heuristic post-processing" };
   }
-  if (mode !== "front-door" || state.config.model.heuristicOnly || heuristicOrdered.length <= 1) return heuristicCurateResult(heuristicOrdered);
+  if (mode !== "front-door") return heuristicCurateResult(heuristicOrdered, 0.3, `curation skipped: mode=${mode}`);
+  if (state.config.model.heuristicOnly) return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: model.heuristicOnly=true");
+  if (heuristicOrdered.length <= 1) return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: <=1 candidate");
 
-  const modelAuth = await getSherpaModelAuth(state, ctx);
-  if (!modelAuth) return heuristicCurateResult(heuristicOrdered);
-  const { model, auth } = modelAuth;
+  const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
+  if (!modelAuth.ok) return heuristicCurateResult(heuristicOrdered, 0.2, `curation skipped: ${modelAuth.reason}`);
+  const { model, auth } = modelAuth.value;
 
   const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
   const curationPool = heuristicOrdered.filter(c => !curationCandidateIsNoisy(c)).slice(0, 30);
@@ -1049,15 +1136,17 @@ async function curateCandidates(
 
   try {
     const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, curationMessage(focus, indicators, manifest), CURATION_TIMEOUT_MS, "candidate curation timed out");
-    if (result.aborted || !result.parsed) return heuristicCurateResult(heuristicOrdered, 0.2);
+    if (result.aborted) return heuristicCurateResult(heuristicOrdered, 0.2, "curation aborted");
+    if (!result.parsed) return heuristicCurateResult(heuristicOrdered, 0.2, "curation returned invalid JSON");
     return curationResultFromParsed(result.parsed as any, curationPool, manifest, focus, isLikelyOod);
-  } catch {
-    return heuristicCurateResult(heuristicOrdered, 0.2);
+  } catch (error) {
+    return heuristicCurateResult(heuristicOrdered, 0.2, `curation error: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, budgetChars = 1200): Promise<string> {
   if (state.config.model.heuristicOnly) return summarize(raw, budgetChars);
+  if (!state.config.privacy.allowRemoteModel && !state.config.model.useMainPiModel) return summarize(raw, budgetChars);
   const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
   if (!model) {
     if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
@@ -1247,79 +1336,25 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
   return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
 }
 
-function signalRouteLine(sourcePlan?: SourcePlan): string {
-  return sourcePlan?.routePlan
-    ? `\nRoute: ${sourcePlan.routePlan.name} (${sourcePlan.routePlan.score} trigger matches)\nSources: ${sourcePlan.sources.join(", ")}\n`
-    : "";
-}
 
-function signalProposalSection(signal: ContextSignalV1): string {
-  if (!signal.proposedResponse) return "";
-  const p = signal.proposedResponse;
-  const citations = p.citations.length
-    ? `\nCitations: ${p.citations.map(c => c.handle ? `${c.handle} ${c.source}` : c.source).join("; ")}`
-    : "";
-  const caveats = p.caveats.length ? `\nCaveats: ${p.caveats.join("; ")}` : "";
-  return `\n### Sherpa proposal for main-agent review\n${p.content}${citations}${caveats}\n`;
-}
-
-function signalRiskSection(signal: ContextSignalV1): string {
-  if (!signal.risks.length && !signal.missingInfo.length) return "";
-  const lines = [
-    ...signal.risks.map(r => `- Risk: ${r}`),
-    ...signal.missingInfo.map(m => `- Missing: ${m}`),
-  ];
-  return `\n### Risks / missing info\n${lines.join("\n")}\n`;
-}
-
-function signalCommandSection(signal: ContextSignalV1): string {
-  if (!signal.suggestedCommands.length) return "";
-  return `\n### Suggested validation\n${signal.suggestedCommands.map(c => `- \`${c.command}\` — ${c.reason}`).join("\n")}\n`;
-}
-
-function signalRecommendationSection(signal: ContextSignalV1): string {
-  const rec = signal.openingRecommendation;
-  if (!rec || (!rec.likelyUseful.length && !rec.likelyNoise.length && !rec.missingInfoNeeded.length)) return "";
-  const lines = [
-    rec.likelyUseful.length ? `- Likely useful: ${rec.likelyUseful.join("; ")}` : "",
-    rec.likelyNoise.length ? `- Treat as likely noise unless task explicitly needs it: ${rec.likelyNoise.join("; ")}` : "",
-    rec.missingInfoNeeded.length ? `- Missing info likely needed: ${rec.missingInfoNeeded.join("; ")}` : "",
-  ].filter(Boolean);
-  return `\n### Opening recommendation\n${lines.join("\n")}\n`;
-}
 
 function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
+  // Strip protocol prefix from source for readability
+  const shortSource = i.source.replace(/^(file|repo):\/\//, "");
   const body = i.inline
     ? `\n\`\`\`\n${i.inline}\n\`\`\``
-    : `\n  ${i.summary}\n  Why: ${i.why}\n  Pointer: ${i.source}. Expand: /sherpa:expand ${i.handle}`;
-  return `- **${i.handle}** [${i.type}, ${(i.relevance * 100).toFixed(0)}%] ${i.source}${body}`;
+    : `\n  ${i.summary}`;
+  return `- ${i.handle} — ${shortSource}${body}`;
 }
 
 function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan) {
   if (signal.disposition.kind === "abstain") return `## Sherpa Context\nNo high-confidence context found for: ${signal.focus}`;
-  return `## Sherpa Context (${mode}, ~${budgetUsedTokens} tokens)`
-    + signalRouteLine(sourcePlan)
-    + `\nDisposition: **${signal.disposition.kind}** — ${signal.disposition.reason}\n`
-    + signalProposalSection(signal)
-    + signalRiskSection(signal)
-    + signalCommandSection(signal)
-    + signalRecommendationSection(signal)
-    + `\n### Context items\n${signal.items.map(signalItemMarkdownItem).join("\n")}`;
+  return `## Context\n${signal.items.map(signalItemMarkdownItem).join("\n")}`;
 }
 
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
-  const body = signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan);
-  const tiered = assignTiers(bundle.items, Math.max(bundle.budgetUsedTokens, 1));
-  const tierSummary = tiered.length
-    ? `\n\n### Progressive disclosure\n${[
-        `- L0 references: ${tiered.filter((i) => i.tier === 0).length}`,
-        `- L1 snippets: ${tiered.filter((i) => i.tier === 1).length}`,
-        `- L2 inline/full: ${tiered.filter((i) => i.tier === 2).length}`,
-        "- Expand handles with `/sherpa:expand <handle>` or `expandHandles`.",
-      ].join("\n")}`
-    : "";
-  return `${body}${tierSummary}\n\nBundle: ${bundle.bundleId}`;
+  return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan);
 }
 
 function traceItem(item: ContextItem) {
@@ -1386,6 +1421,7 @@ function recordDspyTrace(cwd: string, bundle: ContextBundle, indicators: SearchI
         abstainReason: curateResult.abstainReason,
         confidence: curateResult.confidence,
         planner: curateResult.planner,
+        plannerReason: curateResult.plannerReason,
         rejected: curateResult.rejected.slice(0, 60),
       },
       decisions,
@@ -1735,6 +1771,7 @@ async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, s
   }
 }
 
+
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   addExplicitPathCandidates(ctx, focus, add);
   await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
@@ -1927,7 +1964,7 @@ async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext,
 
 function createContextAdder(state: State, focus: string, candidates: ContextItem[]): AddContextItem {
   return (type: string, source: string, raw: string, relBoost = 0) => {
-    if (!raw.trim()) return;
+    if (!raw.trim() || isGloballyNoisySource(source)) return;
     const handle = `ctx-${state.nextHandle++}`;
     const inline = raw.length <= 900 && !type.includes("session");
     const summary = summarize(raw);
@@ -1960,7 +1997,7 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
     if (raw) add("graphify_code_graph", `graphify://${path.relative(ctx.cwd, graphifyGraphPath(ctx.cwd, state.config.graphify)) || state.config.graphify.graphPath}`, raw, 0.32);
   })());
   if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
-  if (enabled("git")) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
+  if (enabled("git") && focusAllowsGitStatus(focus)) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
   if (enabled("web")) tasks.push((async () => { for (const r of await searchWeb(state, ctx, focus)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
   if (enabled("surreal_memory")) tasks.push(addSurrealMemoryCandidates(state, ctx, focus, indicators, add));
   if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
@@ -2171,7 +2208,9 @@ function toolTextResult(text: string, details?: unknown) {
 
 function toolErrorResult(prefix: string, error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
-  return toolTextResult(`${prefix}: ${message}`, { error: message });
+  const stack = error instanceof Error ? error.stack : undefined;
+  const debugStack = process.env.SHERPA_DEBUG_ERRORS === "1" && stack ? `\n\n${stack}` : "";
+  return toolTextResult(`${prefix}: ${message}${debugStack}`, { error: message, stack });
 }
 
 function safeNotify(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error") {
@@ -2235,10 +2274,49 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
     if (action) {
-      ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 ${action}${subject ? `: ${statusLabel(subject)}` : ""}`);
+      ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 Sherpa ${action}${subject ? `: ${statusLabel(subject)}` : ""}`);
       return;
     }
     ctx.ui.setStatus(SHERPA_UI_KEY, state?.config.enabled ? `Sherpa: ${state.config.mode}` : "Sherpa: off");
+  };
+
+  const startSherpaWorkUi = (ctx: ExtensionContext, focus: string, mode: string) => {
+    let phase = "starting";
+    let detail = "Preparing retrieval.";
+    let finished = false;
+    const startedAt = Date.now();
+    const render = () => {
+      if (!ctx.hasUI) return;
+      const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+      ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
+      ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 Sherpa working ${elapsed}s: ${statusLabel(phase)}`);
+      ctx.ui.setWidget(SHERPA_UI_KEY, [
+        "🤵 Sherpa is working — Pi is not frozen.",
+        `Mode: ${mode}`,
+        `Phase: ${phase}`,
+        `Elapsed: ${elapsed}s`,
+        detail,
+        `Focus: ${statusLabel(focus)}`,
+      ]);
+    };
+    render();
+    const timer = ctx.hasUI ? setInterval(render, 1000) : undefined;
+    return {
+      update(nextPhase: string, nextDetail?: string) {
+        phase = nextPhase;
+        if (nextDetail) detail = nextDetail;
+        render();
+      },
+      done(finalAction?: string) {
+        if (finished) return;
+        finished = true;
+        if (timer) clearInterval(timer);
+        if (!ctx.hasUI) return;
+        ctx.ui.setWidget(SHERPA_UI_KEY, undefined);
+        if (finalAction) ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 Sherpa ${finalAction}`);
+        else setSherpaStatus(ctx);
+      },
+    };
   };
 
   const compileDspyCandidate = async (ctx: ExtensionContext, reason: string, notify: boolean, options: { force?: boolean } = {}) => {
@@ -2403,11 +2481,12 @@ export default function (pi: ExtensionAPI) {
     if (!state?.config.enabled) return;
     if ((event as { willRetry?: boolean }).willRetry === true) return;
     const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
-    setTimeout(() => { void runPostTaskWork(ctx, ctx.cwd, recentMessages); }, 0);
+    const cwd = ctx.cwd;
+    setTimeout(() => { void runPostTaskWork(ctx, cwd, recentMessages).catch(() => {}); }, 0);
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
-    if (state?.config.enabled) await maybeAutoCompileDspy(ctx, "session_shutdown");
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (state?.config.enabled) void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {});
     closeSessionDb();
     closeSherpaMemoryIndexes();
     ctx.ui.setWidget(SHERPA_UI_KEY, undefined);
@@ -2627,21 +2706,15 @@ export default function (pi: ExtensionAPI) {
     if (!state?.config?.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
     if (isTrivial(event.prompt)) { state.lastSkip = "trivial prompt"; return; }
 
-    setSherpaStatus(ctx, "curating", event.prompt);
-    ctx.ui.setWidget(SHERPA_UI_KEY, [
-      "🤵 Sherpa is curating context…",
-      "🔎 Searching files, docs, and git status.",
-      "⏳ If curation is slow, Pi will continue automatically.",
-    ]);
+    const sherpaUi = startSherpaWorkUi(ctx, event.prompt, "front-door");
 
     try {
+      sherpaUi.update("planning sources", "Choosing files/docs/git/memory sources.");
       const { sourcePlan, indicators } = await planSources(state, ctx, event.prompt, "front-door");
-      ctx.ui.setWidget(SHERPA_UI_KEY, [
-        "🤵 Sherpa is curating context…",
-        `🧭 Sources: ${sourcePlan.sources.join(", ")} (${sourcePlan.planner})`,
-        `＇　️ Indicators: ${indicators.indicators.slice(0, 5).join(", ")}${indicators.indicators.length > 5 ? "..." : ""}`,
-        `💡 ${indicators.reason.slice(0, 80)}`
-      ]);
+      sherpaUi.update(
+        `searching ${sourcePlan.sources.join(", ")}`,
+        `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+      );
 
       // Front-door context must stay high-signal. Avoid session_recent by default because it often
       // echoes tool-result noise back into the next prompt. Explicit Sherpa requests can still use it.
@@ -2649,20 +2722,20 @@ export default function (pi: ExtensionAPI) {
         buildBundle(state, ctx, event.prompt, "front-door", state.config.frontDoor.tokenBudget, sourcePlan, indicators),
         timeoutAfter<ContextBundle>(CURATION_TIMEOUT_MS, "front-door curation timed out"),
       ]);
-      bundle.items = filterAlreadySeenSources(ctx, bundle.items);
+      sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
+      bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
       bundle.signal = buildContextSignal(bundle);
       void maybeAutoCompileDspy(ctx, "bundle");
       const abstainReason = shouldAbstain(bundle.items, "front-door");
       if (abstainReason) { state.lastSkip = abstainReason; return; }
-      ctx.ui.setStatus(SHERPA_UI_KEY, `🤵 injecting ${bundle.items.length} item(s)`);
+      sherpaUi.done(`injecting ${bundle.items.length} item(s)`);
       return { message: { customType: SHERPA_CONTEXT_TYPE, content: bundleMarkdown(bundle), display: true, details: bundle } };
     } catch (err: any) {
       state.lastSkip = `front-door error: ${err?.message ?? err}`;
       ctx.ui.notify(`Sherpa context skipped: ${err?.message ?? err}; continuing without extra context`, "warning");
       return;
     } finally {
-      ctx.ui.setWidget(SHERPA_UI_KEY, undefined);
-      setSherpaStatus(ctx);
+      sherpaUi.done();
     }
   });
 
@@ -2706,13 +2779,18 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Sherpa init failed: ${e?.message ?? String(e)}` }], details: { error: "init_failed", detail: e?.stack?.slice(0, 300) } };
         }
       }
-      setSherpaStatus(ctx, "context", params.focus);
+      const sherpaUi = startSherpaWorkUi(ctx, params.focus, "explicit tool");
       try {
         const _state = state; // capture at function scope to avoid TDZ issues
         const expanded = (params.expandHandles ?? []).map(h => _state.handles.get(h)).filter(Boolean) as ContextItem[];
+        sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
         const { sourcePlan, indicators } = await planSources(_state, ctx, params.focus, "explicit", params.sources);
-        setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, params.focus);
+        sherpaUi.update(
+          `searching ${sourcePlan.sources.join(", ")}`,
+          `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+        );
         const bundle = await buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy });
+        sherpaUi.update("formatting context", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
         void maybeAutoCompileDspy(ctx, "bundle");
         const extra = expanded.map(i => `\n\n## Expanded ${i.handle}\nSource: ${i.source}\n\n${(i.raw ?? i.summary).slice(0, (params.tokenBudget ?? 3000) * 4)}`).join("");
         persist();
@@ -2720,7 +2798,7 @@ export default function (pi: ExtensionAPI) {
       } catch (e: any) {
         return { content: [{ type: "text", text: `Sherpa error: ${e?.message ?? String(e)}\n${(e?.stack ?? "").split("\n").slice(0, 5).join("\n")}` }], details: { error: e?.message ?? String(e) } };
       } finally {
-        setSherpaStatus(ctx);
+        sherpaUi.done();
       }
     },
   });
@@ -2813,13 +2891,19 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("sherpa", { description: "Ask Sherpa for focused context", handler: async (args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const focus = args?.trim() || await ctx.ui.input("Sherpa", "Focus?"); if (!focus) return;
-    setSherpaStatus(ctx, "context", focus);
+    const sherpaUi = startSherpaWorkUi(ctx, focus, "slash command");
     try {
       // User-invoked /sherpa should behave like an intervention: inject the context and wake the
       // main agent. Source planning chooses the likely stores before expensive retrieval.
+      sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
       const { sourcePlan, indicators } = await planSources(state, ctx, focus, "explicit");
-      setSherpaStatus(ctx, `searching ${sourcePlan.sources.join(",")}`, focus);
+      sherpaUi.update(
+        `searching ${sourcePlan.sources.join(", ")}`,
+        `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+      );
       const bundle = await buildBundle(state, ctx, focus, "explicit", state.config.explicit.tokenBudget, sourcePlan, indicators);
+      sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
+      bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
       void maybeAutoCompileDspy(ctx, "bundle");
       const abstainReason = shouldAbstain(bundle.items, "explicit");
       if (abstainReason) {
@@ -2834,7 +2918,7 @@ export default function (pi: ExtensionAPI) {
       pi.sendMessage({ customType: "sherpa-context", content: bundleMarkdown(bundle), display: true, details: bundle }, { triggerTurn: true, deliverAs: "steer" });
       persist();
     } finally {
-      setSherpaStatus(ctx);
+      sherpaUi.done();
     }
   }});
 
@@ -2888,6 +2972,8 @@ export default function (pi: ExtensionAPI) {
       `top rejected: ${fmt(report.topRejected)}`,
       `top suppressed: ${fmt(report.topSuppressed)}`,
       `top reasons: ${fmtReasons(report.topReasons)}`,
+      `source planner reasons: ${fmtReasons(report.topSourcePlanReasons)}`,
+      `curation reasons: ${fmtReasons(report.topCurationReasons)}`,
     ].join("\n"), "info");
   }});
 

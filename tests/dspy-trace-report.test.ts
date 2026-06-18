@@ -36,7 +36,7 @@ test("summarizeDspyTraces aggregates decisions and reasons", () => {
       { source: "repo://docs/MISSIONS.md", finalRelevance: 0.2, decision: "suppressed", reasons: ["generic_source:mission", "focus_does_not_allow_mission"] },
       { source: "repo://README.md", finalRelevance: 0.3, decision: "rejected", reasons: ["generic_source:readme"] },
     ] }),
-    trace({ candidateCount: 5, selected: [], curate: { abstain: true, abstainReason: "weak", confidence: 0.1, planner: "heuristic", rejected: [] }, decisions: [
+    trace({ candidateCount: 5, selected: [], sourcePlan: { sources: ["files"], reason: "planner skipped: mode=explicit", confidence: 0.4, planner: "fallback" }, curate: { abstain: true, abstainReason: "weak", confidence: 0.1, planner: "heuristic", plannerReason: "curation skipped: remote model disabled", rejected: [] }, decisions: [
       { source: "repo://b.ts", finalRelevance: 0.7, decision: "boosted", reasons: ["missed_path_boost"] },
     ] }),
   ]);
@@ -49,6 +49,8 @@ test("summarizeDspyTraces aggregates decisions and reasons", () => {
   assert(report.decisions.suppressed === 1, "expected suppressed count");
   assert(report.topSuppressed[0]?.source === "repo://docs/MISSIONS.md", "expected suppressed mission doc");
   assert(report.topReasons.some((item) => item.reason === "generic_source:mission"), "expected mission reason");
+  assert(report.topSourcePlanReasons.some((item) => item.reason === "planner skipped: mode=explicit"), "expected source planner reason");
+  assert(report.topCurationReasons.some((item) => item.reason === "curation skipped: remote model disabled"), "expected curation reason");
 });
 
 for (const { name, fn } of tests) {

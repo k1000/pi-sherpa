@@ -55,6 +55,7 @@ const DEFAULT_SESSION_LOG = "hyperpod-tmp/session.jsonl";
 
 export class SessionSearchDb {
   private db: SqliteDatabase;
+  private ftsAvailable = false;
   private dbPath: string;
   private sessionLogPath: string;
   private maxResults: number;
@@ -86,16 +87,6 @@ export class SessionSearchDb {
       )
     `);
     this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS session_entries_fts USING fts5(
-        session_id,
-        ts,
-        kind,
-        text,
-        content='session_entries',
-        content_rowid='rowid'
-      )
-    `);
-    this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_entries (
         rowid INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
@@ -104,19 +95,34 @@ export class SessionSearchDb {
         text TEXT NOT NULL
       )
     `);
-    // Triggers to keep FTS in sync
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS session_entries_ai AFTER INSERT ON session_entries BEGIN
-        INSERT INTO session_entries_fts(rowid, session_id, ts, kind, text)
-        VALUES (new.rowid, new.session_id, new.ts, new.kind, new.text);
-      END
-    `);
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS session_entries_ad AFTER DELETE ON session_entries BEGIN
-        INSERT INTO session_entries_fts(session_entries_fts, rowid, session_id, ts, kind, text)
-        VALUES ('delete', old.rowid, old.session_id, old.ts, old.kind, old.text);
-      END
-    `);
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_entries_fts USING fts5(
+          session_id,
+          ts,
+          kind,
+          text,
+          content='session_entries',
+          content_rowid='rowid'
+        )
+      `);
+      // Triggers to keep FTS in sync when the runtime provides FTS5.
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS session_entries_ai AFTER INSERT ON session_entries BEGIN
+          INSERT INTO session_entries_fts(rowid, session_id, ts, kind, text)
+          VALUES (new.rowid, new.session_id, new.ts, new.kind, new.text);
+        END
+      `);
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS session_entries_ad AFTER DELETE ON session_entries BEGIN
+          INSERT INTO session_entries_fts(session_entries_fts, rowid, session_id, ts, kind, text)
+          VALUES ('delete', old.rowid, old.session_id, old.ts, old.kind, old.text);
+        END
+      `);
+      this.ftsAvailable = true;
+    } catch {
+      this.ftsAvailable = false;
+    }
   }
 
   /**
@@ -142,7 +148,7 @@ export class SessionSearchDb {
 
   private resetIndexProgress(): void {
     this.db.exec("DELETE FROM session_entries");
-    this.db.exec("DELETE FROM session_entries_fts");
+    if (this.ftsAvailable) this.db.exec("DELETE FROM session_entries_fts");
     this.setLastIndexedOffset(0);
   }
 
@@ -206,11 +212,9 @@ export class SessionSearchDb {
    */
   search(query: string, limit?: number): SessionSearchMatch[] {
     const effectiveLimit = Math.min(limit ?? this.maxResults, 100);
+    const safeQuery = sanitizeFts5Query(query);
+    if (!this.ftsAvailable || !safeQuery) return this.fallbackSearch(query, effectiveLimit);
     try {
-      // Sanitize FTS5 query — escape special characters, keep basic syntax
-      const safeQuery = sanitizeFts5Query(query);
-      if (!safeQuery) return [];
-
       const rows = this.db.query(`
         SELECT e.rowid as id, e.session_id as sessionId, e.ts, e.kind,
                snippet(session_entries_fts, 4, '<b>', '</b>', '…', 40) as snippet,
@@ -224,7 +228,7 @@ export class SessionSearchDb {
 
       return rows;
     } catch {
-      // If FTS5 query fails (e.g., bad syntax), fall back to LIKE search
+      // If FTS5 is unavailable in this runtime or query fails, fall back to LIKE search.
       return this.fallbackSearch(query, effectiveLimit);
     }
   }

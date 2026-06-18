@@ -39,7 +39,43 @@ export async function rg(cwd: string, query: string | string[], searchPath = cwd
   const bundledRg = path.join(cwd, "bin", "rg");
   const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
   try {
-    const { stdout } = await execFileAsync(rgBin, ["-n", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.next", "--glob", "!dist", terms.join("|"), searchPath], { timeout: 3000, maxBuffer: 500_000 });
+    const excludeGlobs = [
+      "!.git",
+      "!node_modules",
+      "!.next",
+      "!dist",
+      "!build",
+      "!coverage",
+      "!.pi-memory",
+      "!**/.pi-memory/**",
+      "!graphify-out",
+      "!**/graphify-out/**",
+      "!agent-disabled-extension-backups",
+      "!**/agent-disabled-extension-backups/**",
+      "!extensions-disabled",
+      "!**/extensions-disabled/**",
+      "!extensions.disabled",
+      "!**/extensions.disabled/**",
+      "!**/.pi/revolver/**",
+      "!.zcompdump*",
+      "!**/.zcompdump*",
+      "!.zsh_history",
+      "!**/.zsh_history",
+      "!.bun",
+      "!**/.bun/**",
+      "!.cdk/cache",
+      "!**/.cdk/cache/**",
+      "!Library/Caches",
+      "!**/Library/Caches/**",
+      "!.omp/logs",
+      "!**/.omp/logs/**",
+      "!*.bundle.js",
+      "!*.min.js",
+      "!*.db",
+      "!*.sqlite",
+    ];
+    const args = ["-n", "--hidden", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), searchPath];
+    const { stdout } = await execFileAsync(rgBin, args, { timeout: 3000, maxBuffer: 500_000 });
     return stdout;
   } catch (e: any) { return e.stdout ?? ""; }
 }

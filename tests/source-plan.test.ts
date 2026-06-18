@@ -15,5 +15,6 @@ assert.ok(!codePlan.sources.includes("project_memory" as never), `code-reduced p
 assertSources("explain the end-to-end architecture flow for graph memory retrieval", ["files", "semble", "docs", "project_memory", "surreal_memory"]);
 assertSources("what convention do we use for graph memory in surrealdb", ["project_memory", "surreal_memory"]);
 assertSources("review recent git diff for source routing changes", ["git"]);
+assertSources("review recent sherpa performance, does it provide usefull data, all is working corectly ?", ["docs", "project_memory", "files"]);
 
-console.log("source-plan tests passed=4");
+console.log("source-plan tests passed=5");
