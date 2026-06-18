@@ -5,10 +5,9 @@
  * Run with: npx tsx tests/parse-rg-output.test.ts
  */
 
-import { execFileSync, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { parseRgOutput, rg, isUnsafeBroadSearchRoot } from "../lib/rg";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,52 +15,6 @@ const execFileAsync = promisify(execFile);
 
 function countOccurrences(str: string, sub: string): number {
     return (str.match(new RegExp(sub, "g")) || []).length;
-}
-
-function parseRgOutput(output: string): Array<{ fileAndLine: string; content: string }> {
-    const results: Array<{ fileAndLine: string; content: string }> = [];
-    for (const block of output.split("\n").slice(0, 30)) {
-        if (!block.trim()) continue;
-        // OLD BUGGY PARSER: block.split(":") breaks on any colon
-        // FIX: split on first ":" only (after the line number)
-        const firstColon = block.indexOf(":");
-        const secondColon = block.indexOf(":", firstColon + 1);
-        if (firstColon === -1) continue;
-        
-        // file:line:content — split at second colon to separate line number from content
-        const fileAndLine = block.slice(0, secondColon);
-        const content = block.slice(secondColon + 1).trim();
-        results.push({ fileAndLine, content });
-    }
-    return results;
-}
-
-function parseRgOutputOld(output: string): Array<{ fileAndLine: string; content: string }> {
-    const results: Array<{ fileAndLine: string; content: string }> = [];
-    for (const block of output.split("\n").slice(0, 30)) {
-        if (!block.trim()) continue;
-        const parts = block.split(":");
-        const fileAndLine = parts.slice(0, 2).join(":");
-        const content = parts.slice(2).join(":").trim();
-        results.push({ fileAndLine, content });
-    }
-    return results;
-}
-
-async function rg(cwd: string, query: string): Promise<string> {
-    const terms = query.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-    if (!terms.length) return "";
-    const bundledRg = path.join(cwd, "bin", "rg");
-    const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
-    try {
-        const { stdout } = await execFileAsync(rgBin, [
-            "-n", "--hidden", "--glob", "!.git", "--glob", "!node_modules",
-            terms.join("|"), cwd
-        ], { timeout: 3000, maxBuffer: 500_000 });
-        return stdout;
-    } catch (e: any) {
-        return e.stdout ?? "";
-    }
 }
 
 async function gitChanged(cwd: string): Promise<string> {
@@ -191,12 +144,18 @@ test("gitChanged: returns empty in non-git dir", async () => {
     assert(result === "", `Expected empty string, got: ${result}`);
 });
 
+test("rg: detects unsafe broad search roots", async () => {
+    assert(isUnsafeBroadSearchRoot("/"), "filesystem root should be unsafe");
+    assert(isUnsafeBroadSearchRoot(process.env.HOME || "/Users/kamil"), "home directory should be unsafe");
+    assert(!isUnsafeBroadSearchRoot("/Users/kamil/.pi/agent"), "nested project directory should be safe");
+});
+
 // TEST 9: rg function returns results for known query
 test("rg: finds Sherpa-related files", async () => {
     const output = await rg("/Users/kamil/.pi/agent", "Sherpa");
     assert(output.length > 0, "Should find Sherpa in files");
     assert(output.includes("Sherpa"), "Output should contain 'Sherpa'");
-    assert(output.includes(".ts:"), "Output should contain file:line format");
+    assert(/:\d+:/.test(output), "Output should contain file:line format");
 });
 
 // TEST 10: rg with no matches returns empty

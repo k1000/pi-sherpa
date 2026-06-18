@@ -9,6 +9,12 @@
   "repository": { "type": "git", "url": "git+https://github.com/k1000/pi-sherpa.git" },
   "bugs": { "url": "https://github.com/k1000/pi-sherpa/issues" },
   "homepage": "https://github.com/k1000/pi-sherpa#readme",
+  "scripts": {
+    "check": "bun scripts/check-extension.ts"
+  },
+  "engines": {
+    "bun": ">=1.3.0"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",

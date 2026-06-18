@@ -3,7 +3,7 @@
  * Run with: tsx tests/auto-memory.test.ts
  */
 
-import { mkdtempSync, readFileSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createAutoMemoryState, extractAutoMemoryCandidates, stringifyForAutoMemory, writeAutoMemoryArtifact } from "../lib/auto-memory";
@@ -28,7 +28,7 @@ function withDirs(fn: (repo: string, vault: string, memory: string, scratch: str
   }
 }
 
-test("extractAutoMemoryCandidates keeps structural rules and ignores noise", () => {
+test("extractAutoMemoryCandidates is deprecated and ignores raw session text", () => {
   const candidates = extractAutoMemoryCandidates(`
     ✓ test passed
     Always use migrations for production schema changes because db:push bypasses tracking.
@@ -36,9 +36,7 @@ test("extractAutoMemoryCandidates keeps structural rules and ignores noise", () 
     RUN v2.1.9
     caps.id must remain text not uuid in ClearStack worker code.
   `);
-  assert(candidates.length === 2, `expected 2 candidates, got ${candidates.length}`);
-  assert(candidates[0]!.includes("Always use migrations"), "missing migration candidate");
-  assert(candidates[1]!.includes("caps.id"), "missing caps.id candidate");
+  assert(candidates.length === 0, `expected no candidates, got ${candidates.length}`);
 });
 
 test("stringifyForAutoMemory truncates large values safely", () => {
@@ -46,7 +44,7 @@ test("stringifyForAutoMemory truncates large values safely", () => {
   assert(text.length === 200, "should truncate to max");
 });
 
-test("writeAutoMemoryArtifact writes Obsidian memory and project scratchpad candidate", () => withDirs((repo, vault, memory, scratch) => {
+test("writeAutoMemoryArtifact no longer writes regex-extracted candidates", () => withDirs((repo, vault, memory, scratch) => {
   const state = createAutoMemoryState();
   const result = writeAutoMemoryArtifact(state, {
     cwd: repo,
@@ -55,13 +53,11 @@ test("writeAutoMemoryArtifact writes Obsidian memory and project scratchpad cand
     appendScratchpadCandidate: (text) => scratch.push(text),
   }, "agent_end", "Workers must preserve idempotent queue completion semantics and never falsely complete failed side effects.");
 
-  assert(result.written, "should write artifact");
-  assert(result.candidates.length === 1, "should extract candidate");
-  assert(scratch.length === 1, "should write scratchpad candidate");
+  assert(!result.written, "deprecated extractor should not write artifacts");
+  assert(result.candidates.length === 0, "should not extract regex candidates");
+  assert(scratch.length === 0, "should not write scratchpad candidate");
   assert(existsSync(path.join(memory, "journal")), "should create journal dir");
   assert(existsSync(path.join(memory, "inbox")), "should create inbox dir");
-  const journalText = readFileSync(path.join(memory, "journal", new Date().toISOString().slice(0, 10) + ".md"), "utf8");
-  assert(journalText.includes("idempotent queue"), "journal should contain candidate");
 
   const duplicate = writeAutoMemoryArtifact(state, {
     cwd: repo,
@@ -72,7 +68,7 @@ test("writeAutoMemoryArtifact writes Obsidian memory and project scratchpad cand
   assert(!duplicate.written, "duplicate hash should not rewrite");
 }));
 
-test("writeAutoMemoryArtifact proves lifecycle session distillation for agent, compact, and shutdown", () => withDirs((repo, vault, memory, scratch) => {
+test("writeAutoMemoryArtifact tracks lifecycle hashes without raw regex distillation", () => withDirs((repo, vault, memory, scratch) => {
   const state = createAutoMemoryState();
   const config = {
     cwd: repo,
@@ -85,18 +81,12 @@ test("writeAutoMemoryArtifact proves lifecycle session distillation for agent, c
   const compact = writeAutoMemoryArtifact(state, config, "session_compact", "Invariant: session compaction should extract structural memory candidates without dumping raw context into the main session.");
   const shutdown = writeAutoMemoryArtifact(state, config, "session_shutdown:exit", "Rule: session shutdown should persist only durable structural lessons and should ignore one-off raw logs.");
 
-  assert(agent.written && compact.written && shutdown.written, "all lifecycle events should write");
-  assert(scratch.length === 3, "each lifecycle event should emit a scratchpad candidate");
+  assert(!agent.written && !compact.written && !shutdown.written, "deprecated regex extractor should not write lifecycle artifacts");
+  assert(state.writtenHashes.length === 3, "each lifecycle event should still be deduped by hash");
+  assert(scratch.length === 0, "lifecycle events should not emit scratchpad candidates");
 
   const inboxFiles = readdirSync(path.join(memory, "inbox")).filter((file) => file.endsWith(".md"));
-  assert(inboxFiles.length === 3, `expected 3 inbox candidate files, got ${inboxFiles.length}`);
-
-  const journalFile = path.join(memory, "journal", new Date().toISOString().slice(0, 10) + ".md");
-  const journalText = readFileSync(journalFile, "utf8");
-  assert(journalText.includes("agent_end"), "journal should include agent_end reason");
-  assert(journalText.includes("session_compact"), "journal should include session_compact reason");
-  assert(journalText.includes("session_shutdown:exit"), "journal should include session_shutdown reason");
-  assert(journalText.includes("Candidate learnings"), "journal should include candidate learnings");
+  assert(inboxFiles.length === 0, `expected no inbox candidate files, got ${inboxFiles.length}`);
 }));
 
 for (const { name, fn } of tests) {

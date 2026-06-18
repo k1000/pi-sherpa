@@ -24,6 +24,7 @@ test("classifyTaskOutcome detects core outcomes", () => {
   assert(classifyTaskOutcome("Results: 42 passed, 0 failed").outcome === "completed", "zero failed test summary should not be failure");
   assert(classifyTaskOutcome("blocked waiting on approval").outcome === "blocked", "expected blocked");
   assert(classifyTaskOutcome("typecheck failed with error").outcome === "failed", "expected failed");
+  assert(classifyTaskOutcome("Frontend error logs showed a cascade. Fixed the retry loop and verified: bun test src/server/frontend.test.ts -> 48 pass").outcome === "completed", "fixed error logs with passing tests should be completed");
   assert(classifyTaskOutcome("rolled back discarded changes").outcome === "reverted", "expected reverted");
 });
 
@@ -31,12 +32,17 @@ test("suggestVerificationCommands maps changed files to checks", () => {
   const advice = suggestVerificationCommands([
     "apps/workers/src/index.ts",
     "packages/shared/src/db/drizzle/schema/foo.ts",
-    "routes.csv",
+    "catalog.csv",
   ]);
   assert(advice.commands.some((item) => item.command === "pnpm typecheck"), "missing TS typecheck");
   assert(advice.commands.some((item) => item.command === "pnpm --filter workers typecheck"), "missing workers typecheck");
   assert(advice.commands.some((item) => item.command === "pnpm db:generate"), "missing db generate");
-  assert(advice.routesReview, "expected route review");
+  assert(advice.catalogReview, "expected catalog review");
+});
+
+test("suggestVerificationCommands recommends focused frontend checks", () => {
+  const advice = suggestVerificationCommands(["src/server/public/client.js"]);
+  assert(advice.commands.some((item) => item.command === "bun test src/server/frontend.test.ts"), "missing HyperPod frontend test");
 });
 
 test("compactScratchpad archives large sections", () => withTemp((dir) => {

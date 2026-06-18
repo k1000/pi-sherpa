@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, append
 import os from "node:os";
 import path from "node:path";
 import { getProjectKBBasedir } from "./project-kb";
+import { upsertCatalogRow } from "./catalog";
 
 export type MemoryPaths = {
   cwd: string;
@@ -138,11 +139,74 @@ function obsidianDir(paths: MemoryPaths, entry: ReflectEntry) {
   return path.join(paths.obsidianMemoryPath, "wiki", semantic.folder);
 }
 
-export async function syncReflectMemory(paths: MemoryPaths, options: { refId?: string; destination?: string; dryRun?: boolean; since?: string } = {}) {
-  const entries = options.refId
-    ? [findReflectEntry(paths.cwd, options.refId)].filter(Boolean) as ReflectEntry[]
+function reflectEntriesForSync(paths: MemoryPaths, refId?: string): ReflectEntry[] {
+  return refId
+    ? [findReflectEntry(paths.cwd, refId)].filter(Boolean) as ReflectEntry[]
     : readReflectEntries(paths.cwd);
+}
 
+function reflectNote(entry: ReflectEntry, body: string) {
+  return formatFrontmatter({
+    id: entry.id,
+    type: semanticWikiType(entry).pageType,
+    importance: entry.importance ?? "medium",
+    tags: entry.tags ?? [],
+    source: "reflect",
+    created: new Date().toISOString(),
+  }, body);
+}
+
+function syncReflectScratchpad(paths: MemoryPaths, entry: ReflectEntry, body: string) {
+  const target = path.join(getProjectKBBasedir(paths.cwd), "scratchpad", "sessions", "daily", `${new Date().toISOString().slice(0, 10)}.md`);
+  mkdirSync(path.dirname(target), { recursive: true });
+  appendFileSync(target, `\n## Reflect ${entry.id}\n\n${body}\n`);
+  return `${entry.id} -> project scratchpad`;
+}
+
+function syncReflectJournal(paths: MemoryPaths, entry: ReflectEntry, body: string) {
+  const target = path.join(paths.obsidianMemoryPath, "journal", `${new Date().toISOString().slice(0, 10)}.md`);
+  mkdirSync(path.dirname(target), { recursive: true });
+  appendFileSync(target, `\n## Reflect ${entry.id} — ${entry.title ?? entry.id}\n\n${body}\n`);
+  return `${entry.id} -> ${path.relative(paths.cwd, target)}`;
+}
+
+function syncReflectObsidian(paths: MemoryPaths, entry: ReflectEntry, slug: string, body: string) {
+  const dir = obsidianDir(paths, entry);
+  mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, `${slug}.md`);
+  writeFileSync(target, reflectNote(entry, body));
+  upsertCatalogRow(paths.cwd, {
+    id: `reflect.${entry.id}`,
+    scope: "project",
+    project: path.basename(paths.cwd),
+    type: semanticWikiType(entry).pageType,
+    path: path.relative(paths.cwd, target).replace(/\\/g, "/"),
+    title: entry.title ?? entry.id,
+    summary: entry.summary ?? body.slice(0, 180),
+    aliases: entry.id,
+    tags: Array.isArray(entry.tags) ? entry.tags.join("|") : "reflect",
+    status: "active",
+    confidence: entry.importance ?? "medium",
+    updated: new Date().toISOString().slice(0, 10),
+    based_on: entry.id,
+    routes: [entry.title ?? "", ...(entry.tags ?? [])].filter(Boolean).join("|"),
+    keywords: [entry.id, entry.type ?? "", entry.importance ?? ""].filter(Boolean).join("|"),
+  });
+  return `${entry.id} -> ${path.relative(paths.cwd, target)}`;
+}
+
+function syncReflectEntry(paths: MemoryPaths, entry: ReflectEntry, destination: string, dryRun?: boolean): { synced?: string; skipped?: string } {
+  const slug = slugify(entry.title || entry.id);
+  const body = reflectBody(entry);
+  if (dryRun) return { synced: `${entry.id} -> ${destination}/${slug}.md (dry-run)` };
+  if (destination === "scratchpad") return { synced: syncReflectScratchpad(paths, entry, body) };
+  if (destination === "journal") return { synced: syncReflectJournal(paths, entry, body) };
+  if (destination === "obsidian") return { synced: syncReflectObsidian(paths, entry, slug, body) };
+  return { skipped: `${entry.id}: unsupported destination ${destination}` };
+}
+
+export async function syncReflectMemory(paths: MemoryPaths, options: { refId?: string; destination?: string; dryRun?: boolean; since?: string } = {}) {
+  const entries = reflectEntriesForSync(paths, options.refId);
   const sinceTime = options.since ? Date.parse(options.since) : Number.NEGATIVE_INFINITY;
   const synced: string[] = [];
   const skipped: string[] = [];
@@ -153,49 +217,9 @@ export async function syncReflectMemory(paths: MemoryPaths, options: { refId?: s
       skipped.push(`${entry.id}: before --since`);
       continue;
     }
-
-    const destination = destinationFor(entry, options.destination);
-    const slug = slugify(entry.title || entry.id);
-    const body = reflectBody(entry);
-    const note = formatFrontmatter({
-      id: entry.id,
-      type: semanticWikiType(entry).pageType,
-      importance: entry.importance ?? "medium",
-      tags: entry.tags ?? [],
-      source: "reflect",
-      created: new Date().toISOString(),
-    }, body);
-
-    if (options.dryRun) {
-      synced.push(`${entry.id} -> ${destination}/${slug}.md (dry-run)`);
-      continue;
-    }
-
-    if (destination === "scratchpad") {
-      const target = path.join(getProjectKBBasedir(paths.cwd), "scratchpad", "sessions", "daily", `${new Date().toISOString().slice(0, 10)}.md`);
-      mkdirSync(path.dirname(target), { recursive: true });
-      appendFileSync(target, `\n## Reflect ${entry.id}\n\n${body}\n`);
-      synced.push(`${entry.id} -> project scratchpad`);
-      continue;
-    }
-
-    if (destination === "journal") {
-      const target = path.join(paths.obsidianMemoryPath, "journal", `${new Date().toISOString().slice(0, 10)}.md`);
-      mkdirSync(path.dirname(target), { recursive: true });
-      appendFileSync(target, `\n## Reflect ${entry.id} — ${entry.title ?? entry.id}\n\n${body}\n`);
-      synced.push(`${entry.id} -> ${path.relative(paths.cwd, target)}`);
-      continue;
-    }
-
-    if (destination !== "obsidian") {
-      skipped.push(`${entry.id}: unsupported destination ${destination}`);
-      continue;
-    }
-
-    const dir = obsidianDir(paths, entry);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, `${slug}.md`), note);
-    synced.push(`${entry.id} -> ${path.relative(paths.cwd, path.join(dir, `${slug}.md`))}`);
+    const result = syncReflectEntry(paths, entry, destinationFor(entry, options.destination), options.dryRun);
+    if (result.synced) synced.push(result.synced);
+    if (result.skipped) skipped.push(result.skipped);
   }
 
   return [

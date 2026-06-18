@@ -31,21 +31,21 @@ Files persist for next task — raw data never accumulated in session
 | **retrieve** | `sherpa_request_context` | Session (distilled only) |
 | **route** | root `routes.csv` | Search/read priority map |
 | **enrich** | `sherpa_request_context` + handles | Session (distilled only) |
-| **distill** | `sherpa_distill` / auto-memory hooks | Obsidian durable memory |
-| **preserve** | `sherpa_preserve` | Obsidian / project scratchpad by routing policy |
-| **document** | `prompts/DOCUMENTATION.md` + agent-end documentation audit | Main-agent follow-up / project scratchpad todo |
+| **distill** | Archivist (`archivist_distill`) | Obsidian durable memory |
+| **preserve** | Archivist (`archivist_preserve`) | Obsidian / project scratchpad by routing policy |
+| **document** | Archivist (`archivist:docs:audit`) | Documentation maintenance |
 | **automate** | `prompts/AUTOMATION.md` + `sherpa_run_automation` | Scratchpad candidates / safe registered script execution |
 
-Sherpa is the single memory authority. The former `generic-agent` memory layer has been merged into `extensions/pi-sherpa/memory/`; any remaining `generic-agent` references are compatibility-only.
+Sherpa is the read-side/session memory authority. Durable write-side preservation and distillation are delegated to Archivist. The former `generic-agent` memory layer has been merged into `extensions/pi-sherpa/memory/`; any remaining `generic-agent` references are compatibility-only.
 
 ## When to Use Each
 
 - **retrieve** → before any substantial task. Search files, git, docs, Obsidian, reflect. Return only what matters.
 - **route** → always consult root `routes.csv` before broad search. If missing, create it during Sherpa initialization by scanning project roots/docs/apps/packages.
 - **enrich** → when retrieved context has gaps. Fetch full notes, expand handles. Still only distilled output crosses the firewall.
-- **distill** → after completing tasks with lessons worth preserving. Write durable semantic wiki pages, journal entries, or inbox candidates to Obsidian.
-- **preserve** → after `reflect_capture` or lifecycle extraction. Run the decision gate. Route only if it passes.
-- **document** → after main-agent code/config changes, use the dedicated documentation prompt (`prompts/DOCUMENTATION.md`) to audit whether README/docs/routes/AGENTS/technical docs changed too. If source changed without docs, create a project scratchpad todo and ask the main agent to review/update documentation. Manual command: `/sherpa:docs:audit`.
+- **distill** → Archivist owns. Use `archivist_distill` after completing tasks with lessons worth preserving.
+- **preserve** → Archivist owns. Use `archivist_preserve` after `reflect_capture` or lifecycle extraction.
+- **document** → Archivist owns. Use `/archivist:docs:audit` for documentation drift tracking.
 - **automate** → detect repeated safe workflows, propose project-language-native scripts/package commands, register them through `routes.csv`, and run only safe discovered automations internally. Anything destructive or production-like requires explicit approval.
 
 ## The Decision Gate (preserve)
@@ -95,7 +95,7 @@ Preferred Obsidian ontology:
 
 | Reflect type | Importance | Destination |
 |---|---|---|
-| pattern / automation | any durable reusable value | `wiki/procedures/` unless explicitly cross-project/global |
+| pattern / automation | any durable reusable value | `wiki/procedures/` unless explicitly cross-project/global or routed to `research/<area>/` by domain |
 | knowledge | critical / high | `wiki/concepts/` unless it is better modeled as system, decision, or evidence |
 | knowledge | medium / low | `inbox/` candidate or project scratchpad unless promoted by maintenance transaction |
 | process | critical | `wiki/decisions/` if durable; otherwise project scratchpad |

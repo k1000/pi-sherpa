@@ -182,7 +182,7 @@ function detectProjectLanguage(cwd: string): "typescript" | "javascript" | "pyth
     try {
       const pkg = JSON.parse(readFileSync(path.join(cwd, "package.json"), "utf8"));
       const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
-      if (pkg.type === "module" || deps.typescript || deps.tsx || deps.ts-node) return "typescript";
+      if (pkg.type === "module" || deps.typescript || deps.tsx || deps["ts-node"]) return "typescript";
     } catch {
       // ignore malformed package.json
     }
@@ -264,64 +264,63 @@ export function updateAutomationCandidates(
   return candidates;
 }
 
-export function discoverRunnableAutomations(cwd: string): RunnableAutomation[] {
-  const automations: RunnableAutomation[] = [];
-
+function discoverPackageScripts(cwd: string): RunnableAutomation[] {
   const packageJson = path.join(cwd, "package.json");
-  if (existsSync(packageJson)) {
-    try {
-      const parsed = JSON.parse(readFileSync(packageJson, "utf8"));
-      const scripts = parsed.scripts && typeof parsed.scripts === "object" ? parsed.scripts : {};
-      for (const [name, commandValue] of Object.entries(scripts)) {
-        if (typeof commandValue !== "string") continue;
-        const command = `pnpm run ${name}`;
-        automations.push({
-          name,
-          kind: "package-script",
-          command,
-          cwd,
-          safety: classifyAutomationSafety(commandValue),
-          purpose: `package.json script: ${name}`,
-        });
-      }
-    } catch {
-      // ignore malformed package.json
-    }
+  if (!existsSync(packageJson)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(packageJson, "utf8"));
+    const scripts = parsed.scripts && typeof parsed.scripts === "object" ? parsed.scripts : {};
+    return Object.entries(scripts)
+      .filter(([, v]) => typeof v === "string")
+      .map(([name, commandValue]) => ({
+        name,
+        kind: "package-script" as const,
+        command: `pnpm run ${name}`,
+        cwd,
+        safety: classifyAutomationSafety(String(commandValue)),
+        purpose: `package.json script: ${name}`,
+      }));
+  } catch {
+    return [];
   }
+}
 
+function scriptFileCommand(rel: string, name: string): string {
+  if (name.endsWith(".sh")) return `bash ${rel}`;
+  if (name.endsWith(".ts") || name.endsWith(".tsx")) return `pnpm exec tsx ${rel}`;
+  if (name.endsWith(".py")) return `python3 ${rel}`;
+  return `node ${rel}`;
+}
+
+function discoverScriptsDir(cwd: string): RunnableAutomation[] {
   const scriptsDir = path.join(cwd, "scripts");
-  if (existsSync(scriptsDir)) {
-    try {
-      for (const name of readdirSync(scriptsDir).sort()) {
+  if (!existsSync(scriptsDir)) return [];
+  try {
+    return readdirSync(scriptsDir).sort()
+      .filter((name) => {
         const scriptPath = path.join(scriptsDir, name);
-        const stat = statSync(scriptPath);
-        if (!stat.isFile()) continue;
-        if (!/\.(sh|js|mjs|cjs|ts|tsx|py)$/.test(name)) continue;
-        const rel = path.relative(cwd, scriptPath).replace(/\\/g, "/");
-        const command = name.endsWith(".sh")
-          ? `bash ${rel}`
-          : name.endsWith(".ts") || name.endsWith(".tsx")
-            ? `pnpm exec tsx ${rel}`
-            : name.endsWith(".py")
-              ? `python3 ${rel}`
-              : `node ${rel}`;
-        const metadata = parseAutomationMetadata(readFileSync(scriptPath, "utf8"));
-        const classifiedSafety = classifyAutomationSafety(command, metadata);
-        automations.push({
+        return statSync(scriptPath).isFile() && /\.(sh|js|mjs|cjs|ts|tsx|py)$/.test(name);
+      })
+      .map((name) => {
+        const rel = path.relative(cwd, path.join(scriptsDir, name)).replace(/\\/g, "/");
+        const command = scriptFileCommand(rel, name);
+        const metadata = parseAutomationMetadata(readFileSync(path.join(scriptsDir, name), "utf8"));
+        return {
           name: rel,
-          kind: "repo-script",
+          kind: "repo-script" as const,
           command,
           cwd,
           ...metadata,
-          safety: metadata.safety ?? classifiedSafety,
-        });
-      }
-    } catch {
-      // ignore unreadable scripts dir
-    }
+          safety: metadata.safety ?? classifyAutomationSafety(command, metadata),
+        };
+      });
+  } catch {
+    return [];
   }
+}
 
-  return automations;
+export function discoverRunnableAutomations(cwd: string): RunnableAutomation[] {
+  return [...discoverPackageScripts(cwd), ...discoverScriptsDir(cwd)];
 }
 
 export function findRunnableAutomation(cwd: string, name: string) {
