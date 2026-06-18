@@ -1,0 +1,4 @@
+{
+  "entry": ["index.ts", "scripts/check-extension.ts", "tests/**/*.ts"],
+  "ignoreDependencies": ["node:sqlite"]
+}

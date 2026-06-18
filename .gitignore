@@ -14,3 +14,7 @@ memory/.l0_meta/*.md
 .fallow/
 .ralph/
 graphify-out/
+
+# Archivist catalog mirror with machine-local relative paths (../../../../Documents/...);
+# canonical knowledge lives in the Obsidian vault, not in the extension repo.
+catalog.csv
