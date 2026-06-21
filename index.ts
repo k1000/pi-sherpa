@@ -436,14 +436,47 @@ const FRONT_DOOR_MAX_DOCS = 2;
 const SHERPA_UI_KEY = "ai-sherpa";
 const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
 const SHERPA_CONTEXT_TYPE = "sherpa-context";
-const CURATION_TIMEOUT_MS = 8_000;
-const SOURCE_PLANNER_TIMEOUT_MS = 6_000;
+const CURATION_TIMEOUT_MS = 12_000;
+const FINAL_QUALITY_TIMEOUT_MS = 20_000;
+const SOURCE_PLANNER_TIMEOUT_MS = 12_000;
 const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
 
 function isCodePrompt(focus: string) {
   return /\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|hook|module|typescript|javascript|python|sql)\b/i.test(focus);
+}
+
+type QueryTarget = {
+  action: string;
+  targetTerms: string[];
+  evidenceType: "code" | "docs" | "memory" | "git" | "research" | "unknown";
+  negativeSources: string[];
+};
+
+const TARGET_STOPWORDS = new Set([
+  "about", "after", "again", "context", "could", "current", "files", "from", "into", "quality", "review", "should", "source", "sources", "that", "there", "these", "thing", "those", "with", "would",
+]);
+
+export function extractQueryTarget(focus: string): QueryTarget {
+  const f = focus.toLowerCase();
+  const action = /\b(fix|debug|implement|refactor|test|review|explain|find|search|summarize|configure|update)\b/.exec(f)?.[1] ?? "unknown";
+  const targetTerms = [...new Set((focus.match(/[A-Za-z][A-Za-z0-9_.-]{3,}/g) ?? [])
+    .map((term) => term.toLowerCase())
+    .filter((term) => !TARGET_STOPWORDS.has(term)))]
+    .slice(0, 10);
+  const evidenceType: QueryTarget["evidenceType"] = focusAllowsGitStatus(focus) ? "git"
+    : focusAllowsResearchMemory(focus) ? "research"
+    : /\b(doc|docs|readme|guide|manual|prompt|skill)\b/i.test(focus) ? "docs"
+    : /\b(memory|lesson|scratchpad|journal|previous|history)\b/i.test(focus) ? "memory"
+    : isCodePrompt(focus) || isSourceLookupPrompt(focus) ? "code"
+    : "unknown";
+  const negativeSources = [
+    ...(!focusAllowsGitStatus(focus) ? ["git_status"] : []),
+    ...(!focusAllowsResearchMemory(focus) ? ["research_memory"] : []),
+    ...(!focusAllowsHistoricalMemory(focus) ? ["journal_memory"] : []),
+  ];
+  return { action, targetTerms, evidenceType, negativeSources };
 }
 
 function inferConditionalTaskType(focus: string, mode: string): string | undefined {
@@ -565,6 +598,8 @@ const GLOBAL_NOISY_SOURCE_PATTERNS = [
   /(?:^|\/)(?:dist|build|coverage)\//i,
   /(?:^|\/)public\/.*\.bundle\.js(?::\d+)?$/i,
   /\.min\.js(?::\d+)?$/i,
+  /\.bak(?:-[^/:]+)?(?::\d+)?$/i,
+  /\.backup(?::\d+)?$/i,
   /\.(?:db|sqlite)(?::\d+)?$/i,
 ];
 
@@ -585,6 +620,19 @@ function focusAllowsPackageManifest(focus: string) {
 
 function focusAllowsGitStatus(focus: string) {
   return /\b(git status|dirty|changed files?|uncommitted|commit|diff|staged|unstaged|review changes?|what changed)\b/i.test(focus);
+}
+
+function focusAllowsResearchMemory(focus: string) {
+  return /\b(research|paper|papers|arxiv|literature|study|studies|article|source material|external source|ai research|rag|graphrag|hipporag|sage)\b/i.test(focus);
+}
+
+function focusAllowsHistoricalMemory(focus: string) {
+  return /\b(previous|earlier|history|historical|journal|timeline|session|last time|recent session|past session|what happened|we discussed)\b/i.test(focus);
+}
+
+function isHistoricalMemorySource(item: Pick<ContextItem, "type" | "source">) {
+  const source = item.source.toLowerCase();
+  return source.startsWith("kb://journal/") || source.includes("/journal/") || item.type === "session_recent";
 }
 
 function isSourceLookupPrompt(focus: string) {
@@ -631,14 +679,22 @@ function sourceDedupeKey(source: string) {
 
 function candidateSortKey(item: ContextItem, focus: string, mode: string) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
+  const target = extractQueryTarget(focus);
   let value = item.relevance;
   if (wantsSource) {
     value += item.type === "file_snippet" || item.type === "file_exact" || item.type === "semantic_code_snippet" ? 0.35
       : item.type === "doc_snippet" ? -0.25
       : 0;
   }
+  const haystack = `${item.source}\n${item.summary}\n${item.raw ?? ""}`.toLowerCase();
+  const targetHits = target.targetTerms.filter((term) => haystack.includes(term.replace(/[-_]/g, "")) || haystack.replace(/[-_]/g, "").includes(term.replace(/[-_]/g, ""))).length;
+  if (targetHits) value += Math.min(0.45, targetHits * 0.12);
+  if (target.evidenceType === "code" && (item.type.includes("file") || item.type.includes("semantic_code"))) value += 0.18;
+  if (target.evidenceType === "docs" && item.type.includes("doc")) value += 0.14;
   if (isGloballyNoisySource(item.source)) value -= 2.0;
-  if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= wantsSource ? 0.75 : 0.35;
+  if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= 2.0;
+  if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) value -= 1.5;
+  if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) value -= 1.2;
   if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus)) value -= wantsSource ? 0.65 : 0.25;
   if (isRootReadmeSource(item.source) && !permitsRootReadme(focus)) value -= 1.0;
   if (item.source === "repo://README.md") value -= wantsSource ? 0.35 : 0.15;
@@ -653,36 +709,36 @@ function sessionText(ctx: ExtensionContext) {
   catch { return ""; }
 }
 
-function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[], state?: State) {
-  const text = sessionText(ctx);
-
-  // Collect all previously shown sources from state handles (across all bundles in this session)
+function previouslyShownSourceSet(items: ContextItem[], state?: State): Set<string> {
   const previouslyShownSources = new Set<string>();
+  const currentHandles = new Set(items.map((item) => item.handle));
   if (state) {
     for (const item of state.handles.values()) {
+      if (currentHandles.has(item.handle)) continue;
       if (item.source) {
         previouslyShownSources.add(item.source);
-        // Also add a normalized version without line numbers for fuzzy matching
         const noLines = item.source.replace(/:\d+(-\d+)?$/g, "");
         if (noLines !== item.source) previouslyShownSources.add(noLines);
       }
     }
   }
-
-  return items.filter(i => {
-    // 1. Skip sources already shown in a previous Sherpa bundle
-    if (previouslyShownSources.has(i.source)) return false;
-    const normalized = i.source.replace(/:\d+(-\d+)?$/g, "");
-    if (normalized !== i.source && previouslyShownSources.has(normalized)) return false;
-
-    // 2. Skip sources already visible in session text (the raw conversation)
-    if (text && text.includes(i.source)) return false;
-
-    return true;
-  });
+  return previouslyShownSources;
 }
 
-function postProcessCandidates(candidates: ContextItem[], focus: string, mode: string) {
+function itemAlreadySeen(ctx: ExtensionContext, item: ContextItem, previousSources: Set<string>, text = sessionText(ctx)): boolean {
+  if (previousSources.has(item.source)) return true;
+  const normalized = item.source.replace(/:\d+(-\d+)?$/g, "");
+  if (normalized !== item.source && previousSources.has(normalized)) return true;
+  return Boolean(text && text.includes(item.source));
+}
+
+function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[], state?: State) {
+  const text = sessionText(ctx);
+  const previousSources = previouslyShownSourceSet(items, state);
+  return items.filter((item) => !itemAlreadySeen(ctx, item, previousSources, text));
+}
+
+export function postProcessCandidates(candidates: ContextItem[], focus: string, mode: string) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const sorted = [...candidates].sort((a, b) => candidateSortKey(b, focus, mode) - candidateSortKey(a, focus, mode));
   const out: ContextItem[] = [];
@@ -691,7 +747,9 @@ function postProcessCandidates(candidates: ContextItem[], focus: string, mode: s
   for (const item of sorted) {
     if (isGloballyNoisySource(item.source)) continue;
     if (genericSourceClass(item.source) && !focusAllowsGenericSource(item.source, focus)) continue;
-    if (item.type === "git_status" && !focusAllowsGitStatus(focus) && candidateSortKey(item, focus, mode) < 0.2) continue;
+    if (item.type === "git_status" && !focusAllowsGitStatus(focus)) continue;
+    if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) continue;
+    if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
     const key = sourceDedupeKey(item.source);
     if (seen.has(key)) continue;
@@ -1015,104 +1073,13 @@ const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operatio
   + "pi extensions, pi skills, Sherpa memory, Obsidian knowledge bases, coding tasks, "
   + "alphabot trading strategies, backtesting, and workspace operations.";
 
-const OOD_PATTERNS = [
-  /\bcapital of\b|\bpresident of\b|\bgovernment\b/i,
-  /\bphotosynthesis\b|\bquantum physics\b|\bevolution\b/i,
-  /\bpoem\b|\bpoetry\b|\bwrite (me )?a (story|poem|song)\b/i,
-  /\bmeaning of life\b/i,
-  /\brestaurant\b|\brecipe\b|\bbrew\b/i,
-  /\bmy (dog|cat|pet|horse|fish)\b/i,
-  /\b(wedding|honeymoon|anniversary)\b/i,
-  /\bdinner\b|\blunch\b|\bbreakfast\b|\bwhat do I make for\b/i,
-  /\blearning (to play )?(guitar|piano|drums)\b|\b(play|learn) guitar at\b/i,
-  /\bbirthday card for (my |her |his )?mom\b|\bbirthday message\b/i,
-  /\bmy (wife|husband|girlfriend|boyfriend|family|friends?)\b/i,
-  /\b(is it worth|should I) learning\b/i,
-];
-
-const NOISY_CURATION_TYPES = new Set(["session_recent", "session_event", "audit_log", "system_log"]);
-const NOISY_CURATION_PATTERNS = [
-  /session_compact|audit event|session event/i,
-  /No durable structural learning|no actionable/i,
-  /proactive|session_compact/i,
-];
-
 function heuristicCurateResult(items: ContextItem[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResult {
-  return { items: items.slice(0, 8), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
+  return { items: items.slice(0, 5), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
 }
 
-function curationCandidateIsNoisy(c: { type: string; summary: string; raw?: string }) {
-  return NOISY_CURATION_TYPES.has(c.type) || NOISY_CURATION_PATTERNS.some(p => p.test(c.summary) || (c.raw && p.test(c.raw)));
-}
+type RejectionManifestItem = { index: number; source: string };
 
-function curationManifest(curationPool: ContextItem[], focus: string, mode: string) {
-  return curationPool.map((c, i) => ({
-    index: i,
-    type: c.type,
-    source: c.source,
-    relevance: Number(candidateSortKey(c, focus, mode).toFixed(2)),
-    summary: c.summary.slice(0, 500),
-    rawExcerpt: (c.raw ?? "").slice(0, 200),
-  }));
-}
-
-function pickCuratedItems(selected: unknown[], curationPool: ContextItem[]): ContextItem[] {
-  const picked: ContextItem[] = [];
-  const seen = new Set<number>();
-  for (const idx of selected) {
-    const n = typeof idx === "number" ? idx : Number(idx);
-    if (!Number.isInteger(n) || n < 0 || n >= curationPool.length || seen.has(n)) continue;
-    seen.add(n);
-    picked.push(curationPool[n]);
-    if (picked.length >= 8) break;
-  }
-  return picked;
-}
-
-function curationMessage(focus: string, indicators: SearchIndicators, manifest: ReturnType<typeof curationManifest>): UserMessage {
-  return {
-    role: "user",
-    timestamp: Date.now(),
-    content: [{ type: "text", text: [
-      `User query: ${focus}`,
-      `Inferred indicators: ${indicators.indicators.join(", ")}`,
-      `Why these indicators: ${indicators.reason}`,
-      "",
-      "You are Sherpa, Stage 3: domain-gating suppression.",
-      "",
-      "STEP 1 — Domain check: is this query within the project domain?",
-      `Project domain: ${PROJECT_DOMAIN}`,
-      "A query is IN-DOMAIN if answering it requires knowledge from the project workspace",
-      "(code, files, memory, docs, config, strategy logic, experiment results).",
-      "A query is OUT-OF-DOMAIN if the agent can answer it fully from its own knowledge",
-      "(general knowledge, personal advice, hobbies, health, food, travel, art).",
-      "",
-      "CRITICAL — avoid keyword collision: do NOT select a candidate just because it shares",
-      "a word with the query. A journal entry mentioning 'France' is NOT relevant to",
-      "'what is the capital of France'. A code snippet mentioning 'dog' is NOT relevant to",
-      "'my dog is sick'. Relevance means: THIS specific snippet helps answer THIS question.",
-      "",
-      "STEP 2 — Candidate selection (only if query is in-domain):",
-      "For each candidate, ask: 'If someone asked me this question, would THIS snippet help me",
-      "give a BETTER, MORE ACCURATE answer than I could give from my own knowledge?'",
-      "If yes, select it. If the snippet only shares keywords with the question but covers",
-      "a different topic — or if the agent already knows the answer without it — REJECT it.",
-      "",
-      'Return ONLY JSON with this exact shape:',
-      '{',
-      '  "queryInDomain": true,          // is the query within the project domain?',
-      '  "selected": [0, 3, 5],          // indexes of relevant candidates (ignored if queryInDomain=false)',
-      '  "rejected": [{"index":1,"reason":"about X, not Y"}],  // not relevant to this query',
-      '  "confidence": 0.0,               // confidence in this judgment',
-      '  "reason": "why the query is or is not in-domain, and why selected candidates help',
-      '}',
-      "",
-      JSON.stringify(manifest, null, 2),
-    ].join("\n") }],
-  };
-}
-
-function parseCurationRejected(parsed: any, manifest: ReturnType<typeof curationManifest>): Array<{ index: number; reason: string; source: string }> {
+function parseCurationRejected(parsed: any, manifest: RejectionManifestItem[]): Array<{ index: number; reason: string; source: string }> {
   if (!Array.isArray(parsed?.rejected)) return [];
   return parsed.rejected.filter((r: any) => typeof r?.index === "number").map((r: any) => ({
     index: Number(r.index),
@@ -1121,72 +1088,122 @@ function parseCurationRejected(parsed: any, manifest: ReturnType<typeof curation
   }));
 }
 
-function curationAbstainResult(abstainReason: string, rejected: CurateResult["rejected"], confidence: number): CurateResult {
-  return { items: [], abstain: true, abstainReason, rejected, confidence, planner: "llm", plannerReason: abstainReason };
+export function parseCompiledContextItems(parsed: any, itemCount: number): Array<{ index: number; summary?: string; why?: string }> {
+  const raw = Array.isArray(parsed?.items) ? parsed.items : [];
+  const out: Array<{ index: number; summary?: string; why?: string }> = [];
+  for (const item of raw) {
+    const n = typeof item?.index === "number" ? item.index : Number(item?.index);
+    if (!Number.isInteger(n) || n < 0 || n >= itemCount || out.some((x) => x.index === n)) continue;
+    out.push({
+      index: n,
+      summary: typeof item.summary === "string" ? item.summary.trim().slice(0, 700) : undefined,
+      why: typeof item.why === "string" ? item.why.trim().slice(0, 240) : undefined,
+    });
+    if (out.length >= 3) break;
+  }
+  return out;
 }
 
-function curationResultFromParsed(parsed: any, curationPool: ContextItem[], manifest: ReturnType<typeof curationManifest>, focus: string, isLikelyOod: boolean): CurateResult {
-  const selected: number[] = Array.isArray(parsed.selected) ? parsed.selected : [];
-  const rejected = parseCurationRejected(parsed, manifest);
-  const confidence = Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.4)));
-  if (isLikelyOod || parsed.queryInDomain === false) {
-    const reason = isLikelyOod
-      ? `obvious out-of-domain query — pattern matched '${focus.slice(0, 40)}'`
-      : `query is outside project domain — ${String(parsed.reason ?? "model gated it out").slice(0, 200)}`;
-    return curationAbstainResult(reason, rejected, confidence);
-  }
-  if (selected.length === 0) return curationAbstainResult(String(parsed.reason ?? "no relevant candidates found for in-domain query").slice(0, 240), rejected, confidence);
-  const picked = pickCuratedItems(selected, curationPool);
-  return picked.length
-    ? { items: picked, abstain: false, abstainReason: "", rejected, confidence, planner: "llm", plannerReason: String(parsed.reason ?? "model selected candidates").slice(0, 240) }
-    : curationAbstainResult("model returned selected indexes but none were valid", rejected, confidence);
+function preserveExpandHint(summary: string, originalSummary: string, handle: string): string {
+  const existingHint = originalSummary.match(/\s*\(expand with \/sherpa:expand ctx-\d+\)$/i)?.[0];
+  const hint = existingHint ?? ` (expand with /sherpa:expand ${handle})`;
+  if (/\(expand with \/sherpa:expand ctx-\d+\)$/i.test(summary)) return summary;
+  return `${summary.replace(/\s+/g, " ").trim()}${hint}`;
 }
 
-async function curateCandidates(
-  state: State,
-  ctx: ExtensionContext,
-  candidates: ContextItem[],
-  focus: string,
-  mode: string,
-  indicators: SearchIndicators,
-): Promise<CurateResult> {
-  const heuristicOrdered = heuristicOrderCandidates(candidates, focus, mode);
-  if (mode === "front-door" && heuristicOrdered.length === 0) {
-    return { items: [], abstain: true, abstainReason: "no curated candidates correspond to the query after suppression", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "all candidates suppressed by heuristic post-processing" };
-  }
-  if (mode !== "front-door" && mode !== "explicit") return heuristicCurateResult(heuristicOrdered, 0.3, `curation skipped: mode=${mode}`);
+function contextCompilerManifest(ctx: ExtensionContext, items: ContextItem[], focus: string, mode: string, state: State) {
+  const taskType = inferTaskType(focus);
+  const text = sessionText(ctx);
+  const previousSources = previouslyShownSourceSet(items, state);
+  return items.map((item, index) => ({
+    index,
+    source: item.source,
+    type: item.type,
+    relevance: Number(candidateSortKey(item, focus, mode).toFixed(2)),
+    novelty: itemAlreadySeen(ctx, item, previousSources, text) ? "already_in_session" : "new",
+    summary: conciseSummary(item.summary, 320),
+    rawExcerpt: item.inline ? undefined : (item.raw ?? "").replace(/\s+/g, " ").trim().slice(0, 280),
+    whyCandidateMightMatter: whyItemMatters(item, taskType),
+  }));
+}
+
+function contextCompilerMessage(ctx: ExtensionContext, state: State, focus: string, mode: string, items: ContextItem[]): UserMessage {
+  return {
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: [
+      `User query: ${focus}`,
+      `Query target packet: ${JSON.stringify(extractQueryTarget(focus))}`,
+      "",
+      "You are Sherpa's single Context Compiler pass.",
+      "You replace separate evidence-judge, novelty-filter, compressor, and final-renderer judgment.",
+      "Given candidate context, output only novel context that directly changes the main agent's next action.",
+      "",
+      "Rules:",
+      "- Keep at most 3 items. Prefer 1. Abstain if nothing is directly useful.",
+      "- Keep only candidates with novelty='new'.",
+      "- Reject generic background, stale memory, adjacent research, broad docs, and keyword-only matches.",
+      "- Prefer candidates whose source/summary matches the query target packet and expected evidence type.",
+      "- Summary must be compact, factual, source-grounded, and action-oriented.",
+      "- Do not invent facts not present in candidate summary/rawExcerpt.",
+      "- Preserve source identity by selecting candidate indexes only; do not rewrite sources/handles.",
+      "",
+      "Return ONLY JSON:",
+      '{"abstain":false,"items":[{"index":0,"summary":"minimal context","why":"why this changes next action"}],"rejected":[{"index":1,"reason":"already in session"}],"reason":"overall judgment"}',
+      "",
+      JSON.stringify(contextCompilerManifest(ctx, items, focus, mode, state), null, 2),
+    ].join("\n") }],
+  };
+}
+
+async function compileContextWithModel(state: State, ctx: ExtensionContext, focus: string, mode: string, candidates: ContextItem[]): Promise<CurateResult> {
+  const pool = postProcessCandidates(candidates, focus, mode).slice(0, 12);
+  if (!pool.length) return { items: [], abstain: true, abstainReason: "no candidates survived deterministic prefilter", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "deterministic prefilter" };
+
+  const fallback = () => {
+    const items = filterAlreadySeenSources(ctx, pool, state).slice(0, 3);
+    return items.length
+      ? heuristicCurateResult(items, 0.25, "context compiler fallback: deterministic prefilter + novelty")
+      : { items: [], abstain: true, abstainReason: "deterministic novelty filter removed all context", rejected: [], confidence: 0.25, planner: "heuristic" as const, plannerReason: "context compiler fallback" };
+  };
+
   if (state.config.model.heuristicOnly) {
-    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
-    return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: model.heuristicOnly=true");
+    notifySherpaModelFallback(ctx, "context compiler skipped: model.heuristicOnly=true");
+    return fallback();
   }
-  if (heuristicOrdered.length <= 1) return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: <=1 candidate");
-
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
   if (!modelAuth.ok) {
-    notifySherpaModelFallback(ctx, modelAuth.reason);
-    return heuristicCurateResult(heuristicOrdered, 0.2, `curation skipped: ${modelAuth.reason}`);
+    notifySherpaModelFallback(ctx, `context compiler skipped: ${modelAuth.reason}`);
+    return fallback();
   }
-  const { model, auth } = modelAuth.value;
-
-  const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
-  const curationPool = heuristicOrdered.filter(c => !curationCandidateIsNoisy(c)).slice(0, 30);
-  const manifest = curationManifest(curationPool, focus, mode);
 
   try {
-    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, curationMessage(focus, indicators, manifest), CURATION_TIMEOUT_MS, "candidate curation timed out");
+    const { model, auth } = modelAuth.value;
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, contextCompilerMessage(ctx, state, focus, mode, pool), FINAL_QUALITY_TIMEOUT_MS, "context compiler timed out");
     if (result.aborted) {
-      notifySherpaModelFallback(ctx, "candidate curation aborted");
-      return heuristicCurateResult(heuristicOrdered, 0.2, "curation aborted");
+      notifySherpaModelFallback(ctx, "context compiler aborted");
+      return fallback();
     }
     if (!result.parsed) {
-      notifySherpaModelFallback(ctx, "candidate curation returned invalid JSON");
-      return heuristicCurateResult(heuristicOrdered, 0.2, "curation returned invalid JSON");
+      notifySherpaModelFallback(ctx, "context compiler returned invalid JSON");
+      return fallback();
     }
-    return curationResultFromParsed(result.parsed as any, curationPool, manifest, focus, isLikelyOod);
+    const parsed = result.parsed as any;
+    const selected = parseCompiledContextItems(parsed, pool.length);
+    if (parsed.abstain === true || !selected.length) {
+      return { items: [], abstain: true, abstainReason: String(parsed.reason ?? "context compiler abstained").slice(0, 240), rejected: parseCurationRejected(parsed, contextCompilerManifest(ctx, pool, focus, mode, state) as any), confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.7))), planner: "llm", plannerReason: String(parsed.reason ?? "context compiler abstained").slice(0, 240) };
+    }
+    const compiled = selected.map(({ index, summary }) => {
+      const item = pool[index];
+      return summary ? { ...item, summary: preserveExpandHint(summary, item.summary, item.handle), inline: false } : item;
+    });
+    const guarded = filterAlreadySeenSources(ctx, postProcessCandidates(compiled, focus, mode), state).slice(0, 3);
+    if (!guarded.length) return { items: [], abstain: true, abstainReason: "deterministic guardrails removed compiler output", rejected: [], confidence: 0.5, planner: "llm", plannerReason: "context compiler output failed guardrails" };
+    return { items: guarded, abstain: false, abstainReason: "", rejected: parseCurationRejected(parsed, contextCompilerManifest(ctx, pool, focus, mode, state) as any), confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.7))), planner: "llm", plannerReason: String(parsed.reason ?? "context compiler selected compact context").slice(0, 240) };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    notifySherpaModelFallback(ctx, `candidate curation error: ${message}`);
-    return heuristicCurateResult(heuristicOrdered, 0.2, `curation error: ${message}`);
+    notifySherpaModelFallback(ctx, `context compiler error: ${message}`);
+    return fallback();
   }
 }
 
@@ -1324,7 +1341,7 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
     type: i.type,
     source: i.source,
     relevance: i.relevance,
-    summary: i.summary.replace(/ \(expand with \/sherpa:expand ctx-\d+\)$/i, ""),
+    summary: i.summary,
     why: whyItemMatters(i, taskType),
     inline: i.inline ? i.raw : undefined,
   }));
@@ -1376,7 +1393,7 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
     risks,
     missingInfo,
     suggestedCommands,
-    renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 5 },
+    renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 3 },
     diagnostics: { sourcesSearched: bundle.sourcePlan?.sources ?? [], candidateCount: bundle.candidateCount ?? bundle.items.length, selectedCount: bundle.items.length },
   };
   return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
@@ -1384,9 +1401,13 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
 
 
 
-function conciseSummary(text: string, max = 420): string {
+export function conciseSummary(text: string, max = 420): string {
   const single = text.replace(/\s+/g, " ").trim();
-  return single.length > max ? `${single.slice(0, max - 1)}…` : single;
+  const expandHint = single.match(/\s*\(expand with \/sherpa:expand ctx-\d+\)$/i)?.[0] ?? "";
+  const body = expandHint ? single.slice(0, -expandHint.length).trim() : single;
+  if (body.length + expandHint.length <= max) return single;
+  const room = Math.max(80, max - expandHint.length - 1);
+  return `${body.slice(0, room)}…${expandHint}`;
 }
 
 function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
@@ -1400,7 +1421,7 @@ function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
 
 function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan, bundleId?: string) {
   const bundleLine = bundleId ? `\nBundle: ${bundleId}` : "";
-  if (signal.disposition.kind === "abstain") return `## Sherpa Context${bundleLine}\nNo high-confidence context found for: ${signal.focus}`;
+  if (signal.disposition.kind === "abstain") return "";
   return `## Context${bundleLine}\n${signal.items.slice(0, signal.renderHints?.maxItems ?? 5).map(signalItemMarkdownItem).join("\n")}`;
 }
 
@@ -2110,6 +2131,24 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   return tasks;
 }
 
+function applySessionUsageFeedback(state: State, candidates: ContextItem[]): void {
+  if (!state.feedback.length) return;
+  for (const candidate of candidates) {
+    const source = candidate.source.toLowerCase();
+    for (const record of state.feedback.slice(-20)) {
+      for (const missed of record.missing ?? []) {
+        const normalized = missed.toLowerCase().replace(/^repo:\/\//, "");
+        const base = path.basename(normalized).replace(/\.[^.]+$/, "");
+        if (normalized && source.includes(normalized)) candidate.relevance = Math.min(1, candidate.relevance + 0.45);
+        else if (base.length >= 4 && source.includes(base)) candidate.relevance = Math.min(1, candidate.relevance + 0.18);
+      }
+      for (const unused of record.unused ?? []) {
+        if (unused && candidate.source === unused) candidate.relevance = Math.max(0, candidate.relevance - 0.3);
+      }
+    }
+  }
+}
+
 function applyRetrievalFeedback(state: State, focus: string, candidates: ContextItem[]) {
   try {
     const memoryRoot = obsidianMemoryPath(state);
@@ -2117,8 +2156,12 @@ function applyRetrievalFeedback(state: State, focus: string, candidates: Context
     const qualitySummary = readQualitySummary(memoryRoot);
     const adjusted = applyEvaluationFeedbackToCandidates(candidates, recentEvaluations, qualitySummary, { focus });
     candidates.splice(0, candidates.length, ...adjusted);
+    applySessionUsageFeedback(state, candidates);
     return { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
-  } catch { return {}; }
+  } catch {
+    applySessionUsageFeedback(state, candidates);
+    return {};
+  }
 }
 
 function pickFinalContextItems(finalItems: ContextItem[], tokenBudget: number) {
@@ -2127,7 +2170,7 @@ function pickFinalContextItems(finalItems: ContextItem[], tokenBudget: number) {
   for (const c of finalItems) {
     const t = approxTokens(c.summary) + 30;
     if (used + t <= tokenBudget) { items.push(c); used += t; }
-    if (items.length >= 5) break;
+    if (items.length >= 3) break;
   }
   return { items, used };
 }
@@ -2142,24 +2185,18 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   await retryFrontDoorFileCandidates(state, ctx, focus, mode, sourcePlan, candidates, add, enabled);
 
   const traceFeedback = applyRetrievalFeedback(state, focus, candidates);
-  const curateResult = await curateCandidates(state, ctx, candidates, focus, mode, indicators);
-  if (curateResult.abstain) {
+  const compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+  if (compileResult.abstain) {
     const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
-    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, curateResult, traceFeedback);
+    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, compileResult, traceFeedback);
     return abstainBundle;
   }
 
-  const finalItems = postProcessCandidates(curateResult.items, focus, mode);
-  if (mode === "front-door" && finalItems.length === 0) {
-    const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
-    recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, { ...curateResult, abstain: true, abstainReason: "post-curation suppression removed all selected candidates" }, traceFeedback);
-    return abstainBundle;
-  }
-  const { items, used } = pickFinalContextItems(finalItems, tokenBudget);
+  const { items, used } = pickFinalContextItems(compileResult.items, tokenBudget);
   state.bundles++;
   const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
   bundle.signal = buildContextSignal(bundle);
-  recordDspyTrace(ctx.cwd, bundle, indicators, candidates, curateResult, traceFeedback);
+  recordDspyTrace(ctx.cwd, bundle, indicators, candidates, compileResult, traceFeedback);
   stashContextBundle(state, bundle);
   return bundle;
 }
@@ -2471,6 +2508,59 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const runSidecarSmoke = async (ctx: ExtensionContext) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
+    if (!modelAuth.ok) return { ok: false, lines: [`❌ model auth: ${modelAuth.reason}`] };
+    const { model, auth } = modelAuth.value;
+    const smokePrompts: Array<{ name: string; message: UserMessage; validate: (parsed: any) => string | undefined }> = [
+      {
+        name: "source planner",
+        message: sourcePlanningMessage("review pi-sherpa context curation quality"),
+        validate: (parsed) => parsed?.indicators?.indicators?.length && parsed?.sources?.sources?.length ? undefined : "missing indicators/sources",
+      },
+      {
+        name: "context compiler",
+        message: {
+          role: "user",
+          timestamp: Date.now(),
+          content: [{ type: "text", text: [
+            "User query: review pi-sherpa context curation quality",
+            "Return ONLY JSON selecting useful context from candidates.",
+            '{"abstain":false,"items":[{"index":0,"summary":"minimal context","why":"why useful"}],"rejected":[],"reason":"ok"}',
+            JSON.stringify([{ index: 0, source: "repo://index.ts:1100", novelty: "new", summary: "compileContextWithModel validates and compacts context" }]),
+          ].join("\n") }],
+        },
+        validate: (parsed) => (parsed?.abstain === true || Array.isArray(parsed?.items)) ? undefined : "missing abstain/items",
+      },
+      {
+        name: "abstain contract",
+        message: {
+          role: "user",
+          timestamp: Date.now(),
+          content: [{ type: "text", text: 'Return ONLY JSON: {"abstain":true,"items":[],"reason":"no useful context"}' }],
+        },
+        validate: (parsed) => parsed?.abstain === true && Array.isArray(parsed?.items) ? undefined : "missing abstain true/items array",
+      },
+    ];
+    const lines = [`✅ model auth: ${model.provider}/${model.id ?? model.name ?? "unknown"}`];
+    let ok = true;
+    for (const smoke of smokePrompts) {
+      const start = Date.now();
+      try {
+        const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, smoke.message, FINAL_QUALITY_TIMEOUT_MS, `${smoke.name} smoke timed out`);
+        const elapsed = Date.now() - start;
+        const error = result.aborted ? "aborted" : smoke.validate(result.parsed);
+        if (error) { ok = false; lines.push(`❌ ${smoke.name}: ${error} (${elapsed}ms)`); }
+        else lines.push(`✅ ${smoke.name}: valid JSON (${elapsed}ms)`);
+      } catch (error) {
+        ok = false;
+        lines.push(`❌ ${smoke.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { ok, lines };
+  };
+
   const processAutomationCandidates = (stateObj: State, ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
     const raw = stringifyForAutoMemory(recentMessages);
     const automationCandidates = updateAutomationCandidates(stateObj.automation, raw, 3, cwd);
@@ -2521,6 +2611,12 @@ export default function (pi: ExtensionAPI) {
         files: { ...evidence, referencedFiles, changedFiles },
         finalText: recentText.slice(-2000),
       });
+      stateObj.feedback = [...stateObj.feedback.slice(-49), {
+        used: [...new Set([...evidence.readFiles, ...evidence.writtenFiles, ...referencedFiles])].filter((file) => !evalRecord.missed.includes(file)),
+        unused: evalRecord.noise,
+        missing: evalRecord.missed,
+        at: Date.now(),
+      }];
       const memoryRoot = obsidianMemoryPath(stateObj);
       const target = writeEvaluation(memoryRoot, evalRecord);
       writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
@@ -2972,6 +3068,20 @@ export default function (pi: ExtensionAPI) {
     const filtered = items.filter(item => item.value.startsWith(prefix.trim()));
     return filtered.length ? filtered : items;
   };
+
+  pi.registerCommand("sherpa:smoke:sidecar", {
+    description: "Run live Sherpa sidecar model smoke checks for JSON planning/compilation",
+    handler: async (_args, ctx) => {
+      if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+      const result = await runSidecarSmoke(ctx);
+      pi.sendMessage({
+        customType: "sherpa-sidecar-smoke",
+        content: [`# Sherpa sidecar smoke`, "", ...result.lines].join("\n"),
+        display: true,
+        details: result,
+      }, { triggerTurn: false, deliverAs: "nextTurn" });
+    },
+  });
 
   pi.registerCommand("sherpa:scratchpad", {
     description: "Read repo-local Sherpa scratchpad sections",

@@ -35,13 +35,15 @@ test("filters shell rc files", () => {
   assert(isGloballyNoisySource("repo:///Users/kamil/.profile"), ".profile should be noisy");
 });
 
-test("filters existing shell/cache/build noise", () => {
+test("filters existing shell/cache/build/backup noise", () => {
   assert(isGloballyNoisySource("repo:///Users/kamil/.zsh_history:5"), "zsh_history noisy");
   assert(isGloballyNoisySource("repo:///Users/kamil/.zcompdump-casper"), "zcompdump noisy");
   assert(isGloballyNoisySource("repo:///Users/kamil/Library/Caches/something"), "Library/Caches noisy");
   assert(isGloballyNoisySource("repo://dist/main.js"), "dist/ noisy");
   assert(isGloballyNoisySource("repo:///Users/kamil/.pi/revolver/x"), ".pi/revolver noisy");
   assert(isGloballyNoisySource("repo:///Users/kamil/.bun/install/global"), ".bun noisy");
+  assert(isGloballyNoisySource("repo://models.json.bak-20260616-185320.bak:7"), "timestamped .bak file noisy");
+  assert(isGloballyNoisySource("repo://config.backup"), ".backup file noisy");
 });
 
 test("strips repo:// and file:// schemes and lowercases", () => {

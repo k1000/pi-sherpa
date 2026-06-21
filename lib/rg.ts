@@ -71,6 +71,9 @@ export async function rg(cwd: string, query: string | string[], searchPath = cwd
       "!**/.omp/logs/**",
       "!*.bundle.js",
       "!*.min.js",
+      "!*.bak",
+      "!*.bak-*",
+      "!*.backup",
       "!*.db",
       "!*.sqlite",
     ];
