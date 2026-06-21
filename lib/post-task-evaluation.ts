@@ -162,16 +162,25 @@ function evaluationImprovementHint(missed: string[], noise: string[], taskKind: 
     : "Penalize repeated generic documentation snippets and meta-review docs unless the query asks for them.";
 }
 
-function evaluationReflection(input: PostTaskEvaluationInput, taskKind: EvalTaskKind, usedFiles: string[], coveredFiles: string[], missed: string[], noise: string[]): string {
+function retrievalVerdict(scores: { relevance: number; precision: number; recall: number }): string {
+  if (scores.relevance >= 0.7 && scores.precision >= 0.6 && scores.recall >= 0.6) return "useful";
+  if (scores.relevance >= 0.35 || scores.precision >= 0.4 || scores.recall >= 0.4) return "partial";
+  return "miss";
+}
+
+function evaluationReflection(input: PostTaskEvaluationInput, taskKind: EvalTaskKind, usedFiles: string[], coveredFiles: string[], missed: string[], noise: string[], scores: { relevance: number; precision: number; recall: number }): string {
+  const verdict = retrievalVerdict(scores);
   return [
     `Automatic post-task evaluation for ${input.bundle.bundleId}.`,
     `Focus: ${input.bundle.focus}`,
     `Task kind: ${taskKind}.`,
     `Outcome: ${input.outcome}.`,
+    `Retrieval verdict: ${verdict} (relevance=${scores.relevance}, precision=${scores.precision}, recall=${scores.recall}).`,
     `Used files: ${usedFiles.length ? usedFiles.join(", ") : "none detected"}.`,
     `Covered files: ${coveredFiles.length ? coveredFiles.join(", ") : "none"}.`,
     missed.length ? `Missed files: ${missed.join(", ")}.` : "No missed files detected from tool/change evidence.",
     noise.length ? `Noise sources: ${uniq(noise).join(", ")}.` : "No obvious noisy sources detected.",
+    verdict === "miss" ? "Likely cause: selected context did not overlap the files or intent evidence seen during the task; improve routing, exact path matching, or source filtering." : "Likely cause: selected context overlapped enough task evidence to be useful; keep tuning noisy and missed sources from the lists above.",
   ].join("\n");
 }
 
@@ -199,7 +208,7 @@ export function evaluatePostTaskContext(input: PostTaskEvaluationInput): Context
     },
     noise: uniq(noise).slice(0, 20),
     missed: missed.slice(0, 20),
-    reflection: evaluationReflection(input, taskKind, usedFiles, coveredFiles, missed, noise),
+    reflection: evaluationReflection(input, taskKind, usedFiles, coveredFiles, missed, noise, { relevance, precision, recall }),
     improvementHint: evaluationImprovementHint(missed, noise, taskKind),
     evaluatedAt: new Date().toISOString(),
   };

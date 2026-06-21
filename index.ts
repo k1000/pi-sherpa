@@ -199,6 +199,7 @@ type State = {
   dspyAuto: { lastCompileAt?: string; lastCompileDate?: string; lastBundleCount: number };
   automation: AutomationState;
   lifecycleHashes: string[];
+  evaluationHashes: string[];
   systemPrompt: string;
   systemPromptSource: string;
   retrievalPrompt: string;
@@ -436,7 +437,7 @@ const SHERPA_UI_KEY = "ai-sherpa";
 const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
 const SHERPA_CONTEXT_TYPE = "sherpa-context";
 const CURATION_TIMEOUT_MS = 8_000;
-const SOURCE_PLANNER_TIMEOUT_MS = 1_500;
+const SOURCE_PLANNER_TIMEOUT_MS = 6_000;
 const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
@@ -617,9 +618,10 @@ function isGenericNoiseSource(source: string) {
 }
 
 function sourceCorrespondenceThreshold(focus: string, mode: string) {
-  if (mode !== "front-door") return -Infinity;
-  if (isCodePrompt(focus) || isSourceLookupPrompt(focus)) return 0.16;
-  return 0.08;
+  const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
+  if (mode === "front-door") return wantsSource ? 0.16 : 0.08;
+  if (mode === "explicit") return wantsSource ? 0.22 : 0.14;
+  return wantsSource ? 0.16 : 0.08;
 }
 
 function sourceDedupeKey(source: string) {
@@ -688,6 +690,7 @@ function postProcessCandidates(candidates: ContextItem[], focus: string, mode: s
   let readmeCount = 0;
   for (const item of sorted) {
     if (isGloballyNoisySource(item.source)) continue;
+    if (genericSourceClass(item.source) && !focusAllowsGenericSource(item.source, focus)) continue;
     if (item.type === "git_status" && !focusAllowsGitStatus(focus) && candidateSortKey(item, focus, mode) < 0.2) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
     const key = sourceDedupeKey(item.source);
@@ -725,6 +728,12 @@ function timeoutAfter<T>(ms: number, message: string): Promise<T> {
 }
 
 type SherpaModelAuth = { model: any; auth: any };
+
+function notifySherpaModelFallback(ctx: ExtensionContext, reason: string): void {
+  try {
+    if (ctx.hasUI) ctx.ui.notify(`Sherpa sidecar model unavailable; using heuristic fallback: ${reason}`, "warning");
+  } catch { /* notification must not break retrieval */ }
+}
 
 async function getSherpaModelAuthWithReason(state: State, ctx: ExtensionContext): Promise<{ ok: true; value: SherpaModelAuth } | { ok: false; reason: string }> {
   if (!state.config.privacy.allowRemoteModel && !state.config.model.useMainPiModel) {
@@ -842,10 +851,14 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   // Stage 1: model infers which unique technical identifiers would appear in relevant context.
   // Runs ONCE per request and feeds into all subsequent searches.
   if (state.config.model.heuristicOnly) {
+    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
     return { indicators: heuristicIndicators(focus), reason: "heuristic extraction", confidence: 0.3, planner: "heuristic" };
   }
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
-  if (!modelAuth.ok) return { indicators: heuristicIndicators(focus), reason: `${modelAuth.reason}, falling back`, confidence: 0.3, planner: "heuristic" };
+  if (!modelAuth.ok) {
+    notifySherpaModelFallback(ctx, modelAuth.reason);
+    return { indicators: heuristicIndicators(focus), reason: `${modelAuth.reason}, falling back`, confidence: 0.3, planner: "heuristic" };
+  }
   const { model, auth } = modelAuth.value;
   const message: UserMessage = {
     role: "user",
@@ -870,6 +883,7 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   try {
     const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, message, SOURCE_PLANNER_TIMEOUT_MS, "indicator inference timed out");
     if (result.aborted) {
+      notifySherpaModelFallback(ctx, "indicator inference aborted");
       return { indicators: heuristicIndicators(focus), reason: "model aborted, falling back", confidence: 0.2, planner: "heuristic" };
     }
     const parsed = result.parsed as any;
@@ -884,8 +898,10 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
         planner: "llm",
       };
     }
+    notifySherpaModelFallback(ctx, "indicator inference returned invalid JSON");
     return { indicators: heuristicIndicators(focus), reason: "model returned invalid JSON, falling back", confidence: 0.2, planner: "heuristic" };
-  } catch {
+  } catch (error) {
+    notifySherpaModelFallback(ctx, `indicator inference error: ${error instanceof Error ? error.message : String(error)}`);
     return { indicators: heuristicIndicators(focus), reason: "model error, falling back", confidence: 0.2, planner: "heuristic" };
   }
 }
@@ -959,22 +975,38 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
 
   const fallbackPlan = routedFallbackPlan(state, ctx, focus, mode, routePlan);
   const heuristicInds = heuristicSearchIndicators(focus);
-  if (state.config.model.heuristicOnly) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: model.heuristicOnly=true; ${fallbackPlan.reason}` }, indicators: heuristicInds };
-  if (mode !== "front-door") return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: mode=${mode}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+  if (state.config.model.heuristicOnly) {
+    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
+    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: model.heuristicOnly=true; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+  }
+  if (mode !== "front-door" && mode !== "explicit") return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: mode=${mode}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
 
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
-  if (!modelAuth.ok) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: ${modelAuth.reason}; ${fallbackPlan.reason}` }, indicators: { ...heuristicInds, reason: `${modelAuth.reason}; ${heuristicInds.reason}` } };
+  if (!modelAuth.ok) {
+    notifySherpaModelFallback(ctx, modelAuth.reason);
+    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: ${modelAuth.reason}; ${fallbackPlan.reason}` }, indicators: { ...heuristicInds, reason: `${modelAuth.reason}; ${heuristicInds.reason}` } };
+  }
   const { model, auth } = modelAuth.value;
 
   try {
     const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, sourcePlanningMessage(focus), SOURCE_PLANNER_TIMEOUT_MS, "source + indicator planning timed out");
-    if (result.aborted) return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner aborted; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+    if (result.aborted) {
+      notifySherpaModelFallback(ctx, "source planner aborted");
+      return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner aborted; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+    }
+    if (!result.parsed) {
+      notifySherpaModelFallback(ctx, "source planner returned invalid JSON");
+      return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner invalid JSON; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+    }
     const parsed = result.parsed as any;
     const indicators = parsePlannedIndicators(parsed, heuristicInds);
     const sourcePlan = parsePlannedSourcePlan(state, focus, mode, parsed, routePlan);
+    if (!sourcePlan) notifySherpaModelFallback(ctx, "source planner returned unusable source plan");
     return { sourcePlan: sourcePlan ?? { ...fallbackPlan, planner: "fallback", reason: `planner returned invalid source plan; ${fallbackPlan.reason}` }, indicators };
   } catch (error) {
-    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner error: ${error instanceof Error ? error.message : String(error)}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
+    const message = error instanceof Error ? error.message : String(error);
+    notifySherpaModelFallback(ctx, `source planner error: ${message}`);
+    return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner error: ${message}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
   }
 }
 
@@ -1122,12 +1154,18 @@ async function curateCandidates(
   if (mode === "front-door" && heuristicOrdered.length === 0) {
     return { items: [], abstain: true, abstainReason: "no curated candidates correspond to the query after suppression", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "all candidates suppressed by heuristic post-processing" };
   }
-  if (mode !== "front-door") return heuristicCurateResult(heuristicOrdered, 0.3, `curation skipped: mode=${mode}`);
-  if (state.config.model.heuristicOnly) return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: model.heuristicOnly=true");
+  if (mode !== "front-door" && mode !== "explicit") return heuristicCurateResult(heuristicOrdered, 0.3, `curation skipped: mode=${mode}`);
+  if (state.config.model.heuristicOnly) {
+    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
+    return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: model.heuristicOnly=true");
+  }
   if (heuristicOrdered.length <= 1) return heuristicCurateResult(heuristicOrdered, 0.3, "curation skipped: <=1 candidate");
 
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
-  if (!modelAuth.ok) return heuristicCurateResult(heuristicOrdered, 0.2, `curation skipped: ${modelAuth.reason}`);
+  if (!modelAuth.ok) {
+    notifySherpaModelFallback(ctx, modelAuth.reason);
+    return heuristicCurateResult(heuristicOrdered, 0.2, `curation skipped: ${modelAuth.reason}`);
+  }
   const { model, auth } = modelAuth.value;
 
   const isLikelyOod = OOD_PATTERNS.some(p => p.test(focus));
@@ -1136,11 +1174,19 @@ async function curateCandidates(
 
   try {
     const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, curationMessage(focus, indicators, manifest), CURATION_TIMEOUT_MS, "candidate curation timed out");
-    if (result.aborted) return heuristicCurateResult(heuristicOrdered, 0.2, "curation aborted");
-    if (!result.parsed) return heuristicCurateResult(heuristicOrdered, 0.2, "curation returned invalid JSON");
+    if (result.aborted) {
+      notifySherpaModelFallback(ctx, "candidate curation aborted");
+      return heuristicCurateResult(heuristicOrdered, 0.2, "curation aborted");
+    }
+    if (!result.parsed) {
+      notifySherpaModelFallback(ctx, "candidate curation returned invalid JSON");
+      return heuristicCurateResult(heuristicOrdered, 0.2, "curation returned invalid JSON");
+    }
     return curationResultFromParsed(result.parsed as any, curationPool, manifest, focus, isLikelyOod);
   } catch (error) {
-    return heuristicCurateResult(heuristicOrdered, 0.2, `curation error: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    notifySherpaModelFallback(ctx, `candidate curation error: ${message}`);
+    return heuristicCurateResult(heuristicOrdered, 0.2, `curation error: ${message}`);
   }
 }
 
@@ -1330,7 +1376,7 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
     risks,
     missingInfo,
     suggestedCommands,
-    renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 8 },
+    renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 5 },
     diagnostics: { sourcesSearched: bundle.sourcePlan?.sources ?? [], candidateCount: bundle.candidateCount ?? bundle.items.length, selectedCount: bundle.items.length },
   };
   return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
@@ -1338,23 +1384,29 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
 
 
 
+function conciseSummary(text: string, max = 420): string {
+  const single = text.replace(/\s+/g, " ").trim();
+  return single.length > max ? `${single.slice(0, max - 1)}…` : single;
+}
+
 function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
   // Strip protocol prefix from source for readability
   const shortSource = i.source.replace(/^(file|repo):\/\//, "");
   const body = i.inline
     ? `\n\`\`\`\n${i.inline}\n\`\`\``
-    : `\n  ${i.summary}`;
+    : `\n  ${conciseSummary(i.summary)}`;
   return `- ${i.handle} — ${shortSource}${body}`;
 }
 
-function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan) {
-  if (signal.disposition.kind === "abstain") return `## Sherpa Context\nNo high-confidence context found for: ${signal.focus}`;
-  return `## Context\n${signal.items.map(signalItemMarkdownItem).join("\n")}`;
+function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan, bundleId?: string) {
+  const bundleLine = bundleId ? `\nBundle: ${bundleId}` : "";
+  if (signal.disposition.kind === "abstain") return `## Sherpa Context${bundleLine}\nNo high-confidence context found for: ${signal.focus}`;
+  return `## Context${bundleLine}\n${signal.items.slice(0, signal.renderHints?.maxItems ?? 5).map(signalItemMarkdownItem).join("\n")}`;
 }
 
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
-  return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan);
+  return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan, bundle.bundleId);
 }
 
 function traceItem(item: ContextItem) {
@@ -1745,6 +1797,57 @@ function addExplicitPathCandidates(ctx: ExtensionContext, focus: string, add: Ad
   }
 }
 
+function normalizedName(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function mentionedPiExtensionRoots(focus: string): Array<{ name: string; root: string }> {
+  const extensionRoot = path.dirname(__filename);
+  const extensionsDir = path.dirname(extensionRoot);
+  if (!existsSync(extensionsDir)) return [];
+  const focusLower = focus.toLowerCase();
+  const compactFocus = normalizedName(focus);
+  const out: Array<{ name: string; root: string }> = [];
+  for (const name of readdirSync(extensionsDir).slice(0, 120)) {
+    const root = path.join(extensionsDir, name);
+    try {
+      if (!statSync(root).isDirectory()) continue;
+    } catch { continue; }
+    const aliases = [name, name.replace(/^pi-/, "")].filter((alias) => alias.length >= 4);
+    if (aliases.some((alias) => focusLower.includes(alias.toLowerCase()) || compactFocus.includes(normalizedName(alias)))) {
+      out.push({ name, root });
+    }
+  }
+  return out.slice(0, 4);
+}
+
+function labelRgSource(fileAndLine: string, cwd: string): string {
+  const match = fileAndLine.match(/^(.*):(\d+)$/);
+  if (!match) return `repo://${fileAndLine}`;
+  const [, file, line] = match;
+  const source = path.isAbsolute(file) ? pathSourceLabel(file, cwd) : `repo://${file}`;
+  return `${source}:${line}`;
+}
+
+async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
+  const roots = mentionedPiExtensionRoots(focus);
+  for (const { name, root } of roots) {
+    const keyFiles = ["README.md", "package.json", "index.ts", "SHERPA_SYSTEM.md"]
+      .filter((file) => existsSync(path.join(root, file)));
+    add("pi_extension_route", pathSourceLabel(root, ctx.cwd), [
+      `Pi extension route: ${name}`,
+      `Root: ${root}`,
+      keyFiles.length ? `Key files: ${keyFiles.join(", ")}` : "Key files: none detected",
+    ].join("\n"), 0.7);
+
+    const query = [focus, ...indicators.indicators].join(" ");
+    const out = await rg(ctx.cwd, query, root);
+    for (const { fileAndLine, content } of parseRgOutput(out, 12)) {
+      if (content) add("pi_extension_file", labelRgSource(fileAndLine, ctx.cwd), content, 0.42);
+    }
+  }
+}
+
 async function addRoutedFileCandidates(ctx: ExtensionContext, focus: string, sourcePlan: SourcePlan, add: AddContextItem) {
   for (const rel of sourcePlan?.routePlan?.read ?? []) {
     if (routeSkipsPath(sourcePlan?.routePlan, rel)) continue;
@@ -1774,6 +1877,7 @@ async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, s
 
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   addExplicitPathCandidates(ctx, focus, add);
+  await addPiExtensionCandidates(ctx, focus, indicators, add);
   await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
 }
@@ -1966,7 +2070,7 @@ function createContextAdder(state: State, focus: string, candidates: ContextItem
   return (type: string, source: string, raw: string, relBoost = 0) => {
     if (!raw.trim() || isGloballyNoisySource(source)) return;
     const handle = `ctx-${state.nextHandle++}`;
-    const inline = raw.length <= 900 && !type.includes("session");
+    const inline = raw.length <= 700 && !type.includes("session");
     const summary = summarize(raw);
     const pointer = inline ? "" : ` (expand with /sherpa:expand ${handle})`;
     const item: ContextItem = { handle, type, source, relevance: Math.min(1, score(raw + " " + source, focus) + relBoost), summary: summary + pointer, raw, inline };
@@ -2023,7 +2127,7 @@ function pickFinalContextItems(finalItems: ContextItem[], tokenBudget: number) {
   for (const c of finalItems) {
     const t = approxTokens(c.summary) + 30;
     if (used + t <= tokenBudget) { items.push(c); used += t; }
-    if (items.length >= 8) break;
+    if (items.length >= 5) break;
   }
   return { items, used };
 }
@@ -2060,7 +2164,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   return bundle;
 }
 
-type PersistedSherpaState = Partial<Pick<State, "nextHandle" | "bundles" | "feedback" | "automation" | "lifecycleHashes" | "lastBundleId" | "dspyAuto">> & {
+type PersistedSherpaState = Partial<Pick<State, "nextHandle" | "bundles" | "feedback" | "automation" | "lifecycleHashes" | "evaluationHashes" | "lastBundleId" | "dspyAuto">> & {
   bundleRecords?: ContextBundleRecord[];
   config?: SherpaConfig;
 };
@@ -2083,6 +2187,7 @@ function createState(ctx: ExtensionContext, config: SherpaConfig): State {
     dspyAuto: { lastBundleCount: 0 },
     automation: createAutomationState(),
     lifecycleHashes: [],
+    evaluationHashes: [],
     systemPrompt: retrievalPrompt.prompt,
     systemPromptSource: retrievalPrompt.source,
     retrievalPrompt: retrievalPrompt.prompt,
@@ -2111,6 +2216,7 @@ function applyPersistedState(state: State, data: PersistedSherpaState): void {
   state.feedback = data.feedback ?? state.feedback;
   state.automation = { ...state.automation, ...(data.automation ?? {}) };
   state.lifecycleHashes = Array.isArray(data.lifecycleHashes) ? data.lifecycleHashes : state.lifecycleHashes;
+  state.evaluationHashes = Array.isArray(data.evaluationHashes) ? data.evaluationHashes : state.evaluationHashes;
   state.lastBundleId = data.lastBundleId ?? state.lastBundleId;
   state.dspyAuto = { ...state.dspyAuto, ...(data.dspyAuto ?? {}) };
   state.bundleRecords = restoreBundleRecords(data.bundleRecords);
@@ -2123,6 +2229,7 @@ function serializeState(state: State): PersistedSherpaState {
     feedback: state.feedback,
     automation: state.automation,
     lifecycleHashes: state.lifecycleHashes,
+    evaluationHashes: state.evaluationHashes,
     lastBundleId: state.lastBundleId,
     dspyAuto: state.dspyAuto,
     bundleRecords: [...state.bundleRecords.values()],
@@ -2169,6 +2276,10 @@ function normalizeRepoToolPath(rawPath: unknown, cwd: string): string | undefine
   return relative;
 }
 
+function commandLooksWriteLike(command: string): boolean {
+  return /\b(apply_patch|tee\s+|perl\s+-pi|sed\s+-i|mv\s+|cp\s+)\b|>|>>/.test(command);
+}
+
 function collectRecentTaskFileEvidence(messages: any[] | undefined, cwd: string) {
   const readFiles = new Set<string>();
   const writtenFiles = new Set<string>();
@@ -2178,9 +2289,17 @@ function collectRecentTaskFileEvidence(messages: any[] | undefined, cwd: string)
       if (block?.type !== "toolCall") continue;
       const args = parseToolArguments(block.arguments);
       const rel = normalizeRepoToolPath(args?.path, cwd);
-      if (!rel) continue;
-      if (["write", "edit"].includes(block.name)) writtenFiles.add(rel);
-      if (block.name === "read") readFiles.add(rel);
+      if (rel) {
+        if (["write", "edit"].includes(block.name)) writtenFiles.add(rel);
+        if (block.name === "read") readFiles.add(rel);
+      }
+      if (block.name === "bash" && typeof args?.command === "string") {
+        const mentioned = extractMentionedRepoFiles(args.command, cwd);
+        for (const file of mentioned) {
+          if (commandLooksWriteLike(args.command)) writtenFiles.add(file);
+          else readFiles.add(file);
+        }
+      }
     }
   }
   return { readFiles: [...readFiles], writtenFiles: [...writtenFiles] };
@@ -2391,6 +2510,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const bundle = stateObj.lastBundleId ? getBundle(stateObj, stateObj.lastBundleId) : undefined;
       if (!bundle || Date.now() - bundle.timestamp >= 2 * 60 * 60 * 1000) return;
+      if (stateObj.evaluationHashes.includes(bundle.bundleId)) return;
       const evidence = collectRecentTaskFileEvidence(recentMessages, cwd);
       const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
       const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
@@ -2412,6 +2532,8 @@ export default function (pi: ExtensionAPI) {
         `Hint: ${evalRecord.improvementHint}`,
         `Stored: ${path.relative(memoryRoot, target)}`,
       ].join("\n"), "Sherpa retrieval evaluation");
+      stateObj.evaluationHashes = [...stateObj.evaluationHashes.slice(-49), bundle.bundleId];
+      stateObj.lastBundleId = undefined;
       void recordSurrealRetrievalFeedback(stateObj, bundle, evalRecord);
       void maybeAutoCompileDspy(ctx, "evaluate");
     } catch { /* retrieval evaluation must never affect task completion */ }
@@ -2457,6 +2579,8 @@ export default function (pi: ExtensionAPI) {
       compactScratchpadAndNotify(stateObj, ctx, cwd);
     } catch (error) {
       try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
+    } finally {
+      persist();
     }
   };
 
