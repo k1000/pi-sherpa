@@ -18,12 +18,19 @@ export type DspyTraceDecision = {
   reasons: string[];
 };
 
+export type DspyTraceStageLabels = {
+  processDecision: string;
+  dataSufficiency: string;
+  finalContext: string;
+};
+
 export type DspyTraceRecord = {
   version: 1;
   at: string;
   bundleId: string;
   focus: string;
   mode: string;
+  stageLabels?: DspyTraceStageLabels;
   sourcePlan: { sources: string[]; reason: string; confidence: number; planner: string };
   indicators: { indicators: string[]; reason: string; confidence: number; planner: string };
   candidateCount: number;
@@ -59,6 +66,9 @@ export type DspyTraceReport = {
   topReasons: Array<{ reason: string; count: number }>;
   topSourcePlanReasons: Array<{ reason: string; count: number }>;
   topCurationReasons: Array<{ reason: string; count: number }>;
+  topProcessDecisions: Array<{ reason: string; count: number }>;
+  topDataSufficiency: Array<{ reason: string; count: number }>;
+  topFinalContext: Array<{ reason: string; count: number }>;
 };
 
 export type DspyTrainingExample = {
@@ -175,6 +185,9 @@ export function summarizeDspyTraces(traces: DspyTraceRecord[]): DspyTraceReport 
     topReasons: decisionReasonCounts,
     topSourcePlanReasons: reasonCounts(traces.map((trace) => trace.sourcePlan?.reason ?? ""), 10),
     topCurationReasons: reasonCounts(traces.map((trace) => trace.curate?.plannerReason || trace.curate?.abstainReason || ""), 10),
+    topProcessDecisions: reasonCounts(traces.map((trace) => trace.stageLabels?.processDecision ?? ""), 10),
+    topDataSufficiency: reasonCounts(traces.map((trace) => trace.stageLabels?.dataSufficiency ?? ""), 10),
+    topFinalContext: reasonCounts(traces.map((trace) => trace.stageLabels?.finalContext ?? ""), 10),
   };
 }
 

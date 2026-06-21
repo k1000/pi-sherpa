@@ -184,6 +184,82 @@ function evaluationReflection(input: PostTaskEvaluationInput, taskKind: EvalTask
   ].join("\n");
 }
 
+export type ReflectionUsefulness = "useful" | "partial" | "unused" | "harmful" | "not_needed";
+
+export type ReflectionModelParseResult = {
+  evalRecord: ContextEvaluation;
+  usefulness?: ReflectionUsefulness;
+  shouldPreserve?: boolean;
+  lesson?: string;
+};
+
+const REFLECTION_USEFULNESS = new Set<ReflectionUsefulness>(["useful", "partial", "unused", "harmful", "not_needed"]);
+const TASK_OUTCOMES = new Set<ContextEvaluation["taskOutcome"]>(["completed", "partial", "failed", "reverted", "blocked", "unknown"]);
+
+function stringArray(value: unknown, limit = 20): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniq(value.filter((item): item is string => typeof item === "string" && item.trim()).map((item) => item.trim())).slice(0, limit);
+}
+
+function numberScore(value: unknown, fallback: number): number {
+  return typeof value === "number" ? Number(clamp01(value).toFixed(2)) : fallback;
+}
+
+function usefulnessScores(usefulness: ReflectionUsefulness | undefined, base: ContextEvaluation["scores"]): ContextEvaluation["scores"] {
+  if (!usefulness) return base;
+  if (usefulness === "useful") return { relevance: Math.max(base.relevance, 0.75), precision: Math.max(base.precision, 0.7), recall: Math.max(base.recall, 0.7) };
+  if (usefulness === "partial") return { relevance: Math.max(base.relevance, 0.45), precision: Math.max(base.precision, 0.4), recall: Math.max(base.recall, 0.4) };
+  if (usefulness === "harmful") return { relevance: Math.min(base.relevance, 0.1), precision: Math.min(base.precision, 0.1), recall: Math.min(base.recall, 0.25) };
+  if (usefulness === "unused") return { relevance: Math.min(base.relevance, 0.25), precision: Math.min(base.precision, 0.1), recall: base.recall };
+  return { relevance: Math.min(base.relevance, 0.35), precision: Math.min(base.precision, 0.2), recall: base.recall };
+}
+
+export function applyReflectionModelOutput(base: ContextEvaluation, parsed: unknown): ReflectionModelParseResult {
+  if (!parsed || typeof parsed !== "object") return { evalRecord: base };
+  const obj = parsed as Record<string, unknown>;
+  const usefulness = REFLECTION_USEFULNESS.has(obj.sherpa_context_usefulness as ReflectionUsefulness)
+    ? obj.sherpa_context_usefulness as ReflectionUsefulness
+    : undefined;
+  const outcome = TASK_OUTCOMES.has(obj.outcome as ContextEvaluation["taskOutcome"])
+    ? obj.outcome as ContextEvaluation["taskOutcome"]
+    : base.taskOutcome;
+  const modelScores = typeof obj.scores === "object" && obj.scores ? obj.scores as Record<string, unknown> : {};
+  const usefulnessAdjusted = usefulnessScores(usefulness, base.scores);
+  const scores = {
+    relevance: numberScore(modelScores.relevance, usefulnessAdjusted.relevance),
+    precision: numberScore(modelScores.precision, usefulnessAdjusted.precision),
+    recall: numberScore(modelScores.recall, usefulnessAdjusted.recall),
+  };
+  const missed = stringArray(obj.missed_context ?? obj.missedContext, 20);
+  const noise = stringArray(obj.noisy_context ?? obj.noisyContext, 20);
+  const lesson = typeof obj.lesson === "string" ? obj.lesson.trim().slice(0, 600) : undefined;
+  const modelReason = typeof obj.reason === "string" ? obj.reason.trim().slice(0, 800) : undefined;
+  const improvementHint = typeof obj.improvement_hint === "string" ? obj.improvement_hint.trim().slice(0, 300) : base.improvementHint;
+  const reflectionLines = [
+    base.reflection,
+    "",
+    "## Sidecar task reflection",
+    usefulness ? `Sherpa context usefulness: ${usefulness}.` : undefined,
+    `Model outcome: ${outcome}.`,
+    modelReason ? `Reason: ${modelReason}` : undefined,
+    lesson ? `Lesson: ${lesson}` : undefined,
+  ].filter(Boolean) as string[];
+  return {
+    evalRecord: {
+      ...base,
+      taskOutcome: outcome,
+      scores,
+      missed: missed.length ? missed : base.missed,
+      noise: noise.length ? noise : base.noise,
+      reflection: reflectionLines.join("\n"),
+      improvementHint,
+    },
+    usefulness,
+    shouldPreserve: obj.should_preserve === true || obj.shouldPreserve === true,
+    lesson,
+  };
+}
+
 export function evaluatePostTaskContext(input: PostTaskEvaluationInput): ContextEvaluation {
   const usedFiles = evaluationUsedFiles(input);
   const items = input.bundle.items ?? [];

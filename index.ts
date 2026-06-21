@@ -25,13 +25,14 @@ import {
   writeEvaluation,
   writeQualitySummary,
   type ContextBundleRecord,
+  type ContextEvaluation,
 } from "./lib/evaluation";
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
 import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces, writeDspyTrace } from "./lib/dspy";
 import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
-import { applyEvaluationFeedbackToCandidates, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { writeDistilledSkill } from "./lib/distillation";
 
 import { filterActiveSources } from "./lib/conditional-source";
@@ -1465,6 +1466,19 @@ function traceFeedbackStats(evalsCount: number, qualitySummaryUsed: boolean, dec
   return { recentEvaluations: evalsCount, qualitySummaryUsed, penaltiesApplied, boostsApplied };
 }
 
+function traceStageLabels(bundle: ContextBundle, candidates: ContextItem[], curateResult: CurateResult) {
+  const processDecision = bundle.sourcePlan?.planner
+    ? `${bundle.sourcePlan.planner}: ${(bundle.sourcePlan.reason || "no source-plan reason").slice(0, 160)}`
+    : "no source plan";
+  const dataSufficiency = curateResult.abstain
+    ? `insufficient: ${(curateResult.abstainReason || curateResult.plannerReason || "compiler abstained").slice(0, 160)}`
+    : `sufficient: selected ${bundle.items.length}/${candidates.length} candidates via ${curateResult.planner}`;
+  const finalContext = bundle.items.length
+    ? `provided: ${bundle.items.length} item(s); ${bundle.items.map((item) => item.source).slice(0, 3).join(", ")}`.slice(0, 240)
+    : "silent_abstain: no context injected";
+  return { processDecision, dataSufficiency, finalContext };
+}
+
 function recordDspyTrace(cwd: string, bundle: ContextBundle, indicators: SearchIndicators, candidates: ContextItem[], curateResult: CurateResult, feedback?: { recentEvaluations?: number; qualitySummaryUsed?: boolean; penaltiesApplied?: number; boostsApplied?: number }) {
   try {
     const decisions = traceDecisions(bundle.focus, candidates, bundle.items, curateResult);
@@ -1474,6 +1488,7 @@ function recordDspyTrace(cwd: string, bundle: ContextBundle, indicators: SearchI
       bundleId: bundle.bundleId,
       focus: bundle.focus,
       mode: bundle.mode,
+      stageLabels: traceStageLabels(bundle, candidates, curateResult),
       sourcePlan: {
         sources: bundle.sourcePlan?.sources ?? [],
         reason: bundle.sourcePlan?.reason ?? "",
@@ -2561,6 +2576,43 @@ export default function (pi: ExtensionAPI) {
     return { ok, lines };
   };
 
+  const taskReflectionMessage = (bundle: ContextBundleRecord, evalRecord: ContextEvaluation, outcome: ReturnType<typeof classifyTaskOutcome>, evidence: ReturnType<typeof collectRecentTaskFileEvidence>, referencedFiles: string[], changedFiles: string[], recentText: string): UserMessage => ({
+    role: "user",
+    timestamp: Date.now(),
+    content: [{ type: "text", text: [
+      "You are Sherpa's post-task reflection evaluator.",
+      "Judge whether the Sherpa context helped the main agent complete the user's task.",
+      "Use only the structured packet below; do not invent missing tool evidence.",
+      "",
+      "Return ONLY JSON:",
+      '{"outcome":"completed|partial|blocked|failed|unknown","sherpa_context_usefulness":"useful|partial|unused|harmful|not_needed","missed_context":["repo/path.ts"],"noisy_context":["source"],"scores":{"relevance":0.0,"precision":0.0,"recall":0.0},"lesson":"short reusable lesson or empty","should_preserve":false,"improvement_hint":"short routing/scoring hint","reason":"why"}',
+      "",
+      JSON.stringify({
+        focus: bundle.focus,
+        deterministicOutcome: outcome,
+        shownContext: bundle.items,
+        toolEvidence: { ...evidence, referencedFiles, changedFiles },
+        deterministicEvaluation: evalRecord,
+        finalText: recentText.slice(-1800),
+      }, null, 2),
+    ].join("\n") }],
+  });
+
+  const reflectTaskEvaluationWithModel = async (stateObj: State, ctx: ExtensionContext, bundle: ContextBundleRecord, evalRecord: ContextEvaluation, outcome: ReturnType<typeof classifyTaskOutcome>, evidence: ReturnType<typeof collectRecentTaskFileEvidence>, referencedFiles: string[], changedFiles: string[], recentText: string) => {
+    if (stateObj.config.model.heuristicOnly) return { evalRecord, modelUsed: false, reason: "model.heuristicOnly=true" };
+    const modelAuth = await getSherpaModelAuthWithReason(stateObj, ctx);
+    if (!modelAuth.ok) return { evalRecord, modelUsed: false, reason: modelAuth.reason };
+    const { model, auth } = modelAuth.value;
+    try {
+      const result = await completeJsonObjectWithTimeout(stateObj, ctx, model, auth, taskReflectionMessage(bundle, evalRecord, outcome, evidence, referencedFiles, changedFiles, recentText), 12_000, "task reflection timed out");
+      if (result.aborted || !result.parsed) return { evalRecord, modelUsed: false, reason: result.aborted ? "aborted" : "invalid JSON" };
+      const parsed = applyReflectionModelOutput(evalRecord, result.parsed);
+      return { ...parsed, modelUsed: true, reason: "sidecar reflection applied" };
+    } catch (error) {
+      return { evalRecord, modelUsed: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
   const processAutomationCandidates = (stateObj: State, ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
     const raw = stringifyForAutoMemory(recentMessages);
     const automationCandidates = updateAutomationCandidates(stateObj.automation, raw, 3, cwd);
@@ -2605,12 +2657,14 @@ export default function (pi: ExtensionAPI) {
       const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
       const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
       if (!hasTaskSignal) return;
-      const evalRecord = evaluatePostTaskContext({
+      const deterministicEval = evaluatePostTaskContext({
         bundle,
         outcome: outcome.outcome,
         files: { ...evidence, referencedFiles, changedFiles },
         finalText: recentText.slice(-2000),
       });
+      const reflected = await reflectTaskEvaluationWithModel(stateObj, ctx, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+      const evalRecord = reflected.evalRecord;
       stateObj.feedback = [...stateObj.feedback.slice(-49), {
         used: [...new Set([...evidence.readFiles, ...evidence.writtenFiles, ...referencedFiles])].filter((file) => !evalRecord.missed.includes(file)),
         unused: evalRecord.noise,
@@ -2623,11 +2677,15 @@ export default function (pi: ExtensionAPI) {
       appendScratchpadSection(stateObj, cwd, "observation", [
         `Bundle: ${evalRecord.bundleId}`,
         `Scores: relevance=${evalRecord.scores.relevance} precision=${evalRecord.scores.precision} recall=${evalRecord.scores.recall}`,
+        reflected.usefulness ? `Usefulness: ${reflected.usefulness}` : `Usefulness: deterministic-only (${reflected.reason})`,
         evalRecord.noise.length ? `Noise: ${evalRecord.noise.slice(0, 8).join(", ")}` : "Noise: none detected",
         evalRecord.missed.length ? `Missed: ${evalRecord.missed.slice(0, 8).join(", ")}` : "Missed: none detected",
         `Hint: ${evalRecord.improvementHint}`,
         `Stored: ${path.relative(memoryRoot, target)}`,
       ].join("\n"), "Sherpa retrieval evaluation");
+      if (reflected.shouldPreserve && reflected.lesson) {
+        appendScratchpadSection(stateObj, cwd, "distill_candidate", reflected.lesson, "Sherpa reflection lesson");
+      }
       stateObj.evaluationHashes = [...stateObj.evaluationHashes.slice(-49), bundle.bundleId];
       stateObj.lastBundleId = undefined;
       void recordSurrealRetrievalFeedback(stateObj, bundle, evalRecord);
@@ -3208,6 +3266,9 @@ export default function (pi: ExtensionAPI) {
       `top reasons: ${fmtReasons(report.topReasons)}`,
       `source planner reasons: ${fmtReasons(report.topSourcePlanReasons)}`,
       `curation reasons: ${fmtReasons(report.topCurationReasons)}`,
+      `process decisions: ${fmtReasons(report.topProcessDecisions)}`,
+      `data sufficiency: ${fmtReasons(report.topDataSufficiency)}`,
+      `final context: ${fmtReasons(report.topFinalContext)}`,
     ].join("\n"), "info");
   }});
 

@@ -31,12 +31,15 @@ function trace(partial: Partial<DspyTraceRecord>): DspyTraceRecord {
 
 test("summarizeDspyTraces aggregates decisions and reasons", () => {
   const report = summarizeDspyTraces([
-    trace({ decisions: [
-      { source: "repo://a.ts", finalRelevance: 0.8, decision: "selected", reasons: ["selected_by_curator"] },
-      { source: "repo://docs/MISSIONS.md", finalRelevance: 0.2, decision: "suppressed", reasons: ["generic_source:mission", "focus_does_not_allow_mission"] },
-      { source: "repo://README.md", finalRelevance: 0.3, decision: "rejected", reasons: ["generic_source:readme"] },
-    ] }),
-    trace({ candidateCount: 5, selected: [], sourcePlan: { sources: ["files"], reason: "planner skipped: mode=explicit", confidence: 0.4, planner: "fallback" }, curate: { abstain: true, abstainReason: "weak", confidence: 0.1, planner: "heuristic", plannerReason: "curation skipped: remote model disabled", rejected: [] }, decisions: [
+    trace({
+      stageLabels: { processDecision: "llm: chose files", dataSufficiency: "sufficient: selected 1/3 candidates via llm", finalContext: "provided: 1 item(s); repo://a.ts" },
+      decisions: [
+        { source: "repo://a.ts", finalRelevance: 0.8, decision: "selected", reasons: ["selected_by_curator"] },
+        { source: "repo://docs/MISSIONS.md", finalRelevance: 0.2, decision: "suppressed", reasons: ["generic_source:mission", "focus_does_not_allow_mission"] },
+        { source: "repo://README.md", finalRelevance: 0.3, decision: "rejected", reasons: ["generic_source:readme"] },
+      ],
+    }),
+    trace({ candidateCount: 5, selected: [], sourcePlan: { sources: ["files"], reason: "planner skipped: mode=explicit", confidence: 0.4, planner: "fallback" }, curate: { abstain: true, abstainReason: "weak", confidence: 0.1, planner: "heuristic", plannerReason: "curation skipped: remote model disabled", rejected: [] }, stageLabels: { processDecision: "fallback: planner skipped", dataSufficiency: "insufficient: weak", finalContext: "silent_abstain: no context injected" }, decisions: [
       { source: "repo://b.ts", finalRelevance: 0.7, decision: "boosted", reasons: ["missed_path_boost"] },
     ] }),
   ]);
@@ -51,6 +54,9 @@ test("summarizeDspyTraces aggregates decisions and reasons", () => {
   assert(report.topReasons.some((item) => item.reason === "generic_source:mission"), "expected mission reason");
   assert(report.topSourcePlanReasons.some((item) => item.reason === "planner skipped: mode=explicit"), "expected source planner reason");
   assert(report.topCurationReasons.some((item) => item.reason === "curation skipped: remote model disabled"), "expected curation reason");
+  assert(report.topProcessDecisions.some((item) => item.reason === "llm: chose files"), "expected process decision label");
+  assert(report.topDataSufficiency.some((item) => item.reason === "insufficient: weak"), "expected data sufficiency label");
+  assert(report.topFinalContext.some((item) => item.reason === "silent_abstain: no context injected"), "expected final context label");
 });
 
 for (const { name, fn } of tests) {

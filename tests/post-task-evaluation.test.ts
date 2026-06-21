@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { evaluatePostTaskContext, applyEvaluationFeedbackToCandidates, classifyEvalTaskKind } from "../lib/post-task-evaluation";
+import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, classifyEvalTaskKind, evaluatePostTaskContext } from "../lib/post-task-evaluation";
 import { readQualitySummary, writeQualitySummary, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
@@ -181,6 +181,37 @@ test("quality summary can be written and read back", () => withTemp((dir) => {
   assert(summary?.topNoise[0]?.source === "repo://docs/MISSIONS.md", "expected top noise source");
   assert(summary?.topMissed[0]?.pattern === "src/server/public/client.js", "expected top missed path");
 }));
+
+test("sidecar reflection output overrides usefulness, missed/noisy context, and lesson", () => {
+  const base: ContextEvaluation = {
+    bundleId: "bundle-test",
+    taskOutcome: "unknown",
+    scores: { relevance: 0.2, precision: 0.2, recall: 0.2 },
+    noise: [],
+    missed: [],
+    reflection: "base reflection",
+    improvementHint: "base hint",
+    evaluatedAt: new Date().toISOString(),
+  };
+  const result = applyReflectionModelOutput(base, {
+    outcome: "completed",
+    sherpa_context_usefulness: "useful",
+    missed_context: ["src/exact.ts"],
+    noisy_context: ["repo://README.md"],
+    lesson: "Exact source paths beat generic README context.",
+    should_preserve: true,
+    improvement_hint: "Boost exact source paths.",
+    reason: "Agent used the exact path after reflection.",
+  });
+  assert(result.evalRecord.taskOutcome === "completed", "expected outcome override");
+  assert(result.evalRecord.scores.relevance >= 0.75, "expected usefulness to boost relevance");
+  assert(result.evalRecord.missed.includes("src/exact.ts"), "expected missed context");
+  assert(result.evalRecord.noise.includes("repo://README.md"), "expected noisy context");
+  assert(result.evalRecord.reflection.includes("Sidecar task reflection"), "expected sidecar reflection section");
+  assert(result.shouldPreserve === true, "expected preserve flag");
+  assert(result.lesson === "Exact source paths beat generic README context.", "expected lesson");
+  assert(result.evalRecord.improvementHint === "Boost exact source paths.", "expected hint override");
+});
 
 test("feedback does not boost unrelated generic page.tsx candidates", () => {
   const evals: ContextEvaluation[] = [{
