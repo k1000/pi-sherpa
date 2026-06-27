@@ -36,6 +36,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
+import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { approxTokens, isTrivial, score, summarize } from "./lib/text-utils";
 import { extractUrls } from "./lib/url-utils";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
@@ -669,16 +670,6 @@ function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode
   return postProcessCandidates(candidates, focus, mode);
 }
 
-function extractJsonArray(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const raw = fenced ?? text;
-  const start = raw.indexOf("[");
-  const end = raw.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return null;
-  try { return JSON.parse(raw.slice(start, end + 1)); }
-  catch { return null; }
-}
-
 function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
 }
@@ -796,16 +787,6 @@ function parseSourcePlan(text: string, mode: string): SourcePlan | null {
     confidence: typeof obj.confidence === "number" ? Math.max(0, Math.min(1, obj.confidence)) : 0.5,
     planner: "llm",
   };
-}
-
-function extractJsonObject(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const raw = fenced ?? text;
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end === -1 || end <= start) return null;
-  try { return JSON.parse(raw.slice(start, end + 1)); }
-  catch { return null; }
 }
 
 async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus: string): Promise<SearchIndicators> {
