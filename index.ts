@@ -53,7 +53,7 @@ import type { SessionSearchMatch } from "./lib/session-search";
 import { writeNudge } from "./lib/nudge";
 import type { NudgeTarget } from "./lib/nudge";
 import { checkAutoDistill, prepareDistillPayloads, getAutoDistillStatus, markAutoDistillRun } from "./lib/auto-distill";
-import { ensureRouteMap, parseRouteMap } from "./lib/route-map";
+import { ensureRouteMap } from "./lib/route-map";
 import { searchSemble } from "./lib/semble";
 import { parseRgOutput, rg } from "./lib/rg";
 import { catalogMatches, readGlobalTaxonomy } from "./lib/catalog";
@@ -61,6 +61,7 @@ import { parseGitStatusFiles } from "./lib/common";
 import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
 import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
+import { matchRoutePlan } from "./lib/route-match";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync } from "node:fs";
@@ -482,27 +483,6 @@ function applyConditionalSourceActivation(state: State, focus: string, mode: str
     enabledSources: enabledSourceSet(state),
   }) as Source[];
 }
-
-function routeMapApplies(state: State, mode: string) {
-  const applyTo = state.config.routeMap?.applyTo ?? "all";
-  return Boolean(state.config.routeMap?.enabled) && (applyTo === "all" || applyTo === mode);
-}
-
-function matchRoutePlan(state: State, cwd: string, focus: string, mode: string): RoutePlan | undefined {
-  if (!routeMapApplies(state, mode)) return undefined;
-  try {
-    const routePath = path.isAbsolute(state.config.routeMap.path) ? state.config.routeMap.path : path.join(cwd, state.config.routeMap.path);
-    if (!existsSync(routePath)) return undefined;
-    const routes = parseRouteMap(readFileSync(routePath, "utf8"));
-    const f = focus.toLowerCase();
-    const scored = routes.map(r => ({ ...r, score: r.triggers.reduce((n, t) => n + (t && f.includes(t.toLowerCase()) ? 1 : 0), 0) }))
-      .filter(r => r.score > 0)
-      .sort((a, b) => b.score - a.score);
-    return scored[0];
-  } catch { return undefined; }
-}
-
-
 
 function sourceCorrespondenceThreshold(focus: string, mode: string) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
