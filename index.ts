@@ -33,6 +33,8 @@ import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./l
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { isGloballyNoisySource } from "./lib/noise-filter";
+export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
 import { writeDistilledSkill } from "./lib/distillation";
 
@@ -599,34 +601,7 @@ function routeSkipsPath(routePlan: RoutePlan | undefined, p: string) {
   return routePlan.skip.some(s => s && normalized.includes(s.replace(/\\/g, "/").toLowerCase()));
 }
 
-const GLOBAL_NOISY_SOURCE_PATTERNS = [
-  /(?:^|\/)\.zcompdump[^/]*$/i,
-  /(?:^|\/)\.zsh_history(?::\d+)?$/i,
-  /(?:^|\/)\.(?:zshrc|bashrc|bash_profile|zprofile|profile|zshenv)(?::\d+)?$/i,
-  /(?:^|\/)\.bun\//i,
-  /(?:^|\/)\.cdk\/cache\//i,
-  /(?:^|\/)library\/caches\//i,
-  /(?:^|\/)\.omp\/logs\//i,
-  /(?:^|\/)agent-disabled-extension-backups\//i,
-  /(?:^|\/)extensions-disabled\//i,
-  /(?:^|\/)extensions\.disabled\//i,
-  /(?:^|\/)\.pi\/revolver\//i,
-  /(?:^|\/)\.pi\/sherpa\//i,
-  /(?:^|\/)graphify-out\//i,
-  /(?:^|\/)\.fallow\//i,
-  /(?:^|\/)\.pi-memory\/(?:session-search|memory-index).*\.(?:db|sqlite)/i,
-  /(?:^|\/)(?:dist|build|coverage)\//i,
-  /(?:^|\/)public\/.*\.bundle\.js(?::\d+)?$/i,
-  /\.min\.js(?::\d+)?$/i,
-  /\.bak(?:-[^/:]+)?(?::\d+)?$/i,
-  /\.backup(?::\d+)?$/i,
-  /\.(?:db|sqlite)(?::\d+)?$/i,
-];
 
-export function isGloballyNoisySource(source: string) {
-  const normalized = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/\\/g, "/").toLowerCase();
-  return GLOBAL_NOISY_SOURCE_PATTERNS.some((pattern) => pattern.test(normalized));
-}
 
 function isPackageManifestSource(source: string) {
   return /(?:^|\/)package\.json(?::\d+)?$/i.test(source.replace(/^repo:\/\//, ""))
