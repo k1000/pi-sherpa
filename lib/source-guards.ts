@@ -2,6 +2,7 @@
 
 type SourceLike = { type: string; source: string };
 type StickySnippetLike = { type: string; source: string; summary: string; raw?: string };
+type RelevanceItemLike = { type: string; source: string; relevance: number };
 
 export function isPackageManifestSource(source: string) {
   return /(?:^|\/)package\.json(?::\d+)?$/i.test(source.replace(/^repo:\/\//, ""))
@@ -54,4 +55,44 @@ export function isGenericNoiseSource(source: string) {
     || normalized.includes("/readme.md:")
     || normalized.startsWith("file://~/.pi/agent/skills/")
     || normalized.includes("/wiki/systems/archivist-sherpa-gap-analysis.md");
+}
+
+export function isSmallEditCandidate(focus: string, items: RelevanceItemLike[]) {
+  const f = focus.toLowerCase();
+  if (!/\b(fix|update|add|change|replace|correct)\b/.test(f)) return false;
+  if (!/\b(typo|readme|doc|docs|markdown|comment|config|setting|prompt|prd|route map|route-map)\b/.test(f)) return false;
+  const fileItems = items.filter(i => i.type.includes("file") || i.type.includes("doc"));
+  return fileItems.length > 0 && fileItems.length <= 3 && items[0].relevance >= 0.35;
+}
+
+const GENERIC_NOISE_PATHS = [
+  "/readme.md",
+  "docs/mission_prompt.md",
+  "docs/missions.md",
+  "documentation-drift",
+  "archivist_actionable_solutions.md",
+  "/.pi/agent/skills/",
+];
+
+const GENERIC_NOISE_NEEDED: Array<{ path: string; focusRe: RegExp }> = [
+  { path: "docs/mission_prompt.md", focusRe: /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/i },
+  { path: "docs/missions.md", focusRe: /\b(mission|missions|orchestrator|worker|validator|validation contract)\b/i },
+  { path: "documentation-drift", focusRe: /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/i },
+  { path: "archivist_actionable_solutions.md", focusRe: /\b(archivist|preserve|distill|documentation drift|obsidian|memory routing)\b/i },
+  { path: "/.pi/agent/skills/", focusRe: /\b(skill|skills|agent skill|load skill)\b/i },
+  { path: "/readme.md", focusRe: /\b(readme|overview|onboard|onboarding|project summary)\b/i },
+];
+
+export function isGenericNoiseExplicitlyNeeded(source: string, focus: string): boolean {
+  return GENERIC_NOISE_NEEDED.some((n) => source.includes(n.path) && n.focusRe.test(focus));
+}
+
+export function isGenericNoisePath(source: string): boolean {
+  return GENERIC_NOISE_PATHS.some((p) => source.endsWith(p) || source.includes(p));
+}
+
+export function isLikelyGenericOpeningNoise(item: RelevanceItemLike, focus = ""): boolean {
+  const source = item.source.toLowerCase();
+  if (isGenericNoiseExplicitlyNeeded(source, focus.toLowerCase())) return false;
+  return item.relevance < 0.25 || isGenericNoisePath(source);
 }
