@@ -42,6 +42,7 @@ import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageMa
 import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
+import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import { extractUrls } from "./lib/url-utils";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
