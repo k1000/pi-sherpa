@@ -44,6 +44,7 @@ import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import { extractUrls } from "./lib/url-utils";
+import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./lib/web-search";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
@@ -75,7 +76,6 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 
@@ -1293,15 +1293,6 @@ function webAllowed(state: State) {
   return Boolean(state.config.privacy.allowNetwork && state.config.sources.web && state.config.web?.enabled);
 }
 
-function webCachePath(cwd: string, query: string, provider: string) {
-  const hash = createHash("sha256").update(`${provider}:${query.toLowerCase().trim()}`).digest("hex").slice(0, 24);
-  return path.join(cwd, ".pi", "sherpa-cache", "web", `${hash}.json`);
-}
-
-function conciseWebQuery(focus: string) {
-  return focus.replace(/[^\p{L}\p{N}\s._:/-]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 180);
-}
-
 function surrealMemoryStore(state: State) {
   const cfg = state.config.memoryStore?.surreal;
   return cfg?.enabled ? new MemoryApiStore(cfg) : undefined;
@@ -1403,8 +1394,6 @@ async function searchGraphify(cwd: string, focus: string, cfg: SherpaConfig["gra
   }
 }
 
-type WebSearchResult = { title: string; url: string; snippet: string };
-
 function webSearchConfig(state: State, focus: string) {
   if (!webAllowed(state)) return null;
   const provider = state.config.web.provider || "brave";
@@ -1421,55 +1410,9 @@ function webSearchConfig(state: State, focus: string) {
   };
 }
 
-function readWebCache(cachePath: string, cacheTtlMs: number): WebSearchResult[] | undefined {
-  try {
-    if (!existsSync(cachePath)) return undefined;
-    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    return Date.now() - cached.at < cacheTtlMs ? cached.results ?? [] : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function writeWebCache(cachePath: string, provider: string, query: string, results: WebSearchResult[]): void {
-  mkdirSync(path.dirname(cachePath), { recursive: true });
-  writeFileSync(cachePath, JSON.stringify({ at: Date.now(), provider, query, results }, null, 2));
-}
-
-async function searchBraveWeb(query: string, apiKey: string, maxResults: number, signal: AbortSignal): Promise<WebSearchResult[]> {
-  const url = `https://api.search.brave.com/res/v1/web/search?${new URLSearchParams({ q: query, count: String(maxResults), text_decorations: "false" })}`;
-  const res = await fetch(url, { headers: { "Accept": "application/json", "X-Subscription-Token": apiKey }, signal });
-  if (!res.ok) return [];
-  const json: any = await res.json();
-  return (json.web?.results ?? [])
-    .slice(0, maxResults)
-    .map((r: any) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.description ?? "" }))
-    .filter((r: WebSearchResult) => r.url);
-}
-
-async function runWebProviderSearch(config: NonNullable<ReturnType<typeof webSearchConfig>>, signal: AbortSignal): Promise<WebSearchResult[]> {
-  if (config.provider === "brave") return searchBraveWeb(config.query, config.apiKey, config.maxResults, signal);
-  return [];
-}
-
 async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Promise<WebSearchResult[]> {
   const config = webSearchConfig(state, focus);
-  if (!config) return [];
-  const cachePath = webCachePath(ctx.cwd, config.query, config.provider);
-  const cached = readWebCache(cachePath, config.cacheTtlMs);
-  if (cached) return cached;
-
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), config.timeoutMs);
-  try {
-    const results = await runWebProviderSearch(config, abort.signal);
-    writeWebCache(cachePath, config.provider, config.query, results);
-    return results;
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timer);
-  }
+  return config ? searchWebWithConfig(ctx.cwd, config) : [];
 }
 
 function createEmptyContextBundle(state: State, focus: string, mode: string, candidates: ContextItem[], sourcePlan: SourcePlan): ContextBundle {
