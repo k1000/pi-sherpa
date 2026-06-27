@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { conciseSummary, extractQueryTarget, heuristicSourcePlan, parseCompiledContextItems, postProcessCandidates } from "../index";
+import { conciseSummary, extractQueryTarget, heuristicSourcePlan, isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt, parseCompiledContextItems, postProcessCandidates, resolveModelFilterPool } from "../index";
 
 type Candidate = Parameters<typeof postProcessCandidates>[0][number];
 
@@ -92,6 +92,42 @@ test("golden: source planner includes files for Sherpa quality review", () => {
   const plan = heuristicSourcePlan("review pi-sherpa context curation quality", "explicit");
   assert.ok(plan.sources.includes("files"), `expected files source; got ${plan.sources.join(", ")}`);
   assert.ok(plan.sources.includes("project_memory"), `expected project_memory source; got ${plan.sources.join(", ")}`);
+});
+
+test("golden: Sherpa trace/log prompts route to runtime traces and dspy implementation", () => {
+  const prompt = "pi-sherpa tracing recent calls implementation and where logs/metrics are stored";
+  const plan = heuristicSourcePlan(prompt, "explicit");
+  const actual = sourcesFor(prompt, [
+    candidate({ type: "sherpa_trace_location", source: "repo://.pi-memory/sherpa-traces", relevance: 0.7, summary: "Active trace directory" }),
+    candidate({ type: "pi_sherpa_debug_file", source: "file://~/.pi/agent/extensions/pi-sherpa/lib/dspy.ts", relevance: 0.65, summary: "writeDspyTrace dspyTraceDir readDspyTraces" }),
+    candidate({ type: "project_memory", source: "kb://journal/2026-06-15.md", relevance: 0.95, summary: "old Sherpa journal" }),
+  ]);
+  assert.ok(isTraceLogMetricsPrompt(prompt));
+  assert.ok(isPiSherpaMetaDebugPrompt(prompt));
+  assert.ok(plan.sources.includes("files"), `expected files source; got ${plan.sources.join(", ")}`);
+  assertIncludesAny(actual, ".pi-memory/sherpa-traces");
+  assertIncludesAny(actual, "pi-sherpa/lib/dspy.ts");
+  assertExcludesAny(actual, "kb://journal");
+});
+
+test("golden: sidecar model filters candidates even when the deterministic prefilter empties the pool", () => {
+  // Directive: whatever Sherpa delivers must be filtered by the sidecar model before
+  // reaching the main model. A prefilter-empty pool with surviving raw candidates must
+  // route to the model (not heuristic-abstain); only a truly empty search bypasses it.
+  const noise = candidate({ type: "research_memory", source: "kb://journal/2026-05-01.md", relevance: 0.95, summary: "old research journal" });
+  const weak = candidate({ type: "file_snippet", source: "repo://index.ts:10", relevance: 0.05, summary: "low relevance hit" });
+
+  // prefilter empties (neither survives generic/threshold rules) but raw candidates exist → model must filter
+  const routed = resolveModelFilterPool([], [noise, weak]);
+  assert.ok(routed, "non-empty raw candidates must route to the sidecar model");
+  assert.equal(routed?.length, 2, "all raw candidates are handed to the model to judge");
+
+  // when the prefilter keeps candidates, those are used unchanged (existing behavior preserved)
+  const kept = candidate({ type: "file_snippet", source: "repo://index.ts", relevance: 0.5, summary: "impl" });
+  assert.deepEqual(resolveModelFilterPool([kept], [noise]), [kept]);
+
+  // only a truly empty search (zero raw candidates) bypasses the model
+  assert.equal(resolveModelFilterPool([], []), undefined);
 });
 
 test("golden: query target extraction identifies action, targets, and evidence type", () => {

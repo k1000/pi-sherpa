@@ -33,6 +33,7 @@ import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./l
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
 import { writeDistilledSkill } from "./lib/distillation";
 
 import { filterActiveSources } from "./lib/conditional-source";
@@ -53,6 +54,7 @@ import type { RoutePlan } from "./lib/route-map";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
@@ -286,21 +288,38 @@ const DEFAULT_CONFIG: SherpaConfig = {
 };
 
 function configPath(cwd: string) { return path.join(cwd, ".pi", "sherpa.config.json"); }
+function globalConfigPath() { return path.join(homedir(), ".pi", "sherpa.config.json"); }
 function defaultConfigForCwd(cwd: string): SherpaConfig {
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.memory.obsidianMemoryPath = projectMemoryRel(cwd);
   return cfg;
 }
+function readConfigPatch(p: string): DeepPartial<SherpaConfig> | undefined {
+  if (!existsSync(p)) return undefined;
+  try { return JSON.parse(readFileSync(p, "utf8")); }
+  catch { return undefined; }
+}
+function loadBaseConfig(cwd: string): SherpaConfig {
+  return mergeConfig(defaultConfigForCwd(cwd), readConfigPatch(globalConfigPath()));
+}
 function loadConfig(cwd: string): SherpaConfig {
-  const p = configPath(cwd);
-  const base = defaultConfigForCwd(cwd);
-  if (!existsSync(p)) return base;
-  try { return mergeConfig(base, JSON.parse(readFileSync(p, "utf8"))); }
-  catch { return base; }
+  return mergeConfig(loadBaseConfig(cwd), readConfigPatch(configPath(cwd)));
+}
+function configDiff(base: unknown, value: unknown): unknown | undefined {
+  if (isPlainObject(base) && isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, childValue] of Object.entries(value)) {
+      const diff = configDiff(base[key], childValue);
+      if (diff !== undefined) out[key] = diff;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return JSON.stringify(base) === JSON.stringify(value) ? undefined : value;
 }
 function saveConfig(cwd: string, cfg: SherpaConfig) {
   const p = configPath(cwd); mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
+  const projectPatch = configDiff(loadBaseConfig(cwd), cfg) ?? {};
+  writeFileSync(p, JSON.stringify(projectPatch, null, 2) + "\n");
 }
 function obsidianVaultPath(state: State) {
   return state.config.memory?.obsidianVault || DEFAULT_CONFIG.memory.obsidianVault;
@@ -864,6 +883,19 @@ function heuristicIndicators(focus: string): string[] {
   return extractSearchTerms(focus, 12);
 }
 
+export function isTraceLogMetricsPrompt(focus: string): boolean {
+  return /\b(logs?|trace|traces|tracing|metrics?|perf(?:ormance)?|dspy|bundle|bundles|persist(?:ed|ence)?|stored|storage)\b/i.test(focus);
+}
+
+export function isPiSherpaMetaDebugPrompt(focus: string): boolean {
+  return /\b(?:pi[-\s]?sherpa|sherpa_request_context|sherpa_memory_search|sherpa_session_search|sherpa)\b/i.test(focus)
+    && /\b(?:performance|health|trace|traces|tracing|retrieval|evaluation|evaluations|quality|logs?|metrics?|debug|diagnose|review|context|curation|persist(?:ed|ence)?|stored|storage|implementation|implemented|source|file|files)\b/i.test(focus);
+}
+
+function allowsRepeatedMetaDebugContext(focus: string): boolean {
+  return isPiSherpaMetaDebugPrompt(focus) || (isTraceLogMetricsPrompt(focus) && /\bsherpa\b/i.test(focus));
+}
+
 export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   const f = focus.toLowerCase();
   const sources: Source[] = [];
@@ -874,6 +906,7 @@ export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory", "surreal_memory");
   if (/\b(git|diff|changed|changes|status|staged|unstaged|commit|branch|recent)\b/.test(f)) add("git");
   if (/\b(sherpa|performance|health|trace|traces|retrieval|evaluation|evaluations|quality|useful|usefull|working|correctly|corectly)\b/.test(f)) add("docs", "project_memory", "files");
+  if (isTraceLogMetricsPrompt(f) || isPiSherpaMetaDebugPrompt(f)) add("files", "docs", "project_memory");
   if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory", "surreal_memory");
   if (/\b(internet|web|online|search\s+web|latest|current|today|recent\s+news|external\s+source|documentation\s+online)\b/.test(f)) add("web");
   if (mode !== "front-door" && /\b(previous|earlier|continue|session|conversation|last\s+time|we\s+discussed)\b/.test(f)) add("session");
@@ -910,7 +943,6 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   // Stage 1: model infers which unique technical identifiers would appear in relevant context.
   // Runs ONCE per request and feeds into all subsequent searches.
   if (state.config.model.heuristicOnly) {
-    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
     return { indicators: heuristicIndicators(focus), reason: "heuristic extraction", confidence: 0.3, planner: "heuristic" };
   }
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
@@ -1035,7 +1067,6 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
   const fallbackPlan = routedFallbackPlan(state, ctx, focus, mode, routePlan);
   const heuristicInds = heuristicSearchIndicators(focus);
   if (state.config.model.heuristicOnly) {
-    notifySherpaModelFallback(ctx, "model.heuristicOnly=true");
     return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: model.heuristicOnly=true; ${fallbackPlan.reason}` }, indicators: heuristicInds };
   }
   if (mode !== "front-door" && mode !== "explicit") return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: mode=${mode}; ${fallbackPlan.reason}` }, indicators: heuristicInds };
@@ -1157,19 +1188,33 @@ function contextCompilerMessage(ctx: ExtensionContext, state: State, focus: stri
   };
 }
 
+// Directive: whatever Sherpa delivers must be filtered by the sidecar model before
+// reaching the main model. Under R1+R2, heuristic abstention without the model forces
+// the main model to search itself — the exact accidental-data pollution Sherpa exists
+// to prevent. So when the deterministic prefilter empties the pool but raw candidates
+// exist, the model still filters them rather than heuristic-abstaining. Only a truly
+// empty search (zero raw candidates) bypasses the model: it cannot manufacture context
+// that was never found.
+export function resolveModelFilterPool(filteredPool: ContextItem[], candidates: ContextItem[]): ContextItem[] | undefined {
+  if (filteredPool.length) return filteredPool;
+  if (candidates.length) return [...candidates].sort((a, b) => b.relevance - a.relevance).slice(0, 12);
+  return undefined;
+}
+
 async function compileContextWithModel(state: State, ctx: ExtensionContext, focus: string, mode: string, candidates: ContextItem[]): Promise<CurateResult> {
-  const pool = postProcessCandidates(candidates, focus, mode).slice(0, 12);
-  if (!pool.length) return { items: [], abstain: true, abstainReason: "no candidates survived deterministic prefilter", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "deterministic prefilter" };
+  const pool = resolveModelFilterPool(postProcessCandidates(candidates, focus, mode).slice(0, 12), candidates);
+  if (!pool) return { items: [], abstain: true, abstainReason: "no candidates found by any source", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "empty search — no candidates for the sidecar model to filter" };
 
   const fallback = () => {
     const items = filterAlreadySeenSources(ctx, pool, state).slice(0, 3);
-    return items.length
-      ? heuristicCurateResult(items, 0.25, "context compiler fallback: deterministic prefilter + novelty")
-      : { items: [], abstain: true, abstainReason: "deterministic novelty filter removed all context", rejected: [], confidence: 0.25, planner: "heuristic" as const, plannerReason: "context compiler fallback" };
+    if (items.length) return heuristicCurateResult(items, 0.25, "context compiler fallback: deterministic prefilter + novelty");
+    if (allowsRepeatedMetaDebugContext(focus)) {
+      return heuristicCurateResult(pool.slice(0, 3), 0.22, "context compiler fallback: meta/debug exact-source context already in session, repeated instead of abstaining");
+    }
+    return { items: [], abstain: true, abstainReason: "deterministic novelty filter removed all context", rejected: [], confidence: 0.25, planner: "heuristic" as const, plannerReason: "context compiler fallback" };
   };
 
   if (state.config.model.heuristicOnly) {
-    notifySherpaModelFallback(ctx, "context compiler skipped: model.heuristicOnly=true");
     return fallback();
   }
   const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
@@ -1192,13 +1237,22 @@ async function compileContextWithModel(state: State, ctx: ExtensionContext, focu
     const parsed = result.parsed as any;
     const selected = parseCompiledContextItems(parsed, pool.length);
     if (parsed.abstain === true || !selected.length) {
-      return { items: [], abstain: true, abstainReason: String(parsed.reason ?? "context compiler abstained").slice(0, 240), rejected: parseCurationRejected(parsed, contextCompilerManifest(ctx, pool, focus, mode, state) as any), confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.7))), planner: "llm", plannerReason: String(parsed.reason ?? "context compiler abstained").slice(0, 240) };
+      const reason = String(parsed.reason ?? "context compiler abstained").slice(0, 240);
+      const rejected = parseCurationRejected(parsed, contextCompilerManifest(ctx, pool, focus, mode, state) as any);
+      if (allowsRepeatedMetaDebugContext(focus) && /already[_\s-]?in[_\s-]?session|novel|known|repeat/i.test(reason + " " + rejected.map((r) => r.reason).join(" "))) {
+        return heuristicCurateResult(pool.slice(0, 3), 0.22, "context compiler novelty fallback for meta/debug lookup");
+      }
+      return { items: [], abstain: true, abstainReason: reason, rejected, confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.7))), planner: "llm", plannerReason: reason };
     }
     const compiled = selected.map(({ index, summary }) => {
       const item = pool[index];
       return summary ? { ...item, summary: preserveExpandHint(summary, item.summary, item.handle), inline: false } : item;
     });
-    const guarded = filterAlreadySeenSources(ctx, postProcessCandidates(compiled, focus, mode), state).slice(0, 3);
+    const processedCompiled = postProcessCandidates(compiled, focus, mode);
+    const guarded = filterAlreadySeenSources(ctx, processedCompiled, state).slice(0, 3);
+    if (!guarded.length && allowsRepeatedMetaDebugContext(focus) && processedCompiled.length) {
+      return heuristicCurateResult(processedCompiled.slice(0, 3), 0.22, "context compiler guardrail novelty fallback for meta/debug lookup");
+    }
     if (!guarded.length) return { items: [], abstain: true, abstainReason: "deterministic guardrails removed compiler output", rejected: [], confidence: 0.5, planner: "llm", plannerReason: "context compiler output failed guardrails" };
     return { items: guarded, abstain: false, abstainReason: "", rejected: parseCurationRejected(parsed, contextCompilerManifest(ctx, pool, focus, mode, state) as any), confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.7))), planner: "llm", plannerReason: String(parsed.reason ?? "context compiler selected compact context").slice(0, 240) };
   } catch (error) {
@@ -1206,6 +1260,105 @@ async function compileContextWithModel(state: State, ctx: ExtensionContext, focu
     notifySherpaModelFallback(ctx, `context compiler error: ${message}`);
     return fallback();
   }
+}
+
+// ── Escalation tier: model-driven search loop ─────────────────────────────
+// When the deterministic fast path yields no candidates, hand control to the
+// sidecar model with a small toolset so it can BROADEN the research — searching
+// places/queries the deterministic pass cannot (e.g. ~/.pi dotfiles that rg is
+// guardrailed away from). The model is the delivery gate; the loop only gathers.
+
+// Tool: find files by name/glob within scoped safe roots. This is the capability
+// the deterministic path lacks — rg refuses $HOME, so config files like
+// ~/.pi/agent/models.json are invisible to it. The model picks the pattern.
+const MODEL_SEARCH_FILE_ROOTS: string[] = (() => {
+  const roots: string[] = [];
+  const home = process.env.HOME;
+  if (home) roots.push(path.join(home, ".pi", "agent"));
+  return roots;
+})();
+
+function makeFileFinderTool(ctx: ExtensionContext): SearchTool {
+  return {
+    name: "find_file",
+    description: "Find files by name or glob under ~/.pi/agent (config, models, extensions). Use when the user asks about configuration, models, providers, or pi setup and the exact path is unknown. Pass a query like 'models' or 'sherpa.config'.",
+    async run({ query, limit }) {
+      const q = (query ?? "").trim().toLowerCase();
+      if (!q) return [];
+      const out: ModelSearchCandidate[] = [];
+      const seen = new Set<string>();
+      const max = Math.min(limit ?? 5, 5);
+      for (const root of MODEL_SEARCH_FILE_ROOTS) {
+        if (!existsSync(root)) continue;
+        let entries: string[];
+        try { entries = readdirSync(root); } catch { continue; }
+        for (const name of entries) {
+          if (seen.has(name)) continue;
+          if (name.toLowerCase().includes(q)) {
+            seen.add(name);
+            const abs = path.join(root, name);
+            try { if (!statSync(abs).isFile()) continue; } catch { continue; }
+            out.push({ source: pathSourceLabel(abs, ctx.cwd), summary: `File under ~/.pi/agent: ${name}`, relevance: 0.7 });
+            if (out.length >= max) return out;
+          }
+        }
+      }
+      return out;
+    },
+  };
+}
+
+// Tool: search Sherpa durable memory (scratchpad/catalog). Existing primitive reused.
+function makeMemorySearchTool(): SearchTool {
+  return {
+    name: "search_memory",
+    description: "Search past Sherpa observations, distillation candidates, and catalog entries for a keyword. Use for conventions, lessons, prior decisions.",
+    async run({ query, limit }) {
+      const q = (query ?? "").trim();
+      if (!q) return [];
+      try {
+        const hits = searchSherpaMemory("/Users/kamil/.pi-memory", q, Math.min(limit ?? 5, 5));
+        return hits.map((h) => ({ source: `kb://memory/${h.kind ?? ""}/${h.id ?? ""}`, summary: (h.title ? h.title + ": " : "") + (h.summary ?? "").slice(0, 200), relevance: 0.5 }));
+      } catch { return []; }
+    },
+  };
+}
+
+// Real modelStep: injects the sidecar completion into the pure loop controller.
+function makeModelStepRunner(state: State, ctx: ExtensionContext, timeoutMs = 8000) {
+  return async (_transcript: string, toolsDescription: string): Promise<ModelStep | undefined> => {
+    const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
+    if (!modelAuth.ok) return { action: "stop", reason: `no sidecar model: ${modelAuth.reason}` };
+    const { model, auth } = modelAuth.value;
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, modelStepMessage(_transcript, toolsDescription), timeoutMs, "model search step timed out");
+    if (result.aborted || !result.parsed) return undefined;
+    const p = result.parsed as any;
+    if (p.action === "search") return { action: "search", tool: String(p.tool ?? ""), query: String(p.query ?? ""), reason: String(p.reason ?? "") };
+    if (p.action === "deliver") return { action: "deliver", items: Array.isArray(p.items) ? p.items.map((i: any) => ({ source: String(i.source ?? ""), summary: String(i.summary ?? "") })) : [], reason: String(p.reason ?? "") };
+    return { action: "stop", reason: String(p.reason ?? "unknown action") };
+  };
+}
+
+async function escalateToModelSearch(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators): Promise<ContextItem[]> {
+  if (state.config.model.heuristicOnly) return [];
+  const tools: Record<string, SearchTool> = {
+    find_file: makeFileFinderTool(ctx),
+    search_memory: makeMemorySearchTool(),
+  };
+  const result = await runModelSearchLoop({
+    focus,
+    tools,
+    modelStep: makeModelStepRunner(state, ctx),
+    budget: { maxRounds: 3, maxToolCalls: 4 },
+  });
+  return result.candidates.map((c) => ({
+    handle: `ctx-${state.nextHandle++}`,
+    type: "model_search",
+    source: c.source,
+    relevance: c.relevance,
+    summary: c.summary,
+    inline: false,
+  }));
 }
 
 async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, budgetChars = 1200): Promise<string> {
@@ -1865,16 +2018,85 @@ function labelRgSource(fileAndLine: string, cwd: string): string {
   return `${source}:${line}`;
 }
 
+function readSnippetAround(abs: string, needles: string[], max = 3600): string | undefined {
+  try {
+    const raw = readFileSync(abs, "utf8");
+    const lower = raw.toLowerCase();
+    const idx = needles.map((needle) => lower.indexOf(needle.toLowerCase())).filter((n) => n >= 0).sort((a, b) => a - b)[0] ?? 0;
+    const start = Math.max(0, idx - Math.floor(max / 3));
+    const end = Math.min(raw.length, start + max);
+    const prefix = start > 0 ? `... excerpt from ${path.basename(abs)} ...\n` : "";
+    const suffix = end < raw.length ? "\n..." : "";
+    return `${prefix}${raw.slice(start, end)}${suffix}`;
+  } catch { return undefined; }
+}
+
+function latestTraceFiles(traceDir: string): string[] {
+  try {
+    return readdirSync(traceDir)
+      .filter((file) => file.endsWith(".jsonl"))
+      .sort()
+      .reverse()
+      .slice(0, 5);
+  } catch { return []; }
+}
+
+function traceFileStats(traceDir: string, file: string): string {
+  const p = path.join(traceDir, file);
+  try {
+    const raw = readFileSync(p, "utf8");
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const last = lines.length ? JSON.parse(lines[lines.length - 1]) as { at?: string; bundleId?: string; focus?: string } : undefined;
+    return [
+      `- ${file}: ${lines.length} traces`,
+      last?.at ? `last=${last.at}` : "",
+      last?.bundleId ? `bundle=${last.bundleId}` : "",
+      last?.focus ? `focus=${String(last.focus).slice(0, 120)}` : "",
+    ].filter(Boolean).join("; ");
+  } catch {
+    return `- ${file}`;
+  }
+}
+
+function addRuntimeTraceCandidates(ctx: ExtensionContext, focus: string, add: AddContextItem) {
+  if (!isTraceLogMetricsPrompt(focus)) return;
+  const traceDir = path.join(ctx.cwd, ".pi-memory", "sherpa-traces");
+  if (!existsSync(traceDir)) return;
+  const files = latestTraceFiles(traceDir);
+  add("sherpa_trace_location", pathSourceLabel(traceDir, ctx.cwd), [
+    "Sherpa retrieval traces are written under the active cwd, not necessarily under the pi-sherpa extension checkout.",
+    `Active trace directory: ${traceDir}`,
+    files.length ? "Recent trace files:" : "No trace jsonl files found.",
+    ...files.map((file) => traceFileStats(traceDir, file)),
+  ].join("\n"), 0.88);
+}
+
+function addPiSherpaDebugSourceCandidates(ctx: ExtensionContext, focus: string, root: string, add: AddContextItem) {
+  if (!isPiSherpaMetaDebugPrompt(focus)) return;
+  const dspyPath = path.join(root, "lib", "dspy.ts");
+  const indexPath = path.join(root, "index.ts");
+  if (isTraceLogMetricsPrompt(focus) && existsSync(dspyPath)) {
+    const raw = readSnippetAround(dspyPath, ["dspyTraceDir", "writeDspyTrace", "readDspyTraces", "summarizeDspyTraces"]);
+    if (raw) add("pi_sherpa_debug_file", pathSourceLabel(dspyPath, ctx.cwd), raw, 0.82);
+  }
+  if (existsSync(indexPath)) {
+    const raw = readSnippetAround(indexPath, ["recordDspyTrace", "buildBundle", "compileContextWithModel", "planSources"]);
+    if (raw) add("pi_sherpa_debug_file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.66);
+  }
+}
+
 async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
   const roots = mentionedPiExtensionRoots(focus);
   for (const { name, root } of roots) {
-    const keyFiles = ["README.md", "package.json", "index.ts", "SHERPA_SYSTEM.md"]
+    const keyFiles = ["README.md", "package.json", "index.ts", "SHERPA_SYSTEM.md", "lib/dspy.ts"]
       .filter((file) => existsSync(path.join(root, file)));
     add("pi_extension_route", pathSourceLabel(root, ctx.cwd), [
       `Pi extension route: ${name}`,
       `Root: ${root}`,
       keyFiles.length ? `Key files: ${keyFiles.join(", ")}` : "Key files: none detected",
-    ].join("\n"), 0.7);
+      isTraceLogMetricsPrompt(focus) ? "Trace logs: active cwd .pi-memory/sherpa-traces/*.jsonl" : "",
+    ].filter(Boolean).join("\n"), 0.7);
+    addPiSherpaDebugSourceCandidates(ctx, focus, root, add);
 
     const query = [focus, ...indicators.indicators].join(" ");
     const out = await rg(ctx.cwd, query, root);
@@ -1913,6 +2135,7 @@ async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, s
 
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   addExplicitPathCandidates(ctx, focus, add);
+  addRuntimeTraceCandidates(ctx, focus, add);
   await addPiExtensionCandidates(ctx, focus, indicators, add);
   await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
@@ -2200,7 +2423,20 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   await retryFrontDoorFileCandidates(state, ctx, focus, mode, sourcePlan, candidates, add, enabled);
 
   const traceFeedback = applyRetrievalFeedback(state, focus, candidates);
-  const compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+  let compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+
+  // Escalation tier: when the deterministic fast path + model filter abstained due to
+  // an empty/thin search (not a deliberate model rejection), hand control to the sidecar
+  // model with search tools so it can BROADEN the research — e.g. find config files under
+  // ~/.pi that rg is guardrailed away from. Then re-compile so the model still gates delivery.
+  if (compileResult.abstain && candidates.length === 0 && !state.config.model.heuristicOnly) {
+    const searched = await escalateToModelSearch(state, ctx, focus, indicators);
+    if (searched.length) {
+      for (const item of searched) { state.handles.set(item.handle, item); candidates.push(item); }
+      compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+    }
+  }
+
   if (compileResult.abstain) {
     const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
     recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, compileResult, traceFeedback);
