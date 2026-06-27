@@ -34,7 +34,9 @@ import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./l
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
+import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
+export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
 import { writeDistilledSkill } from "./lib/distillation";
 
@@ -465,10 +467,6 @@ const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
 
-function isCodePrompt(focus: string) {
-  return /\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|hook|module|typescript|javascript|python|sql)\b/i.test(focus);
-}
-
 type QueryTarget = {
   action: string;
   targetTerms: string[];
@@ -628,10 +626,6 @@ function focusAllowsHistoricalMemory(focus: string) {
 function isHistoricalMemorySource(item: Pick<ContextItem, "type" | "source">) {
   const source = item.source.toLowerCase();
   return source.startsWith("kb://journal/") || source.includes("/journal/") || item.type === "session_recent";
-}
-
-function isSourceLookupPrompt(focus: string) {
-  return /\b(where|which file|what file|implemented|implementation|tested|test covers|exact files?|function names?|code generates|served|stored|configured|connects|downloads|display)\b/i.test(focus);
 }
 
 function isStickyGenericSnippet(item: Pick<ContextItem, "source" | "summary" | "raw" | "type">) {
@@ -856,15 +850,6 @@ function extractSearchTerms(query: string, max = 12): string[] {
 // Inferior to model inference but prevents complete failure when model is unavailable.
 function heuristicIndicators(focus: string): string[] {
   return extractSearchTerms(focus, 12);
-}
-
-export function isTraceLogMetricsPrompt(focus: string): boolean {
-  return /\b(logs?|trace|traces|tracing|metrics?|perf(?:ormance)?|dspy|bundle|bundles|persist(?:ed|ence)?|stored|storage)\b/i.test(focus);
-}
-
-export function isPiSherpaMetaDebugPrompt(focus: string): boolean {
-  return /\b(?:pi[-\s]?sherpa|sherpa_request_context|sherpa_memory_search|sherpa_session_search|sherpa)\b/i.test(focus)
-    && /\b(?:performance|health|trace|traces|tracing|retrieval|evaluation|evaluations|quality|logs?|metrics?|debug|diagnose|review|context|curation|persist(?:ed|ence)?|stored|storage|implementation|implemented|source|file|files)\b/i.test(focus);
 }
 
 function allowsRepeatedMetaDebugContext(focus: string): boolean {
