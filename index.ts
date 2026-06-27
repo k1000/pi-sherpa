@@ -30,6 +30,7 @@ import {
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
 import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces, writeDspyTrace } from "./lib/dspy";
 import { parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
+import { inferSuggestedCommands, inferTaskType, isDirectAnswerCandidate, whyItemMatters } from "./lib/context-signal-helpers";
 import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
 import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
 
@@ -1060,42 +1061,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
   return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
 }
-function inferTaskType(focus: string) {
-  const f = focus.toLowerCase();
-  if (/\b(fix|bug|failing|error|exception|debug)\b/.test(f)) return "debug";
-  if (/\b(implement|add|build|create)\b/.test(f)) return "implementation";
-  if (/\b(refactor|cleanup|clean up)\b/.test(f)) return "refactor";
-  if (/\b(test|spec|coverage)\b/.test(f)) return "test";
-  if (/\b(explain|what is|where is|how do|show me|summarize)\b/.test(f)) return "explanation";
-  if (/\b(plan|prd|design|proposal)\b/.test(f)) return "planning";
-  if (/\b(web|research|read\s+it|paper|arxiv|url)\b/.test(f)) return "research";
-  return "unknown";
-}
-
-function whyItemMatters(item: ContextItem, taskType: string) {
-  if (item.type === "git_status") return "Shows current repo changes before acting.";
-  if (item.type === "url_reference") return "User explicitly referenced this URL.";
-  if (item.type.includes("doc")) return taskType === "explanation" || taskType === "planning" ? "Relevant documentation for the requested explanation or plan." : "Documentation may constrain the implementation.";
-  if (item.type.includes("file")) return taskType === "test" ? "Relevant source/test location for the requested test work." : "Likely code location related to the task.";
-  if (item.type.includes("kb")) return "Project memory may contain reusable conventions or prior lessons.";
-  return "Selected as relevant source-grounded context.";
-}
-
-function inferSuggestedCommands(focus: string, items: ContextItem[]): SuggestedCommand[] {
-  const f = focus.toLowerCase();
-  const commands: SuggestedCommand[] = [];
-  const hasPackage = items.some(i => /package\.json/.test(i.source));
-  if (/\b(test|failing|fix|bug)\b/.test(f)) commands.push({ command: hasPackage ? "npm test" : "run the focused test command for the touched area", reason: "Validate the suspected failing behavior after inspection or edit." });
-  if (/\b(typecheck|typescript|tsc)\b/.test(f)) commands.push({ command: hasPackage ? "npm run typecheck" : "run the project typecheck command", reason: "Validate TypeScript changes." });
-  return commands.slice(0, 3);
-}
-
-function isDirectAnswerCandidate(focus: string, taskType: string, items: ContextItem[]) {
-  if (!items.length) return false;
-  const f = focus.toLowerCase();
-  return taskType === "explanation" && /\b(where is|what is|which file|show me|how do i|how to)\b/.test(f) && items[0].relevance >= 0.55;
-}
-
 function buildOpeningRecommendation(signal: Omit<ContextSignalV1, "openingRecommendation">): ContextSignalV1["openingRecommendation"] | undefined {
   const likelyUseful = signal.items
     .filter((item) => item.relevance >= 0.45 && !isLikelyGenericOpeningNoise(item, signal.focus))
