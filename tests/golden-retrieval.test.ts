@@ -7,7 +7,7 @@ function candidate(partial: Partial<Candidate> & Pick<Candidate, "source">): Can
   const raw = partial.raw ?? partial.summary ?? partial.source;
   return {
     handle: partial.handle ?? `ctx-${Math.random().toString(36).slice(2, 8)}`,
-    type: partial.type ?? "file_snippet",
+    type: partial.type ?? "file",
     source: partial.source,
     relevance: partial.relevance ?? 0.5,
     summary: partial.summary ?? raw,
@@ -44,9 +44,9 @@ test("golden: code prompt keeps exact implementation file and strips generic noi
   const actual = sourcesFor(prompt, [
     candidate({ type: "doc_snippet", source: "repo://README.md", relevance: 0.98, summary: "Project overview and broad setup" }),
     candidate({ type: "doc_snippet", source: "file://~/.pi/agent/skills/allium/SKILL.md", relevance: 0.95, summary: "Skill instructions unrelated to Semble parser" }),
-    candidate({ type: "file_snippet", source: "repo://package.json", relevance: 0.9, summary: "package metadata" }),
+    candidate({ type: "file", source: "repo://package.json", relevance: 0.9, summary: "package metadata" }),
     candidate({ type: "git_status", source: "git://status", relevance: 0.85, summary: " M README.md" }),
-    candidate({ type: "file_snippet", source: "repo://lib/semble.ts:42", relevance: 0.55, summary: "function parseSembleSearchOutput(output: string)" }),
+    candidate({ type: "file", source: "repo://lib/semble.ts:42", relevance: 0.55, summary: "function parseSembleSearchOutput(output: string)" }),
   ]);
   assertIncludesAny(actual, "repo://lib/semble.ts:42");
   assertExcludesAny(actual, "README.md");
@@ -58,7 +58,7 @@ test("golden: code prompt keeps exact implementation file and strips generic noi
 test("golden: git status is only returned when the prompt asks for changed files", () => {
   const candidates = [
     candidate({ type: "git_status", source: "git://status", relevance: 0.9, summary: " M index.ts" }),
-    candidate({ type: "file_snippet", source: "repo://index.ts:100", relevance: 0.35, summary: "retrieval status handling" }),
+    candidate({ type: "file", source: "repo://index.ts:100", relevance: 0.35, summary: "retrieval status handling" }),
   ];
   assertExcludesAny(sourcesFor("explain retrieval status handling", candidates), "git://status");
   assertIncludesAny(sourcesFor("review git status and changed files", candidates), "git://status");
@@ -75,7 +75,7 @@ test("golden: pi-sherpa prompt routes to extension code instead of unrelated res
   const actual = sourcesFor(prompt, [
     candidate({ type: "research_memory", source: "kb://research/AI/hipporag-long-term-memory-rag.md", relevance: 0.8, summary: "Graph memory research paper" }),
     candidate({ type: "pi_extension_route", source: "file://~/.pi/agent/extensions/pi-sherpa", relevance: 0.7, summary: "Pi extension route: pi-sherpa" }),
-    candidate({ type: "pi_extension_file", source: "file://~/.pi/agent/extensions/pi-sherpa/index.ts:1145", relevance: 0.65, summary: "async function compileContextWithModel" }),
+    candidate({ type: "file", source: "file://~/.pi/agent/extensions/pi-sherpa/index.ts:1145", relevance: 0.65, summary: "async function compileContextWithModel" }),
   ]);
   assertIncludesAny(actual, "extensions/pi-sherpa");
   assertExcludesAny(actual, "hipporag-long-term-memory-rag.md");
@@ -99,7 +99,7 @@ test("golden: Sherpa trace/log prompts route to runtime traces and dspy implemen
   const plan = heuristicSourcePlan(prompt, "explicit");
   const actual = sourcesFor(prompt, [
     candidate({ type: "sherpa_trace_location", source: "repo://.pi-memory/sherpa-traces", relevance: 0.7, summary: "Active trace directory" }),
-    candidate({ type: "pi_sherpa_debug_file", source: "file://~/.pi/agent/extensions/pi-sherpa/lib/dspy.ts", relevance: 0.65, summary: "writeDspyTrace dspyTraceDir readDspyTraces" }),
+    candidate({ type: "file", source: "file://~/.pi/agent/extensions/pi-sherpa/lib/dspy.ts", relevance: 0.65, summary: "writeDspyTrace dspyTraceDir readDspyTraces" }),
     candidate({ type: "project_memory", source: "kb://journal/2026-06-15.md", relevance: 0.95, summary: "old Sherpa journal" }),
   ]);
   assert.ok(isTraceLogMetricsPrompt(prompt));
@@ -115,7 +115,7 @@ test("golden: sidecar model filters candidates even when the deterministic prefi
   // reaching the main model. A prefilter-empty pool with surviving raw candidates must
   // route to the model (not heuristic-abstain); only a truly empty search bypasses it.
   const noise = candidate({ type: "research_memory", source: "kb://journal/2026-05-01.md", relevance: 0.95, summary: "old research journal" });
-  const weak = candidate({ type: "file_snippet", source: "repo://index.ts:10", relevance: 0.05, summary: "low relevance hit" });
+  const weak = candidate({ type: "file", source: "repo://index.ts:10", relevance: 0.05, summary: "low relevance hit" });
 
   // prefilter empties (neither survives generic/threshold rules) but raw candidates exist → model must filter
   const routed = resolveModelFilterPool([], [noise, weak]);
@@ -123,7 +123,7 @@ test("golden: sidecar model filters candidates even when the deterministic prefi
   assert.equal(routed?.length, 2, "all raw candidates are handed to the model to judge");
 
   // when the prefilter keeps candidates, those are used unchanged (existing behavior preserved)
-  const kept = candidate({ type: "file_snippet", source: "repo://index.ts", relevance: 0.5, summary: "impl" });
+  const kept = candidate({ type: "file", source: "repo://index.ts", relevance: 0.5, summary: "impl" });
   assert.deepEqual(resolveModelFilterPool([kept], [noise]), [kept]);
 
   // only a truly empty search (zero raw candidates) bypasses the model
@@ -140,7 +140,7 @@ test("golden: query target extraction identifies action, targets, and evidence t
 
 test("golden: old journal memory is stripped unless history/session is requested", () => {
   const journal = candidate({ type: "project_memory", source: "kb://journal/2026-06-15.md", relevance: 0.9, summary: "Old Sherpa finding" });
-  const file = candidate({ type: "file_snippet", source: "repo://index.ts:1110", relevance: 0.4, summary: "compileContextWithModel" });
+  const file = candidate({ type: "file", source: "repo://index.ts:1110", relevance: 0.4, summary: "compileContextWithModel" });
   assertExcludesAny(sourcesFor("review pi-sherpa context curation quality", [journal, file]), "kb://journal");
   assertIncludesAny(sourcesFor("review previous session journal about pi-sherpa", [journal, file]), "kb://journal");
 });
@@ -153,8 +153,8 @@ test("golden: research memory is stripped unless research is requested", () => {
 
 test("golden: target term matches boost exact source over adjacent context", () => {
   const actual = sourcesFor("fix context compiler", [
-    candidate({ type: "file_snippet", source: "repo://lib/unrelated.ts:1", relevance: 0.5, summary: "context setup" }),
-    candidate({ type: "file_snippet", source: "repo://index.ts:1110", relevance: 0.4, summary: "compileContextWithModel context compiler" }),
+    candidate({ type: "file", source: "repo://lib/unrelated.ts:1", relevance: 0.5, summary: "context setup" }),
+    candidate({ type: "file", source: "repo://index.ts:1110", relevance: 0.4, summary: "compileContextWithModel context compiler" }),
   ]);
   assert.equal(actual[0], "repo://index.ts:1110");
 });

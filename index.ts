@@ -702,7 +702,7 @@ function candidateSortKey(item: ContextItem, focus: string, mode: string) {
   const target = extractQueryTarget(focus);
   let value = item.relevance;
   if (wantsSource) {
-    value += item.type === "file_snippet" || item.type === "file_exact" || item.type === "semantic_code_snippet" ? 0.35
+    value += item.type === "file" ? 0.35
       : item.type === "doc_snippet" ? -0.25
       : 0;
   }
@@ -1982,7 +1982,7 @@ type AddContextItem = (type: string, source: string, raw: string, relBoost?: num
 function addExplicitPathCandidates(ctx: ExtensionContext, focus: string, add: AddContextItem) {
   for (const p of explicitPathCandidates(focus, ctx.cwd)) {
     const exact = readExplicitSource(p);
-    if (exact) add("file_exact", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
+    if (exact) add("file", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
   }
 }
 
@@ -2077,11 +2077,11 @@ function addPiSherpaDebugSourceCandidates(ctx: ExtensionContext, focus: string, 
   const indexPath = path.join(root, "index.ts");
   if (isTraceLogMetricsPrompt(focus) && existsSync(dspyPath)) {
     const raw = readSnippetAround(dspyPath, ["dspyTraceDir", "writeDspyTrace", "readDspyTraces", "summarizeDspyTraces"]);
-    if (raw) add("pi_sherpa_debug_file", pathSourceLabel(dspyPath, ctx.cwd), raw, 0.82);
+    if (raw) add("file", pathSourceLabel(dspyPath, ctx.cwd), raw, 0.82);
   }
   if (existsSync(indexPath)) {
     const raw = readSnippetAround(indexPath, ["recordDspyTrace", "buildBundle", "compileContextWithModel", "planSources"]);
-    if (raw) add("pi_sherpa_debug_file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.66);
+    if (raw) add("file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.66);
   }
 }
 
@@ -2101,7 +2101,7 @@ async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, in
     const query = [focus, ...indicators.indicators].join(" ");
     const out = await rg(ctx.cwd, query, root);
     for (const { fileAndLine, content } of parseRgOutput(out, 12)) {
-      if (content) add("pi_extension_file", labelRgSource(fileAndLine, ctx.cwd), content, 0.42);
+      if (content) add("file", labelRgSource(fileAndLine, ctx.cwd), content, 0.42);
     }
   }
 }
@@ -2112,11 +2112,11 @@ async function addRoutedFileCandidates(ctx: ExtensionContext, focus: string, sou
     const p = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
     try {
       if (existsSync(p) && statSync(p).isFile()) {
-        add("file_snippet", `repo://${rel}`, readFileSync(p, "utf8").slice(0, 1200), 0.35);
+        add("file", `repo://${rel}`, readFileSync(p, "utf8").slice(0, 1200), 0.35);
       } else if (existsSync(p) && statSync(p).isDirectory()) {
         const routedOut = await rg(ctx.cwd, focus, p);
         for (const { fileAndLine, content } of parseRgOutput(routedOut, 12)) {
-          if (content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine)) add("file_snippet", `repo://${fileAndLine}`, content, 0.3);
+          if (content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine)) add("file", `repo://${fileAndLine}`, content, 0.3);
         }
       }
     } catch { /* ignore route file */ }
@@ -2128,7 +2128,7 @@ async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, s
   const out = await rg(ctx.cwd, indicators.indicators);
   for (const { fileAndLine, content } of parseRgOutput(out, 30)) {
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicatorText, mode)) continue;
-    add("file_snippet", `repo://${fileAndLine}`, content, 0.15);
+    add("file", `repo://${fileAndLine}`, content, 0.15);
   }
 }
 
@@ -2242,7 +2242,7 @@ async function addSembleCandidates(state: State, ctx: ExtensionContext, focus: s
   const results = await searchSemble(ctx.cwd, query, state.config.semble);
   for (const result of results) {
     if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
-    add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.4);
+    add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.4);
   }
 }
 
@@ -2315,13 +2315,13 @@ async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext,
     const retrySemble = await searchSemble(ctx.cwd, focus, state.config.semble);
     for (const result of retrySemble.slice(0, 8)) {
       if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
-      add("semantic_code_snippet", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
+      add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
     }
   }
   const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
   for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
-    add("file_snippet", `repo://${fileAndLine}`, content, 0.08);
+    add("file", `repo://${fileAndLine}`, content, 0.08);
   }
 }
 
