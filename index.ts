@@ -40,7 +40,7 @@ import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceL
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
-import { approxTokens, isTrivial, score, summarize } from "./lib/text-utils";
+import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { extractUrls } from "./lib/url-utils";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -64,6 +64,7 @@ import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parseSourcePlan } from "./lib/source-planning";
+export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
 export { parseCompiledContextItems }; // re-export so tests/golden-retrieval.test.ts keep working
 export { heuristicSourcePlan }; // re-export so tests/source-plan.test.ts and golden tests keep working
 import { execFile } from "node:child_process";
@@ -1178,15 +1179,6 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
 }
 
 
-
-export function conciseSummary(text: string, max = 420): string {
-  const single = text.replace(/\s+/g, " ").trim();
-  const expandHint = single.match(/\s*\(expand with \/sherpa:expand ctx-\d+\)$/i)?.[0] ?? "";
-  const body = expandHint ? single.slice(0, -expandHint.length).trim() : single;
-  if (body.length + expandHint.length <= max) return single;
-  const room = Math.max(80, max - expandHint.length - 1);
-  return `${body.slice(0, room)}…${expandHint}`;
-}
 
 function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
   // Strip protocol prefix from source for readability
