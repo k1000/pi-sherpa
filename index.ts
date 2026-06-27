@@ -36,6 +36,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
+import { extractUrls } from "./lib/url-utils";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
@@ -429,32 +430,6 @@ function summarize(raw: string, budgetChars = 700) {
   const important = lines.filter(l => /error|fail|exception|warning|todo|fixme|export |function |class |describe\(|it\(/i.test(l));
   const picked = (important.length ? important : lines).slice(0, 10).join("\n");
   return picked.length > budgetChars ? picked.slice(0, budgetChars - 1) + "…" : picked;
-}
-
-function normalizeUrl(raw: string) {
-  const cleaned = raw.trim().replace(/[)\].,;!?]+$/g, "");
-  try {
-    const u = new URL(cleaned);
-    u.hash = "";
-    u.hostname = u.hostname.toLowerCase();
-    if ((u.protocol === "https:" && u.port === "443") || (u.protocol === "http:" && u.port === "80")) u.port = "";
-    for (const key of Array.from(u.searchParams.keys())) {
-      if (/^utm_/i.test(key) || ["fbclid", "gclid", "mc_cid", "mc_eid"].includes(key.toLowerCase())) u.searchParams.delete(key);
-    }
-    u.searchParams.sort();
-    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/g, "");
-    return u.toString();
-  } catch { return cleaned; }
-}
-
-function extractUrls(text: string) {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const match of text.matchAll(/https?:\/\/\S+/g)) {
-    const url = normalizeUrl(match[0]);
-    if (!seen.has(url)) { seen.add(url); out.push(url); }
-  }
-  return out;
 }
 
 const FRONT_DOOR_MAX_DOCS = 2;
