@@ -36,6 +36,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
+import { approxTokens, isTrivial, score, summarize } from "./lib/text-utils";
 import { extractUrls } from "./lib/url-utils";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -410,8 +411,6 @@ function mergeConfig<T>(base: T, over: DeepPartial<T> | undefined): T {
   return out as T;
 }
 
-function approxTokens(s: string) { return Math.ceil(s.length / 4); }
-function isTrivial(text: string) { return text.trim().length < 24 && !/[/.]|error|fail|test|bug|fix|refactor|implement/i.test(text); }
 function shouldAbstain(items: ContextItem[], mode: string) {
   if (!items.length) return "no source-grounded context found";
   const best = items[0]?.relevance ?? 0;
@@ -419,19 +418,6 @@ function shouldAbstain(items: ContextItem[], mode: string) {
   if (best < threshold) return `best relevance ${best.toFixed(2)} below ${threshold}`;
   return "";
 }
-function score(text: string, focus: string) {
-  const words = new Set(focus.toLowerCase().split(/\W+/).filter(w => w.length > 2));
-  let hits = 0; for (const w of words) if (text.toLowerCase().includes(w)) hits++;
-  return words.size ? hits / words.size : 0.1;
-}
-
-function summarize(raw: string, budgetChars = 700) {
-  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  const important = lines.filter(l => /error|fail|exception|warning|todo|fixme|export |function |class |describe\(|it\(/i.test(l));
-  const picked = (important.length ? important : lines).slice(0, 10).join("\n");
-  return picked.length > budgetChars ? picked.slice(0, budgetChars - 1) + "…" : picked;
-}
-
 const FRONT_DOOR_MAX_DOCS = 2;
 const SHERPA_UI_KEY = "ai-sherpa";
 const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
