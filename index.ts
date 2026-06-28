@@ -34,13 +34,14 @@ import {
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
 import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces } from "./lib/dspy";
 import { recordDspyTrace } from "./lib/dspy-trace-recording";
+import { addRuntimeTraceCandidates } from "./lib/runtime-trace-candidates";
 import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
 import { buildContextSignal } from "./lib/context-signal";
 import { createEmptyContextBundle } from "./lib/context-bundle";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
-import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
+import { labelRgSource, readSnippetAround } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
@@ -620,19 +621,6 @@ function mentionedPiExtensionRoots(focus: string): Array<{ name: string; root: s
     }
   }
   return out.slice(0, 4);
-}
-
-function addRuntimeTraceCandidates(ctx: ExtensionContext, focus: string, add: AddContextItem) {
-  if (!isTraceLogMetricsPrompt(focus)) return;
-  const traceDir = path.join(ctx.cwd, ".pi-memory", "sherpa-traces");
-  if (!existsSync(traceDir)) return;
-  const files = latestTraceFiles(traceDir);
-  add("sherpa_trace_location", pathSourceLabel(traceDir, ctx.cwd), [
-    "Sherpa retrieval traces are written under the active cwd, not necessarily under the pi-sherpa extension checkout.",
-    `Active trace directory: ${traceDir}`,
-    files.length ? "Recent trace files:" : "No trace jsonl files found.",
-    ...files.map((file) => traceFileStats(traceDir, file)),
-  ].join("\n"), 0.88);
 }
 
 function addPiSherpaDebugSourceCandidates(ctx: ExtensionContext, focus: string, root: string, add: AddContextItem) {
