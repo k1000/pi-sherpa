@@ -15,6 +15,7 @@ import {
 } from "./lib/automation";
 import type { AutomationState } from "./lib/automation";
 import { graphifyAllowedForQuery, graphifyGraphPath, searchGraphify } from "./lib/graphify-search";
+import { gitChanged } from "./lib/git-status";
 import { getProjectKBBasedir } from "./lib/project-kb";
 import {
   createBundleId,
@@ -652,11 +653,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
   return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
 }
-async function gitChanged(cwd: string) {
-  try { const { stdout } = await execFileAsync("git", ["-C", cwd, "status", "--short"], { timeout: 1500 }); return stdout; }
-  catch { return ""; }
-}
-
 function webAllowed(state: State) {
   return Boolean(state.config.privacy.allowNetwork && state.config.sources.web && state.config.web?.enabled);
 }
