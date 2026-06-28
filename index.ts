@@ -51,7 +51,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
-import { applyConditionalSourceActivation } from "./lib/source-activation";
+import { applyConditionalSourceActivation, retrievalEnabled } from "./lib/source-activation";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
@@ -785,10 +785,6 @@ async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext,
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
     add("file", `repo://${fileAndLine}`, content, 0.08);
   }
-}
-
-function retrievalEnabled(state: State, sourcePlan: SourcePlan) {
-  return (s: Source) => Boolean(state.config.sources[s]) && sourcePlan.sources.includes(s);
 }
 
 function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {

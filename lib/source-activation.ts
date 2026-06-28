@@ -16,3 +16,7 @@ export function applyConditionalSourceActivation<T extends string>(state: Source
     enabledSources: enabledSourceSet(state),
   }) as T[];
 }
+
+export function retrievalEnabled<T extends string>(state: SourceStateLike, sourcePlan: { sources: T[] }) {
+  return (s: T) => Boolean(state.config.sources[s]) && sourcePlan.sources.includes(s);
+}
