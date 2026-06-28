@@ -78,7 +78,7 @@ import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
 import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
-import { signalItemMarkdownItem, signalMarkdown } from "./lib/signal-render";
+import { bundleMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parseSourcePlan, sourcePlanningMessage } from "./lib/source-planning";
 import { associativeMemoryProbes, inferSurrealMemoryTypes, inferSurrealResearchArea, mergeSurrealProbeResults, shouldSearchTranscendentalMemory, surrealArtifactIdFromSource, surrealProbeResults } from "./lib/surreal-retrieval";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -652,11 +652,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
   return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
 }
-function bundleMarkdown(bundle: ContextBundle) {
-  const signal = bundle.signal ?? buildContextSignal(bundle);
-  return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan, bundle.bundleId);
-}
-
 async function gitChanged(cwd: string) {
   try { const { stdout } = await execFileAsync("git", ["-C", cwd, "status", "--short"], { timeout: 1500 }); return stdout; }
   catch { return ""; }
