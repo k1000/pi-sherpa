@@ -73,3 +73,12 @@ export function readExplicitSource(abs: string): { raw: string; boost: number } 
   } catch { /* ignore explicit source read errors */ }
   return undefined;
 }
+
+export type AddExactSourceItem = (type: string, source: string, raw: string, relBoost?: number) => void;
+
+export function addExplicitPathCandidates(cwd: string, focus: string, add: AddExactSourceItem) {
+  for (const p of explicitPathCandidates(focus, cwd)) {
+    const exact = readExplicitSource(p);
+    if (exact) add("file", pathSourceLabel(p, cwd), exact.raw, exact.boost);
+  }
+}

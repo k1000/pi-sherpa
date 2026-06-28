@@ -35,7 +35,7 @@ import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextIt
 import { buildContextSignal } from "./lib/context-signal";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
-import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
+import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, timeoutAfter } from "./lib/model-completion";
@@ -777,13 +777,6 @@ function createEmptyContextBundle(state: State, focus: string, mode: string, can
 
 type AddContextItem = (type: string, source: string, raw: string, relBoost?: number) => void;
 
-function addExplicitPathCandidates(ctx: ExtensionContext, focus: string, add: AddContextItem) {
-  for (const p of explicitPathCandidates(focus, ctx.cwd)) {
-    const exact = readExplicitSource(p);
-    if (exact) add("file", pathSourceLabel(p, ctx.cwd), exact.raw, exact.boost);
-  }
-}
-
 function normalizedName(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -884,7 +877,7 @@ async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, s
 
 
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
-  addExplicitPathCandidates(ctx, focus, add);
+  addExplicitPathCandidates(ctx.cwd, focus, add);
   addRuntimeTraceCandidates(ctx, focus, add);
   await addPiExtensionCandidates(ctx, focus, indicators, add);
   await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
