@@ -40,7 +40,7 @@ import { createEmptyContextBundle } from "./lib/context-bundle";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
-import { labelRgSource, readSnippetAround } from "./lib/file-snippet";
+import { labelRgSource } from "./lib/file-snippet";
 import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "./lib/file-candidates";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
@@ -68,6 +68,7 @@ import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-too
 
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { addMemoryIndexCandidates } from "./lib/memory-index-candidates";
+import { addPiSherpaDebugSourceCandidates } from "./lib/pi-extension-candidates";
 import { applyPersistedState, serializeState } from "./lib/state-persistence";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
 import type { SessionSearchMatch } from "./lib/session-search";
@@ -624,20 +625,6 @@ function mentionedPiExtensionRoots(focus: string): Array<{ name: string; root: s
     }
   }
   return out.slice(0, 4);
-}
-
-function addPiSherpaDebugSourceCandidates(ctx: ExtensionContext, focus: string, root: string, add: AddContextItem) {
-  if (!isPiSherpaMetaDebugPrompt(focus)) return;
-  const dspyPath = path.join(root, "lib", "dspy.ts");
-  const indexPath = path.join(root, "index.ts");
-  if (isTraceLogMetricsPrompt(focus) && existsSync(dspyPath)) {
-    const raw = readSnippetAround(dspyPath, ["dspyTraceDir", "writeDspyTrace", "readDspyTraces", "summarizeDspyTraces"]);
-    if (raw) add("file", pathSourceLabel(dspyPath, ctx.cwd), raw, 0.82);
-  }
-  if (existsSync(indexPath)) {
-    const raw = readSnippetAround(indexPath, ["recordDspyTrace", "buildBundle", "compileContextWithModel", "planSources"]);
-    if (raw) add("file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.66);
-  }
 }
 
 async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
