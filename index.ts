@@ -23,6 +23,7 @@ import {
   getBundle,
   readQualitySummary,
   readRecentEvaluations,
+  restoreBundleRecords,
   stashContextBundle,
   summarizeEvaluations,
   writeEvaluation,
@@ -893,15 +894,6 @@ function createState(ctx: ExtensionContext, config: SherpaConfig): State {
     automationPrompt: automationPrompt.prompt,
     automationPromptSource: automationPrompt.source,
   };
-}
-
-function restoreBundleRecords(records: unknown): Map<string, ContextBundleRecord> {
-  const map = new Map<string, ContextBundleRecord>();
-  if (!Array.isArray(records)) return map;
-  for (const record of records.slice(-20)) {
-    if (record?.bundleId && Array.isArray(record.items)) map.set(record.bundleId, record as ContextBundleRecord);
-  }
-  return map;
 }
 
 function applyPersistedState(state: State, data: PersistedSherpaState): void {

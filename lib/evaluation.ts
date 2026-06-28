@@ -73,6 +73,15 @@ export function getBundle(state: { bundleRecords?: Map<string, ContextBundleReco
   return state.bundleRecords?.get(bundleId);
 }
 
+export function restoreBundleRecords(records: unknown): Map<string, ContextBundleRecord> {
+  const map = new Map<string, ContextBundleRecord>();
+  if (!Array.isArray(records)) return map;
+  for (const record of records.slice(-20)) {
+    if (record?.bundleId && Array.isArray(record.items)) map.set(record.bundleId, record as ContextBundleRecord);
+  }
+  return map;
+}
+
 export function writeEvaluation(projectRoot: string, evalRecord: ContextEvaluation): string {
   const dir = path.join(projectRoot, EVAL_DIR);
   mkdirSync(dir, { recursive: true });
