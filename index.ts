@@ -42,6 +42,7 @@ import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } fr
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
+import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
@@ -53,7 +54,7 @@ import { applyConditionalSourceActivation } from "./lib/source-activation";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
-import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
+import { conciseSummary, isTrivial } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
 import { searchWebForState } from "./lib/web-search";
@@ -635,8 +636,6 @@ function createEmptyContextBundle(state: State, focus: string, mode: string, can
   return bundle;
 }
 
-type AddContextItem = (type: string, source: string, raw: string, relBoost?: number) => void;
-
 function normalizedName(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -802,19 +801,6 @@ async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext,
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
     add("file", `repo://${fileAndLine}`, content, 0.08);
   }
-}
-
-function createContextAdder(state: State, focus: string, candidates: ContextItem[]): AddContextItem {
-  return (type: string, source: string, raw: string, relBoost = 0) => {
-    if (!raw.trim() || isGloballyNoisySource(source)) return;
-    const handle = `ctx-${state.nextHandle++}`;
-    const inline = raw.length <= 700 && !type.includes("session");
-    const summary = summarize(raw);
-    const pointer = inline ? "" : ` (expand with /sherpa:expand ${handle})`;
-    const item: ContextItem = { handle, type, source, relevance: Math.min(1, score(raw + " " + source, focus) + relBoost), summary: summary + pointer, raw, inline };
-    state.handles.set(handle, item);
-    candidates.push(item);
-  };
 }
 
 function retrievalEnabled(state: State, sourcePlan: SourcePlan) {
