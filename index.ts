@@ -1,5 +1,5 @@
 import type { UserMessage } from "@mariozechner/pi-ai";
-import { addDocCandidates, addSessionCandidates } from "./lib/basic-candidate-sources";
+import { addDocCandidates, addSessionCandidates, addUrlReferences } from "./lib/basic-candidate-sources";
 import { candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -56,7 +56,6 @@ import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
-import { extractUrls } from "./lib/url-utils";
 import { searchWebForState } from "./lib/web-search";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -816,15 +815,6 @@ function createContextAdder(state: State, focus: string, candidates: ContextItem
     state.handles.set(handle, item);
     candidates.push(item);
   };
-}
-
-function addUrlReferences(state: State, focus: string, add: AddContextItem) {
-  const urls = state.config.dedupe?.urls?.enabled ? extractUrls(focus) : (focus.match(/https?:\/\/\S+/g) ?? []);
-  for (const url of urls) {
-    add("url_reference", url, state.config.privacy.allowNetwork || state.config.sources.web
-      ? `User provided URL: ${url}. Sherpa did not fetch it yet; the main agent should fetch/read it with an approved web tool if needed.`
-      : `User provided URL: ${url}. Network/web retrieval is disabled in Sherpa privacy settings, so this is passed through as an explicit reference for the main agent.`, 0.9);
-  }
 }
 
 function retrievalEnabled(state: State, sourcePlan: SourcePlan) {
