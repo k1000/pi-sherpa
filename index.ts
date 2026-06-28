@@ -52,7 +52,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
-import { applyConditionalSourceActivation, retrievalEnabled } from "./lib/source-activation";
+import { retrievalEnabled } from "./lib/source-activation";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
@@ -82,7 +82,7 @@ import { matchRoutePlan } from "./lib/route-match";
 import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { bundleMarkdown } from "./lib/signal-render";
-import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parseSourcePlan, sourcePlanningMessage } from "./lib/source-planning";
+import { extractSearchTerms, heuristicIndicators, heuristicSearchIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parsePlannedSourcePlan, sourcePlanningMessage, routedFallbackPlan } from "./lib/source-planning";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
 export { postProcessCandidates }; // re-export so tests/golden-retrieval.test.ts keep working
 export { extractQueryTarget }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -424,35 +424,12 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
   }
 }
 
-function heuristicSearchIndicators(focus: string): SearchIndicators {
-  return { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" };
-}
-
-function routedFallbackPlan(state: State, ctx: ExtensionContext, focus: string, mode: string, routePlan?: RoutePlan): SourcePlan {
-  const fallbackPlan = { ...heuristicSourcePlan(focus, mode), routePlan };
-  if (routePlan) {
-    fallbackPlan.sources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
-    fallbackPlan.reason = `route ${routePlan.name}: ${fallbackPlan.reason}`;
-    fallbackPlan.confidence = Math.max(fallbackPlan.confidence, 0.8);
-  }
-  fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
-  return fallbackPlan;
-}
-
-function parsePlannedSourcePlan(state: State, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
-  if (!parsed?.sources) return null;
-  const sourcePlan = parseSourcePlan(JSON.stringify(parsed.sources), mode);
-  if (!sourcePlan?.sources.length) return null;
-  const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
-  return { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan };
-}
-
 async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
   const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
   const overridden = normalizeSources(sourceOverride, mode);
   if (overridden.length) return { sourcePlan: { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan }, indicators: await inferSearchIndicators(state, ctx, focus) };
 
-  const fallbackPlan = routedFallbackPlan(state, ctx, focus, mode, routePlan);
+  const fallbackPlan = routedFallbackPlan(state, focus, mode, routePlan) as SourcePlan;
   const heuristicInds = heuristicSearchIndicators(focus);
   if (state.config.model.heuristicOnly) {
     return { sourcePlan: { ...fallbackPlan, planner: "fallback", reason: `planner skipped: model.heuristicOnly=true; ${fallbackPlan.reason}` }, indicators: heuristicInds };

@@ -1,6 +1,8 @@
 import type { UserMessage } from "@mariozechner/pi-ai";
 
+import { applyConditionalSourceActivation } from "./source-activation";
 import { extractJsonObject } from "./json-utils";
+import type { RoutePlan } from "./route-map";
 import { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt } from "./query-classifier";
 
 export type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "semble" | "graphify";
@@ -10,7 +12,10 @@ export type SourcePlan = {
   reason: string;
   confidence: number;
   planner: "heuristic" | "llm" | "override" | "fallback";
+  routePlan?: RoutePlan;
 };
+
+type SourceStateLike = { config: { sources: Record<string, boolean> } };
 
 export type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
 
@@ -127,4 +132,27 @@ export function parseSourcePlan(text: string, mode: string): SourcePlan | null {
     confidence: typeof obj.confidence === "number" ? Math.max(0, Math.min(1, obj.confidence)) : 0.5,
     planner: "llm",
   };
+}
+
+export function heuristicSearchIndicators(focus: string): SearchIndicators {
+  return { indicators: heuristicIndicators(focus), reason: "heuristic", confidence: 0.3, planner: "heuristic" };
+}
+
+export function routedFallbackPlan(state: SourceStateLike, focus: string, mode: string, routePlan?: RoutePlan): SourcePlan {
+  const fallbackPlan = { ...heuristicSourcePlan(focus, mode), routePlan };
+  if (routePlan) {
+    fallbackPlan.sources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
+    fallbackPlan.reason = `route ${routePlan.name}: ${fallbackPlan.reason}`;
+    fallbackPlan.confidence = Math.max(fallbackPlan.confidence, 0.8);
+  }
+  fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
+  return fallbackPlan;
+}
+
+export function parsePlannedSourcePlan(state: SourceStateLike, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
+  if (!parsed?.sources) return null;
+  const sourcePlan = parseSourcePlan(JSON.stringify(parsed.sources), mode);
+  if (!sourcePlan?.sources.length) return null;
+  const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
+  return { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan };
 }
