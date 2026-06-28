@@ -13,6 +13,14 @@ export type WebSearchConfig = {
   cacheTtlMs: number;
 };
 
+type WebStateLike = {
+  config: {
+    privacy: { allowNetwork: boolean };
+    sources: { web?: boolean };
+    web: { enabled: boolean; provider: string; apiKeyEnv: string; maxResults?: number; timeoutMs?: number; cacheTtlMs?: number };
+  };
+};
+
 export function webCachePath(cwd: string, query: string, provider: string) {
   const hash = createHash("sha256").update(`${provider}:${query.toLowerCase().trim()}`).digest("hex").slice(0, 24);
   return path.join(cwd, ".pi", "sherpa-cache", "web", `${hash}.json`);
@@ -51,6 +59,31 @@ export async function searchBraveWeb(query: string, apiKey: string, maxResults: 
 export async function runWebProviderSearch(config: WebSearchConfig, signal: AbortSignal): Promise<WebSearchResult[]> {
   if (config.provider === "brave") return searchBraveWeb(config.query, config.apiKey, config.maxResults, signal);
   return [];
+}
+
+export function webAllowed(state: WebStateLike) {
+  return Boolean(state.config.privacy.allowNetwork && state.config.sources.web && state.config.web?.enabled);
+}
+
+export function resolveWebSearchConfig(state: WebStateLike, focus: string, defaultCacheTtlMs: number): WebSearchConfig | null {
+  if (!webAllowed(state)) return null;
+  const provider = state.config.web.provider || "brave";
+  const apiKey = process.env[state.config.web.apiKeyEnv || "BRAVE_SEARCH_API_KEY"];
+  const query = conciseWebQuery(focus);
+  if (!apiKey || !query) return null;
+  return {
+    provider,
+    apiKey,
+    query,
+    maxResults: Math.max(1, Math.min(10, state.config.web.maxResults ?? 5)),
+    timeoutMs: Math.max(1000, Math.min(10000, state.config.web.timeoutMs ?? 5000)),
+    cacheTtlMs: state.config.web.cacheTtlMs ?? defaultCacheTtlMs,
+  };
+}
+
+export async function searchWebForState(cwd: string, state: WebStateLike, focus: string, defaultCacheTtlMs: number): Promise<WebSearchResult[]> {
+  const config = resolveWebSearchConfig(state, focus, defaultCacheTtlMs);
+  return config ? searchWebWithConfig(cwd, config) : [];
 }
 
 export async function searchWebWithConfig(cwd: string, config: WebSearchConfig): Promise<WebSearchResult[]> {

@@ -56,7 +56,7 @@ import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
 import { extractUrls } from "./lib/url-utils";
-import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./lib/web-search";
+import { searchWebForState } from "./lib/web-search";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
@@ -653,10 +653,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
   return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
 }
-function webAllowed(state: State) {
-  return Boolean(state.config.privacy.allowNetwork && state.config.sources.web && state.config.web?.enabled);
-}
-
 function surrealMemoryStore(state: State) {
   const cfg = state.config.memoryStore?.surreal;
   return cfg?.enabled ? new MemoryApiStore(cfg) : undefined;
@@ -731,27 +727,6 @@ async function recordSurrealRetrievalFeedback(state: State, bundle: ContextBundl
     notes: evalRecord.reflection,
     createdAt: new Date().toISOString(),
   }).catch(() => undefined);
-}
-
-function webSearchConfig(state: State, focus: string) {
-  if (!webAllowed(state)) return null;
-  const provider = state.config.web.provider || "brave";
-  const apiKey = process.env[state.config.web.apiKeyEnv || "BRAVE_SEARCH_API_KEY"];
-  const query = conciseWebQuery(focus);
-  if (!apiKey || !query) return null;
-  return {
-    provider,
-    apiKey,
-    query,
-    maxResults: Math.max(1, Math.min(10, state.config.web.maxResults ?? 5)),
-    timeoutMs: Math.max(1000, Math.min(10000, state.config.web.timeoutMs ?? 5000)),
-    cacheTtlMs: state.config.web.cacheTtlMs ?? DEFAULT_CONFIG.web.cacheTtlMs,
-  };
-}
-
-async function searchWeb(state: State, ctx: ExtensionContext, focus: string): Promise<WebSearchResult[]> {
-  const config = webSearchConfig(state, focus);
-  return config ? searchWebWithConfig(ctx.cwd, config) : [];
 }
 
 function createEmptyContextBundle(state: State, focus: string, mode: string, candidates: ContextItem[], sourcePlan: SourcePlan): ContextBundle {
@@ -1017,7 +992,7 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   })());
   if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
   if (enabled("git") && focusAllowsGitStatus(focus)) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
-  if (enabled("web")) tasks.push((async () => { for (const r of await searchWeb(state, ctx, focus)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
+  if (enabled("web")) tasks.push((async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
   if (enabled("surreal_memory")) tasks.push(addSurrealMemoryCandidates(state, ctx, focus, indicators, add));
   if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
   if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
