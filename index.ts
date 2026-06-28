@@ -42,6 +42,7 @@ import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
 import { labelRgSource, readSnippetAround } from "./lib/file-snippet";
+import { addIndicatorFileCandidates, addRoutedFileCandidates } from "./lib/file-candidates";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
@@ -657,33 +658,6 @@ async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, in
     }
   }
 }
-
-async function addRoutedFileCandidates(ctx: ExtensionContext, focus: string, sourcePlan: SourcePlan, add: AddContextItem) {
-  for (const rel of sourcePlan?.routePlan?.read ?? []) {
-    if (routeSkipsPath(sourcePlan?.routePlan, rel)) continue;
-    const p = path.isAbsolute(rel) ? rel : path.join(ctx.cwd, rel);
-    try {
-      if (existsSync(p) && statSync(p).isFile()) {
-        add("file", `repo://${rel}`, readFileSync(p, "utf8").slice(0, 1200), 0.35);
-      } else if (existsSync(p) && statSync(p).isDirectory()) {
-        const routedOut = await rg(ctx.cwd, focus, p);
-        for (const { fileAndLine, content } of parseRgOutput(routedOut, 12)) {
-          if (content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine)) add("file", `repo://${fileAndLine}`, content, 0.3);
-        }
-      }
-    } catch { /* ignore route file */ }
-  }
-}
-
-async function addIndicatorFileCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
-  const indicatorText = indicators.indicators.join(" ");
-  const out = await rg(ctx.cwd, indicators.indicators);
-  for (const { fileAndLine, content } of parseRgOutput(out, 30)) {
-    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicatorText, mode)) continue;
-    add("file", `repo://${fileAndLine}`, content, 0.15);
-  }
-}
-
 
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   addExplicitPathCandidates(ctx.cwd, focus, add);
