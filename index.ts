@@ -23,7 +23,6 @@ import {
   getBundle,
   readQualitySummary,
   readRecentEvaluations,
-  restoreBundleRecords,
   stashContextBundle,
   summarizeEvaluations,
   writeEvaluation,
@@ -69,6 +68,7 @@ import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-too
 
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { addMemoryIndexCandidates } from "./lib/memory-index-candidates";
+import { applyPersistedState, serializeState } from "./lib/state-persistence";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
 import type { SessionSearchMatch } from "./lib/session-search";
 import { writeNudge } from "./lib/nudge";
@@ -770,33 +770,6 @@ function createState(ctx: ExtensionContext, config: SherpaConfig): State {
     documentationPromptSource: documentationPrompt.source,
     automationPrompt: automationPrompt.prompt,
     automationPromptSource: automationPrompt.source,
-  };
-}
-
-function applyPersistedState(state: State, data: PersistedSherpaState): void {
-  state.nextHandle = Math.max(state.nextHandle, data.nextHandle ?? 1);
-  state.bundles = data.bundles ?? state.bundles;
-  state.feedback = data.feedback ?? state.feedback;
-  state.automation = { ...state.automation, ...(data.automation ?? {}) };
-  state.lifecycleHashes = Array.isArray(data.lifecycleHashes) ? data.lifecycleHashes : state.lifecycleHashes;
-  state.evaluationHashes = Array.isArray(data.evaluationHashes) ? data.evaluationHashes : state.evaluationHashes;
-  state.lastBundleId = data.lastBundleId ?? state.lastBundleId;
-  state.dspyAuto = { ...state.dspyAuto, ...(data.dspyAuto ?? {}) };
-  state.bundleRecords = restoreBundleRecords(data.bundleRecords);
-}
-
-function serializeState(state: State): PersistedSherpaState {
-  return {
-    nextHandle: state.nextHandle,
-    bundles: state.bundles,
-    feedback: state.feedback,
-    automation: state.automation,
-    lifecycleHashes: state.lifecycleHashes,
-    evaluationHashes: state.evaluationHashes,
-    lastBundleId: state.lastBundleId,
-    dspyAuto: state.dspyAuto,
-    bundleRecords: [...state.bundleRecords.values()],
-    config: state.config,
   };
 }
 
