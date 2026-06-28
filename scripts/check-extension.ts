@@ -18,6 +18,22 @@ function run(command: string[], cwd = sherpaDir) {
   if (result.exitCode !== 0) process.exit(result.exitCode);
 }
 
+function checkNoUnresolvedTypeScriptSymbols() {
+  const result = Bun.spawnSync(["tsc", "-p", "tsconfig.check.json", "--pretty", "false"], { cwd: sherpaDir, stdout: "pipe", stderr: "pipe" });
+  const output = `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`;
+  const fatal = output.split(/\r?\n/).filter((line) => /error TS(2304|2305|2307|2552):/.test(line));
+  if (fatal.length) {
+    console.error("\n❌ TypeScript unresolved-symbol guard failed");
+    console.error(fatal.join("\n"));
+    process.exit(1);
+  }
+  if (result.exitCode !== 0) {
+    console.log("\nℹ TypeScript unresolved-symbol guard passed (broader type errors are currently non-gating).");
+  } else {
+    console.log("\n✅ TypeScript unresolved-symbol guard passed");
+  }
+}
+
 if (!existsSync(sherpaDir)) {
   throw new Error(`Sherpa extension directory not found: ${sherpaDir}`);
 }
@@ -30,6 +46,9 @@ if (!existsSync(testsDir)) {
 const tests = readdirSync(testsDir)
   .filter((file) => file.endsWith(".test.ts"))
   .sort();
+
+console.log("\n▶ unresolved-symbol guard");
+checkNoUnresolvedTypeScriptSymbols();
 
 for (const test of tests) {
   const testPath = path.join(testsDir, test);

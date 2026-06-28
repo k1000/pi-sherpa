@@ -38,7 +38,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
-import { extractJsonArray } from "./lib/json-utils";
+import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
@@ -1293,6 +1293,15 @@ function webAllowed(state: State) {
 function surrealMemoryStore(state: State) {
   const cfg = state.config.memoryStore?.surreal;
   return cfg?.enabled ? new MemoryApiStore(cfg) : undefined;
+}
+
+async function runDspyPromptCompile(cwd: string) {
+  const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
+  const projectPrompt = path.join(cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
+  const basePrompt = existsSync(projectPrompt) ? projectPrompt : path.join(path.dirname(__filename), "prompts", "RETRIEVAL.md");
+  const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
+  const result = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+  return { ...result, candidateDir };
 }
 
 async function requestQueryEmbedding(text: string): Promise<number[] | undefined> {
