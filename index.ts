@@ -66,6 +66,7 @@ import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-sour
 import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
+import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parseSourcePlan } from "./lib/source-planning";
 import { associativeMemoryProbes, inferSurrealMemoryTypes, inferSurrealResearchArea, mergeSurrealProbeResults, shouldSearchTranscendentalMemory, surrealArtifactIdFromSource, surrealProbeResults } from "./lib/surreal-retrieval";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -452,40 +453,6 @@ function applyConditionalSourceActivation(state: State, focus: string, mode: str
     query: focus,
     enabledSources: enabledSourceSet(state),
   }) as Source[];
-}
-
-function sessionText(ctx: ExtensionContext) {
-  try { return JSON.stringify(ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries()); }
-  catch { return ""; }
-}
-
-function previouslyShownSourceSet(items: ContextItem[], state?: State): Set<string> {
-  const previouslyShownSources = new Set<string>();
-  const currentHandles = new Set(items.map((item) => item.handle));
-  if (state) {
-    for (const item of state.handles.values()) {
-      if (currentHandles.has(item.handle)) continue;
-      if (item.source) {
-        previouslyShownSources.add(item.source);
-        const noLines = item.source.replace(/:\d+(-\d+)?$/g, "");
-        if (noLines !== item.source) previouslyShownSources.add(noLines);
-      }
-    }
-  }
-  return previouslyShownSources;
-}
-
-function itemAlreadySeen(ctx: ExtensionContext, item: ContextItem, previousSources: Set<string>, text = sessionText(ctx)): boolean {
-  if (previousSources.has(item.source)) return true;
-  const normalized = item.source.replace(/:\d+(-\d+)?$/g, "");
-  if (normalized !== item.source && previousSources.has(normalized)) return true;
-  return Boolean(text && text.includes(item.source));
-}
-
-function filterAlreadySeenSources(ctx: ExtensionContext, items: ContextItem[], state?: State) {
-  const text = sessionText(ctx);
-  const previousSources = previouslyShownSourceSet(items, state);
-  return items.filter((item) => !itemAlreadySeen(ctx, item, previousSources, text));
 }
 
 function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode: string) {
