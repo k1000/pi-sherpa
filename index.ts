@@ -1,4 +1,5 @@
 import type { UserMessage } from "@mariozechner/pi-ai";
+import { addDocCandidates, addSessionCandidates } from "./lib/basic-candidate-sources";
 import { candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -35,7 +36,7 @@ import { recordDspyTrace } from "./lib/dspy-trace-recording";
 import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
 import { buildContextSignal } from "./lib/context-signal";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
-import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
+import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
@@ -768,19 +769,6 @@ async function addSembleCandidates(state: State, ctx: ExtensionContext, focus: s
     if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
     add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.4);
   }
-}
-
-function addDocCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
-  const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan);
-  for (const f of docFiles) {
-    const p = path.join(ctx.cwd, f);
-    if (existsSync(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
-  }
-}
-
-function addSessionCandidates(ctx: ExtensionContext, add: AddContextItem) {
-  const recent = ctx.sessionManager.getEntries().slice(-25).map((e: any) => JSON.stringify(e).slice(0, 500)).join("\n");
-  add("session_recent", "session://recent", recent, 0.05);
 }
 
 function addMemoryIndexCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
