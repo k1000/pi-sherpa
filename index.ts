@@ -50,7 +50,7 @@ import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
-import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
@@ -81,7 +81,7 @@ import { parseGitStatusFiles } from "./lib/common";
 import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
-import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
+import { applyRetrievalFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { bundleMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSearchIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parsePlannedSourcePlan, sourcePlanningMessage, routedFallbackPlan } from "./lib/source-planning";
@@ -744,21 +744,6 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   return tasks;
 }
 
-function applyRetrievalFeedback(state: State, focus: string, candidates: ContextItem[]) {
-  try {
-    const memoryRoot = obsidianMemoryPath(state);
-    const recentEvaluations = readRecentEvaluations(memoryRoot, 200);
-    const qualitySummary = readQualitySummary(memoryRoot);
-    const adjusted = applyEvaluationFeedbackToCandidates(candidates, recentEvaluations, qualitySummary, { focus });
-    candidates.splice(0, candidates.length, ...adjusted);
-    applySessionUsageFeedback(state, candidates);
-    return { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
-  } catch {
-    applySessionUsageFeedback(state, candidates);
-    return {};
-  }
-}
-
 async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
   const enabled = retrievalEnabled(state, sourcePlan);
   const candidates: ContextItem[] = [];
@@ -768,7 +753,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled));
   await retryFrontDoorFileCandidates(state, ctx, focus, mode, sourcePlan, candidates, add, enabled);
 
-  const traceFeedback = applyRetrievalFeedback(state, focus, candidates);
+  const traceFeedback = applyRetrievalFeedback(state, focus, candidates, obsidianMemoryPath(state));
   let compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
 
   // Escalation tier: when the deterministic fast path + model filter abstained due to

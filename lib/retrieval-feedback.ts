@@ -1,6 +1,9 @@
 import path from "node:path";
 
-/** Session-local retrieval feedback adjustments. */
+import { readQualitySummary, readRecentEvaluations } from "./evaluation";
+import { applyEvaluationFeedbackToCandidates } from "./post-task-evaluation";
+
+/** Session-local and persisted retrieval feedback adjustments. */
 
 type FeedbackRecordLike = { used?: string[]; unused?: string[]; missing?: string[]; at?: number };
 type FeedbackStateLike = { feedback?: FeedbackRecordLike[] };
@@ -21,5 +24,19 @@ export function applySessionUsageFeedback<T extends ContextItemLike>(state: Feed
         if (unused && candidate.source === unused) candidate.relevance = Math.max(0, candidate.relevance - 0.3);
       }
     }
+  }
+}
+
+export function applyRetrievalFeedback<T extends ContextItemLike>(state: FeedbackStateLike, focus: string, candidates: T[], memoryRoot: string) {
+  try {
+    const recentEvaluations = readRecentEvaluations(memoryRoot, 200);
+    const qualitySummary = readQualitySummary(memoryRoot);
+    const adjusted = applyEvaluationFeedbackToCandidates(candidates, recentEvaluations, qualitySummary, { focus });
+    candidates.splice(0, candidates.length, ...adjusted);
+    applySessionUsageFeedback(state, candidates);
+    return { recentEvaluations: recentEvaluations.length, qualitySummaryUsed: Boolean(qualitySummary) };
+  } catch {
+    applySessionUsageFeedback(state, candidates);
+    return {};
   }
 }
