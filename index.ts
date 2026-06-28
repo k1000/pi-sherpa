@@ -35,6 +35,7 @@ import { inferSuggestedCommands, inferTaskType, isDirectAnswerCandidate, whyItem
 import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
 import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
+import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
@@ -382,31 +383,6 @@ function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode
 
 function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
-}
-
-type SherpaModelAuth = { model: any; auth: any };
-
-function notifySherpaModelFallback(ctx: ExtensionContext, reason: string): void {
-  try {
-    if (ctx.hasUI) ctx.ui.notify(`Sherpa sidecar model unavailable; using heuristic fallback: ${reason}`, "warning");
-  } catch { /* notification must not break retrieval */ }
-}
-
-async function getSherpaModelAuthWithReason(state: State, ctx: ExtensionContext): Promise<{ ok: true; value: SherpaModelAuth } | { ok: false; reason: string }> {
-  if (!state.config.privacy.allowRemoteModel && !state.config.model.useMainPiModel) {
-    return { ok: false, reason: "remote model disabled by privacy.allowRemoteModel=false" };
-  }
-  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) return { ok: false, reason: `model not found: ${state.config.model.provider}/${state.config.model.id}` };
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) return { ok: false, reason: `auth failed: ${(auth as any).error ?? model.provider}` };
-  if (!auth.apiKey) return { ok: false, reason: `missing API key for ${model.provider}` };
-  return { ok: true, value: { model, auth } };
-}
-
-async function getSherpaModelAuth(state: State, ctx: ExtensionContext): Promise<SherpaModelAuth | undefined> {
-  const result = await getSherpaModelAuthWithReason(state, ctx);
-  return result.ok ? result.value : undefined;
 }
 
 async function completeJsonObjectWithTimeout(state: State, ctx: ExtensionContext, model: any, auth: any, message: UserMessage, timeoutMs: number, timeoutMessage: string) {
