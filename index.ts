@@ -43,7 +43,8 @@ import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } f
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
-import { extractQueryTarget, inferConditionalTaskType } from "./lib/query-target";
+import { extractQueryTarget } from "./lib/query-target";
+import { applyConditionalSourceActivation } from "./lib/source-activation";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
@@ -58,7 +59,6 @@ export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so t
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
 import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-tools";
 
-import { filterActiveSources } from "./lib/conditional-source";
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
 import type { SessionSearchMatch } from "./lib/session-search";
@@ -361,18 +361,6 @@ const SOURCE_PLANNER_TIMEOUT_MS = 12_000;
 const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
-
-function enabledSourceSet(state: State): Set<string> {
-  return new Set(Object.entries(state.config.sources).filter(([, enabled]) => Boolean(enabled)).map(([source]) => source));
-}
-
-function applyConditionalSourceActivation(state: State, focus: string, mode: string, sources: Source[]): Source[] {
-  return filterActiveSources(sources, {
-    taskType: inferConditionalTaskType(focus, mode),
-    query: focus,
-    enabledSources: enabledSourceSet(state),
-  }) as Source[];
-}
 
 function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode: string) {
   return postProcessCandidates(candidates, focus, mode);
