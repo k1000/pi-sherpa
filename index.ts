@@ -47,6 +47,7 @@ import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import { traceDecisions, traceFeedbackStats, traceItem, traceStageLabels } from "./lib/trace-helpers";
+import type { ContextDisposition, ContextSignalItem, ContextSignalV1, ProposedResponse, SmallEditPlan, SuggestedCommand } from "./lib/context-types";
 import { extractUrls } from "./lib/url-utils";
 import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./lib/web-search";
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
@@ -69,6 +70,7 @@ import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
+import { signalItemMarkdownItem, signalMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parseSourcePlan } from "./lib/source-planning";
 import { associativeMemoryProbes, inferSurrealMemoryTypes, inferSurrealResearchArea, mergeSurrealProbeResults, shouldSearchTranscendentalMemory, surrealArtifactIdFromSource, surrealProbeResults } from "./lib/surreal-retrieval";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -161,56 +163,6 @@ type CurateResult = {
   plannerReason?: string;
 };
 type ContextBundle = { bundleId: string; taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
-
-type ContextDisposition =
-  | { kind: "answer_directly"; reason: string }
-  | { kind: "small_edit"; reason: string; editPlan: SmallEditPlan }
-  | { kind: "provide_context"; reason: string }
-  | { kind: "abstain"; reason: string };
-
-type ContextSignalItem = {
-  handle: string;
-  type: string;
-  source: string;
-  relevance: number;
-  summary: string;
-  why: string;
-  inline?: string;
-};
-
-type SuggestedCommand = { command: string; reason: string };
-type SmallEditPlan = {
-  confidence: number;
-  risk: "low" | "medium";
-  files: Array<{ source: string; changeType: "replace" | "append" | "create"; summary: string }>;
-  validation: SuggestedCommand[];
-  requiresApproval: boolean;
-};
-type ProposedResponse = {
-  kind: "answer" | "edit_plan" | "context";
-  content: string;
-  citations: Array<{ source: string; handle?: string }>;
-  caveats: string[];
-};
-type ContextSignalV1 = {
-  version: "1";
-  focus: string;
-  taskType: string;
-  confidence: number;
-  disposition: ContextDisposition;
-  proposedResponse?: ProposedResponse;
-  items: ContextSignalItem[];
-  risks: string[];
-  missingInfo: string[];
-  suggestedCommands: SuggestedCommand[];
-  openingRecommendation?: {
-    likelyUseful: string[];
-    likelyNoise: string[];
-    missingInfoNeeded: string[];
-  };
-  renderHints?: { style: "minimal" | "normal" | "detailed"; maxItems?: number };
-  diagnostics: { sourcesSearched: string[]; candidateCount: number; selectedCount: number };
-};
 
 type State = {
   config: SherpaConfig;
@@ -1009,21 +961,6 @@ function buildContextSignal(bundle: ContextBundle): ContextSignalV1 {
 }
 
 
-
-function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): string {
-  // Strip protocol prefix from source for readability
-  const shortSource = i.source.replace(/^(file|repo):\/\//, "");
-  const body = i.inline
-    ? `\n\`\`\`\n${i.inline}\n\`\`\``
-    : `\n  ${conciseSummary(i.summary)}`;
-  return `- ${i.handle} — ${shortSource}${body}`;
-}
-
-function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: SourcePlan, bundleId?: string) {
-  const bundleLine = bundleId ? `\nBundle: ${bundleId}` : "";
-  if (signal.disposition.kind === "abstain") return "";
-  return `## Context${bundleLine}\n${signal.items.slice(0, signal.renderHints?.maxItems ?? 5).map(signalItemMarkdownItem).join("\n")}`;
-}
 
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
