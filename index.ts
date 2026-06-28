@@ -74,14 +74,12 @@ import { catalogMatches, readGlobalTaxonomy } from "./lib/catalog";
 import { addCurrentProjectMemory, addOntologyFallbackMemory, addOtherProjectMemory, addResearchMemory, addTaxonomyMemory } from "./lib/project-memory-readers";
 import { parseGitStatusFiles } from "./lib/common";
 import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
-import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
 import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { bundleMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parseSourcePlan, sourcePlanningMessage } from "./lib/source-planning";
-import { associativeMemoryProbes, inferSurrealMemoryTypes, inferSurrealResearchArea, mergeSurrealProbeResults, shouldSearchTranscendentalMemory, surrealArtifactIdFromSource, surrealProbeResults } from "./lib/surreal-retrieval";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
 export { postProcessCandidates }; // re-export so tests/golden-retrieval.test.ts keep working
 export { extractQueryTarget }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -130,7 +128,7 @@ function loadSherpaSystemPrompt(cwd: string, config?: Partial<SherpaConfig>) {
 
 
 type Mode = "auto" | "explicit" | "proactive" | "off";
-type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "surreal_memory" | "semble" | "graphify";
+type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "semble" | "graphify";
 
 type SherpaConfig = {
   enabled: boolean;
@@ -146,8 +144,6 @@ type SherpaConfig = {
   web: { enabled: boolean; provider: "brave" | "tavily" | "serpapi"; apiKeyEnv: string; maxResults: number; timeoutMs: number; cacheTtlMs: number };
   semble: { enabled: boolean; command: string; topK: number; timeoutMs: number };
   graphify: { enabled: boolean; command: string; graphPath: string; timeoutMs: number; budgetTokens: number; maxLines: number; };
-  memoryStore: { surreal: MemoryApiStoreConfig };
-  surrealMemory: { chainWeightBoost: number; constrainedLimit: number; broadFallbackLimit: number; evidenceDepth: number };
   routeMap: { enabled: boolean; path: string; applyTo: "all" | "front-door" | "explicit" };
   dedupe: { urls: { enabled: boolean; normalize: boolean; scope: "bundle" } };
   dspy: {
@@ -251,7 +247,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   frontDoor: { enabled: true, tokenBudget: 1200 },
   explicit: { enabled: true, tokenBudget: 3000 },
   proactive: { enabled: false, tokenBudget: 800, cooldownTurns: 3 },
-  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true, surreal_memory: false, semble: true, graphify: true },
+  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true, semble: true, graphify: true },
   privacy: { allowNetwork: false, allowRemoteModel: false },
   model: { provider: "olmx", id: "Qwen3.6-35B-A3B-4bit", useMainPiModel: false, heuristicOnly: false, fallbackToHeuristics: true },
   summarization: { maxToolResultChars: 12000, replacementBudget: 1500 },
@@ -259,8 +255,6 @@ const DEFAULT_CONFIG: SherpaConfig = {
   web: { enabled: false, provider: "brave", apiKeyEnv: "BRAVE_SEARCH_API_KEY", maxResults: 5, timeoutMs: 5000, cacheTtlMs: 6 * 60 * 60 * 1000 },
   semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
   graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
-  memoryStore: { surreal: { enabled: false, mode: "memory-api", url: "http://127.0.0.1:8010", namespace: "pi", database: "memory", userEnv: "SURREAL_USER", passEnv: "SURREAL_PASS" } },
-  surrealMemory: { chainWeightBoost: 0.12, constrainedLimit: 8, broadFallbackLimit: 4, evidenceDepth: 2 },
   routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
   dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
@@ -653,11 +647,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
   return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
 }
-function surrealMemoryStore(state: State) {
-  const cfg = state.config.memoryStore?.surreal;
-  return cfg?.enabled ? new MemoryApiStore(cfg) : undefined;
-}
-
 async function runDspyPromptCompile(cwd: string) {
   const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
   const projectPrompt = path.join(cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
@@ -665,68 +654,6 @@ async function runDspyPromptCompile(cwd: string) {
   const candidateDir = path.join(".pi", "sherpa", "compiled-candidates");
   const result = await execFileAsync("python3", [scriptPath, "--base-prompt", basePrompt, "--out-dir", candidateDir], { cwd, timeout: 120_000, maxBuffer: 1_000_000 });
   return { ...result, candidateDir };
-}
-
-async function requestQueryEmbedding(text: string): Promise<number[] | undefined> {
-  const apiKey = process.env.EMBEDDING_API_KEY;
-  if (!apiKey || !text.trim()) return undefined;
-  const baseUrl = process.env.EMBEDDING_BASE_URL || "https://api.openai.com/v1";
-  const model = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/embeddings`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({ model, input: [text] }),
-  }).catch(() => undefined);
-  if (!response?.ok) return undefined;
-  const payload = await response.json().catch(() => undefined) as { data?: Array<{ embedding?: number[] }> } | undefined;
-  return payload?.data?.[0]?.embedding?.map(Number);
-}
-
-function surrealSearchLimits(state: State) {
-  return {
-    constrainedLimit: Math.max(1, Math.min(30, state.config.surrealMemory?.constrainedLimit ?? DEFAULT_CONFIG.surrealMemory.constrainedLimit)),
-    broadFallbackLimit: Math.max(0, Math.min(20, state.config.surrealMemory?.broadFallbackLimit ?? DEFAULT_CONFIG.surrealMemory.broadFallbackLimit)),
-  };
-}
-
-async function searchSurrealAssociativeMemory(state: State, focus: string, indicators: SearchIndicators, project: string): Promise<MemoryResult[]> {
-  const store = surrealMemoryStore(state);
-  if (!store) return [];
-  const merged = new Map<string, MemoryResult>();
-  const probes = associativeMemoryProbes(focus, indicators);
-  const types = inferSurrealMemoryTypes(focus);
-  const area = inferSurrealResearchArea(focus);
-  const includeTranscendental = shouldSearchTranscendentalMemory(focus);
-  const limits = surrealSearchLimits(state);
-  const queryEmbedding = await requestQueryEmbedding(focus);
-  for (const [index, probe] of probes.entries()) {
-    const embedding = index === 0 ? queryEmbedding : undefined;
-    const results = await surrealProbeResults(store, probe, project, types, area, includeTranscendental, embedding, limits);
-    mergeSurrealProbeResults(merged, results, probe, index);
-  }
-  return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 8);
-}
-
-async function recordSurrealRetrievalFeedback(state: State, bundle: ContextBundleRecord, evalRecord: { noise: string[]; missed: string[]; scores: { relevance: number }; reflection?: string }) {
-  const store = surrealMemoryStore(state);
-  if (!store) return;
-  const selectedIds = (bundle.items ?? []).map((item) => surrealArtifactIdFromSource(item.source)).filter((id): id is string => Boolean(id));
-  if (!selectedIds.length && !evalRecord.missed.length) return;
-  const unusedIds = (bundle.items ?? [])
-    .filter((item) => evalRecord.noise.includes(item.source))
-    .map((item) => surrealArtifactIdFromSource(item.source))
-    .filter((id): id is string => Boolean(id));
-  const usedIds = selectedIds.filter((id) => !unusedIds.includes(id));
-  await store.recordFeedback({
-    query: bundle.focus,
-    selectedIds,
-    usedIds,
-    unusedIds,
-    missing: evalRecord.missed,
-    outcome: evalRecord.scores.relevance >= 0.7 ? "helpful" : evalRecord.scores.relevance >= 0.35 ? "partial" : "unhelpful",
-    notes: evalRecord.reflection,
-    createdAt: new Date().toISOString(),
-  }).catch(() => undefined);
 }
 
 function createEmptyContextBundle(state: State, focus: string, mode: string, candidates: ContextItem[], sourcePlan: SourcePlan): ContextBundle {
@@ -877,34 +804,6 @@ async function addSembleCandidates(state: State, ctx: ExtensionContext, focus: s
   }
 }
 
-async function addSurrealMemoryCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
-  const store = surrealMemoryStore(state);
-  if (!store) return;
-  const results = await searchSurrealAssociativeMemory(state, focus, indicators, path.basename(ctx.cwd));
-  for (const result of results) {
-    const evidenceDepth = Math.max(1, Math.min(3, state.config.surrealMemory?.evidenceDepth ?? DEFAULT_CONFIG.surrealMemory.evidenceDepth));
-    const evidenceChain = result.evidenceChain?.length ? result.evidenceChain : await store.retrieveEvidenceChain(result.artifact.id, { depth: evidenceDepth, limit: 10 }).catch(() => []);
-    const chainWeight = Math.max(0, ...evidenceChain.map((step) => Number(step.summary?.match(/weight=([0-9.]+)/)?.[1] ?? 0)));
-    const chain = evidenceChain.length
-      ? `\n\nEvidence chain:\n${evidenceChain.map((step) => `- ${step.from} -[${step.relation}]-> ${step.to}${step.summary ? ` (${step.summary})` : ""}`).join("\n")}`
-      : "";
-    const raw = [
-      `Scope: ${result.artifact.scope}`,
-      result.artifact.project ? `Project: ${result.artifact.project}` : "",
-      result.artifact.area ? `Area: ${result.artifact.area}` : "",
-      `Type: ${result.artifact.type}`,
-      `Title: ${result.artifact.title}`,
-      result.artifact.summary ? `Summary: ${result.artifact.summary}` : "",
-      result.artifact.sourcePath ? `Source: ${result.artifact.sourcePath}` : "",
-      "",
-      result.artifact.text ?? "",
-      chain,
-    ].filter(Boolean).join("\n");
-    const chainWeightBoost = Math.max(0, Math.min(1, state.config.surrealMemory?.chainWeightBoost ?? DEFAULT_CONFIG.surrealMemory.chainWeightBoost));
-    add("surreal_memory", `surreal://${result.artifact.id}`, raw, Math.max(0.28, result.score + (chainWeight * chainWeightBoost)));
-  }
-}
-
 function addDocCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan);
   for (const f of docFiles) {
@@ -993,7 +892,6 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
   if (enabled("git") && focusAllowsGitStatus(focus)) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
   if (enabled("web")) tasks.push((async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
-  if (enabled("surreal_memory")) tasks.push(addSurrealMemoryCandidates(state, ctx, focus, indicators, add));
   if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
   if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
   if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(state, ctx, focus, indicators, add)));
@@ -1379,7 +1277,6 @@ export default function (pi: ExtensionAPI) {
       }
       stateObj.evaluationHashes = [...stateObj.evaluationHashes.slice(-49), bundle.bundleId];
       stateObj.lastBundleId = undefined;
-      void recordSurrealRetrievalFeedback(stateObj, bundle, evalRecord);
       void maybeAutoCompileDspy(ctx, "evaluate");
     } catch { /* retrieval evaluation must never affect task completion */ }
   };
@@ -1906,7 +1803,6 @@ export default function (pi: ExtensionAPI) {
     };
     const target = writeEvaluation(memoryRoot, evalRecord);
     writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
-    if (parsed.bundle) void recordSurrealRetrievalFeedback(state, parsed.bundle, evalRecord);
     ctx.ui.notify(`Sherpa evaluation written: ${path.relative(memoryRoot, target)}`, "info");
     void maybeAutoCompileDspy(ctx, "evaluate");
   }});
@@ -2121,7 +2017,7 @@ export default function (pi: ExtensionAPI) {
       `distillPrompt=${state.distillPromptSource}`,
       `documentationPrompt=${state.documentationPromptSource}`,
       `automationPrompt=${state.automationPromptSource}`,
-      `surrealMemory=${state.config.memoryStore.surreal.enabled ? `${state.config.memoryStore.surreal.url} mode=${state.config.memoryStore.surreal.mode ?? "memory-api"} ns=${state.config.memoryStore.surreal.namespace} db=${state.config.memoryStore.surreal.database}; source=${state.config.sources.surreal_memory ? "on" : "off"}; depth=${state.config.surrealMemory.evidenceDepth}; chainBoost=${state.config.surrealMemory.chainWeightBoost}` : "disabled"}`,
+      `inquirerMemory=managed-by-Archivist/Inquirer (Sherpa has no direct Surreal source)`,
       `lastSkip=${state.lastSkip}`,
     ].join("\n"), "info");
   }});

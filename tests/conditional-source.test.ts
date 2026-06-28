@@ -24,7 +24,7 @@ function assertEqual(a: unknown, b: unknown, msg: string) {
 const allEnabled: ActivationContext = {
   taskType: "refactor",
   query: "How does the error pipeline work?",
-  enabledSources: new Set(["files", "git", "docs", "session", "semble", "graphify", "project_memory", "surreal_memory", "web", "logs"]),
+  enabledSources: new Set(["files", "git", "docs", "session", "semble", "graphify", "project_memory", "web", "logs"]),
 };
 
 test("source without conditions is always active when enabled", () => {
@@ -62,11 +62,11 @@ test("queryPattern condition matches", () => {
 
 test("requireSources condition (AND)", () => {
   const source: ConditionalSource = {
-    id: "surreal_memory", label: "Surreal",
+    id: "semantic_memory", label: "Semantic memory",
     when: { requireSources: ["project_memory"] },
   };
-  const withBoth: ActivationContext = { ...allEnabled, enabledSources: new Set(["project_memory", "surreal_memory"]) };
-  const withoutProj: ActivationContext = { ...allEnabled, enabledSources: new Set(["surreal_memory"]) };
+  const withBoth: ActivationContext = { ...allEnabled, enabledSources: new Set(["project_memory", "semantic_memory"]) };
+  const withoutProj: ActivationContext = { ...allEnabled, enabledSources: new Set(["semantic_memory"]) };
   assertEqual(evaluateSource(source, withBoth), "active", "active when required source present");
   assertEqual(evaluateSource(source, withoutProj), "inactive", "inactive when required source missing");
 });

@@ -3,7 +3,7 @@ import type { UserMessage } from "@mariozechner/pi-ai";
 import { extractJsonObject } from "./json-utils";
 import { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt } from "./query-classifier";
 
-export type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "surreal_memory" | "semble" | "graphify";
+export type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "semble" | "graphify";
 
 export type SourcePlan = {
   sources: Source[];
@@ -14,11 +14,11 @@ export type SourcePlan = {
 
 export type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
 
-const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "semble", "graphify", "docs", "git", "session", "project_memory", "surreal_memory", "web"];
+const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "semble", "graphify", "docs", "git", "session", "project_memory", "web"];
 
 export function normalizeSources(input: string[] | undefined, mode: string): Source[] {
   const allowed = new Set<Source>(mode === "front-door"
-    ? ["files", "semble", "graphify", "docs", "git", "project_memory", "surreal_memory", "web"]
+    ? ["files", "semble", "graphify", "docs", "git", "project_memory", "web"]
     : ALL_RETRIEVAL_SOURCES);
   const out: Source[] = [];
   for (const raw of input ?? []) {
@@ -64,15 +64,15 @@ export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
 
   if (/\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|module)\b/.test(f)) add("files", "semble");
   if (/\b(doc|docs|readme|guide|explain|overview|architecture|design|how\s+to|reference|manual)\b/.test(f)) add("docs");
-  if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory", "surreal_memory");
+  if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory");
   if (/\b(git|diff|changed|changes|status|staged|unstaged|commit|branch|recent)\b/.test(f)) add("git");
   if (/\b(sherpa|performance|health|trace|traces|retrieval|evaluation|evaluations|quality|useful|usefull|working|correctly|corectly)\b/.test(f)) add("docs", "project_memory", "files");
   if (isTraceLogMetricsPrompt(f) || isPiSherpaMetaDebugPrompt(f)) add("files", "docs", "project_memory");
-  if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory", "surreal_memory");
+  if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory");
   if (/\b(internet|web|online|search\s+web|latest|current|today|recent\s+news|external\s+source|documentation\s+online)\b/.test(f)) add("web");
   if (mode !== "front-door" && /\b(previous|earlier|continue|session|conversation|last\s+time|we\s+discussed)\b/.test(f)) add("session");
 
-  if (!sources.length) add(...(mode === "front-door" ? ["files", "semble", "docs"] as Source[] : ["files", "semble", "graphify", "docs", "git", "project_memory", "surreal_memory"] as Source[]));
+  if (!sources.length) add(...(mode === "front-door" ? ["files", "semble", "docs"] as Source[] : ["files", "semble", "graphify", "docs", "git", "project_memory"] as Source[]));
   return { sources, reason: `heuristic matched ${sources.join(", ")}`, confidence: sources.length === 1 ? 0.7 : 0.6, planner: "heuristic" };
 }
 
@@ -91,7 +91,7 @@ export function sourcePlanningMessage(focus: string): UserMessage {
       'Return as JSON: {"indicators":{"indicators":["..."],"reason":"...","confidence":0.0}}',
       "",
       "TASK B — Source selection: Which sources should Sherpa search?",
-      "Available: files, semble, graphify, docs, git, project_memory, surreal_memory, web.",
+      "Available: files, semble, graphify, docs, git, project_memory, web.",
       "Act as a router:",
       "- If the prompt is clearly reduced to source code, implementation, symbols, tests, errors, or exact files, choose files + semble.",
       "- If the prompt asks about architecture, topology, call paths, dependencies, relationships, subsystem boundaries, or how X connects to Y, choose graphify + files + semble.",

@@ -90,14 +90,6 @@ const BUILT_IN_SOURCES: ConditionalSource[] = [
     },
   },
   {
-    id: "surreal_memory",
-    label: "Surreal memory store",
-    when: {
-      requireSources: ["project_memory"],
-      minRelevance: 0.5,
-    },
-  },
-  {
     id: "logs",
     label: "Log files",
     when: {

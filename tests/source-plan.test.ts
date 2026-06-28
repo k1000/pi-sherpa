@@ -12,8 +12,8 @@ function assertSources(prompt: string, expected: string[]) {
 const codePlan = assertSources("fix failing parseSembleSearchOutput test in lib/semble.ts", ["files", "semble"]);
 assert.ok(!codePlan.sources.includes("project_memory" as never), `code-reduced prompt should not require project_memory; got ${codePlan.sources.join(", ")}`);
 
-assertSources("explain the end-to-end architecture flow for graph memory retrieval", ["files", "semble", "docs", "project_memory", "surreal_memory"]);
-assertSources("what convention do we use for graph memory in surrealdb", ["project_memory", "surreal_memory"]);
+assertSources("explain the end-to-end architecture flow for graph memory retrieval", ["files", "semble", "docs", "project_memory"]);
+assertSources("what convention do we use for graph memory in surrealdb", ["project_memory"]);
 assertSources("review recent git diff for source routing changes", ["git"]);
 assertSources("review recent sherpa performance, does it provide usefull data, all is working corectly ?", ["docs", "project_memory", "files"]);
 

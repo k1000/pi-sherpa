@@ -40,6 +40,7 @@ Archivist owns:
 - **Distillation** — `archivist_distill` (was `sherpa_distill`)
 - **Documentation drift** — `/archivist:docs:audit`
 - **Session-level memory** — `archivist:status`, `archivist:sync-reflect`
+- **Inquirer graph/vector memory** — Archivist writes durable Obsidian notes first, then ingests/mirrors them through the Inquirer Memory API. Sherpa must not connect to SurrealDB or the Inquirer backend directly; it retrieves Archivist-authored knowledge through Obsidian/catalog/index surfaces. If graph/vector recall is needed, enable/sync Archivist/Inquirer rather than adding a Sherpa `surreal_memory` source.
 
 ## Model configuration
 
