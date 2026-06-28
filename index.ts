@@ -41,7 +41,7 @@ import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
-import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
+import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget, inferConditionalTaskType } from "./lib/query-target";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
@@ -394,10 +394,6 @@ async function completeJsonObjectWithTimeout(state: State, ctx: ExtensionContext
   if (response.stopReason === "aborted") return { aborted: true, parsed: null };
   const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
   return { aborted: false, parsed: extractJsonObject(text) };
-}
-
-function allowsRepeatedMetaDebugContext(focus: string): boolean {
-  return isPiSherpaMetaDebugPrompt(focus) || (isTraceLogMetricsPrompt(focus) && /\bsherpa\b/i.test(focus));
 }
 
 async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus: string): Promise<SearchIndicators> {
