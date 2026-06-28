@@ -73,6 +73,7 @@ import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-sour
 import { MemoryApiStore, type MemoryResult, type MemoryApiStoreConfig } from "./lib/memory-store";
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
+import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { signalItemMarkdownItem, signalMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parseSourcePlan } from "./lib/source-planning";
@@ -1293,24 +1294,6 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
   if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(state, ctx, focus, indicators, add)));
   return tasks;
-}
-
-function applySessionUsageFeedback(state: State, candidates: ContextItem[]): void {
-  if (!state.feedback.length) return;
-  for (const candidate of candidates) {
-    const source = candidate.source.toLowerCase();
-    for (const record of state.feedback.slice(-20)) {
-      for (const missed of record.missing ?? []) {
-        const normalized = missed.toLowerCase().replace(/^repo:\/\//, "");
-        const base = path.basename(normalized).replace(/\.[^.]+$/, "");
-        if (normalized && source.includes(normalized)) candidate.relevance = Math.min(1, candidate.relevance + 0.45);
-        else if (base.length >= 4 && source.includes(base)) candidate.relevance = Math.min(1, candidate.relevance + 0.18);
-      }
-      for (const unused of record.unused ?? []) {
-        if (unused && candidate.source === unused) candidate.relevance = Math.max(0, candidate.relevance - 0.3);
-      }
-    }
-  }
 }
 
 function applyRetrievalFeedback(state: State, focus: string, candidates: ContextItem[]) {
