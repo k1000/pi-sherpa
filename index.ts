@@ -74,6 +74,7 @@ import { writeNudge } from "./lib/nudge";
 import type { NudgeTarget } from "./lib/nudge";
 import { ensureRouteMap } from "./lib/route-map";
 import { searchSemble } from "./lib/semble";
+import { addSembleCandidates } from "./lib/semble-candidates";
 import { parseRgOutput, rg } from "./lib/rg";
 import { catalogMatches, readGlobalTaxonomy } from "./lib/catalog";
 import { addCurrentProjectMemory, addOntologyFallbackMemory, addOtherProjectMemory, addResearchMemory, addTaxonomyMemory } from "./lib/project-memory-readers";
@@ -678,15 +679,6 @@ async function addProjectMemoryCandidates(state: State, ctx: ExtensionContext, f
   // If current project catalog is absent or did not match, fall back to current
   // project's semantic ontology folders only. Do not scan legacy bucket folders.
   if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
-}
-
-async function addSembleCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
-  const query = [focus, ...indicators.indicators].join(" ").trim();
-  const results = await searchSemble(ctx.cwd, query, state.config.semble);
-  for (const result of results) {
-    if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, indicators.indicators.join(" "), mode)) continue;
-    add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.4);
-  }
 }
 
 function addMemoryIndexCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
