@@ -38,8 +38,7 @@ import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextIt
 import { buildContextSignal } from "./lib/context-signal";
 import { createEmptyContextBundle } from "./lib/context-bundle";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
-import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
-import { labelRgSource } from "./lib/file-snippet";
+import { addExplicitPathCandidates } from "./lib/exact-source";
 import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "./lib/file-candidates";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
@@ -67,7 +66,7 @@ import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-too
 
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { addMemoryIndexCandidates } from "./lib/memory-index-candidates";
-import { addPiSherpaDebugSourceCandidates } from "./lib/pi-extension-candidates";
+import { addPiExtensionCandidates } from "./lib/pi-extension-candidates";
 import { applyPersistedState, serializeState } from "./lib/state-persistence";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
 import type { SessionSearchMatch } from "./lib/session-search";
@@ -624,31 +623,10 @@ function mentionedPiExtensionRoots(focus: string): Array<{ name: string; root: s
   return out.slice(0, 4);
 }
 
-async function addPiExtensionCandidates(ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
-  const roots = mentionedPiExtensionRoots(focus);
-  for (const { name, root } of roots) {
-    const keyFiles = ["README.md", "package.json", "index.ts", "SHERPA_SYSTEM.md", "lib/dspy.ts"]
-      .filter((file) => existsSync(path.join(root, file)));
-    add("pi_extension_route", pathSourceLabel(root, ctx.cwd), [
-      `Pi extension route: ${name}`,
-      `Root: ${root}`,
-      keyFiles.length ? `Key files: ${keyFiles.join(", ")}` : "Key files: none detected",
-      isTraceLogMetricsPrompt(focus) ? "Trace logs: active cwd .pi-memory/sherpa-traces/*.jsonl" : "",
-    ].filter(Boolean).join("\n"), 0.7);
-    addPiSherpaDebugSourceCandidates(ctx, focus, root, add);
-
-    const query = [focus, ...indicators.indicators].join(" ");
-    const out = await rg(ctx.cwd, query, root);
-    for (const { fileAndLine, content } of parseRgOutput(out, 12)) {
-      if (content) add("file", labelRgSource(fileAndLine, ctx.cwd), content, 0.42);
-    }
-  }
-}
-
 async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   addExplicitPathCandidates(ctx.cwd, focus, add);
   addRuntimeTraceCandidates(ctx, focus, add);
-  await addPiExtensionCandidates(ctx, focus, indicators, add);
+  await addPiExtensionCandidates(ctx, focus, indicators, mentionedPiExtensionRoots(focus), add);
   await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
 }
