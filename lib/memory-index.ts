@@ -18,6 +18,7 @@ export type MemoryIndexConfig = {
   catalogRoots?: string[];
   evaluationRoot?: string;
   nudgeDigestPath?: string;
+  reflectRoot?: string;
 };
 
 export type MemoryIndexStats = {
@@ -149,6 +150,8 @@ export class SherpaMemoryIndex {
     const catalogRoots = config.catalogRoots?.length ? config.catalogRoots : [baseDir];
     for (const root of catalogRoots) this.indexCatalog(path.resolve(baseDir, root));
 
+    this.indexReflect(path.resolve(baseDir, config.reflectRoot ?? path.join(baseDir, ".pi", "reflect")));
+
     if (config.evaluationRoot) this.indexEvaluations(path.resolve(baseDir, config.evaluationRoot));
     if (config.nudgeDigestPath) this.indexDedupHashes(path.resolve(baseDir, config.nudgeDigestPath));
     else this.indexDedupHashes(path.join(scratchpadRoot, "nudge-digest.jsonl"));
@@ -201,6 +204,34 @@ export class SherpaMemoryIndex {
       this.upsertCatalogEntry({ id, catalogPath, row, hash });
       this.upsertDocument({ id, kind: `catalog:${row.type || "entry"}`, sourcePath: catalogPath, title: row.title || row.id || "Catalog entry", summary: row.summary || "", body, hash, scope: row.scope });
     });
+  }
+
+  indexReflect(reflectRoot: string): void {
+    const indexPath = path.join(reflectRoot, "index.jsonl");
+    if (!existsSync(indexPath)) return;
+    this.clearSourcePath(indexPath);
+    const reflectionDir = path.join(reflectRoot, "reflections");
+    for (const line of readFileSync(indexPath, "utf8").split(/\r?\n/).filter(Boolean)) {
+      try {
+        const entry = JSON.parse(line) as { id?: string; type?: string; title?: string; summary?: string; body?: string; context?: string; evidence?: string; application?: string; verification?: string; importance?: string; tags?: string[]; file?: string; createdAt?: string; source?: string };
+        if (!entry.id) continue;
+        const mdPath = entry.file ? path.join(reflectionDir, entry.file) : "";
+        const embedded = [entry.body, entry.context, entry.evidence, entry.application, entry.verification].filter(Boolean).join("\n\n");
+        const body = embedded || (mdPath && existsSync(mdPath) ? readFileSync(mdPath, "utf8") : [entry.title, entry.summary, entry.tags?.join(" ")].filter(Boolean).join("\n"));
+        const id = stableId("reflect", indexPath, entry.id, body);
+        const hash = sha256(body);
+        this.upsertDocument({
+          id,
+          kind: `reflect:${entry.type || "entry"}`,
+          sourcePath: indexPath,
+          title: entry.title || entry.id,
+          summary: entry.summary || summarize(body),
+          body: [entry.id, entry.type, entry.importance, entry.source, entry.tags?.join(" "), body].filter(Boolean).join("\n"),
+          hash,
+          scope: "project",
+        });
+      } catch { /* ignore malformed reflect entries */ }
+    }
   }
 
   indexEvaluations(root: string): void {

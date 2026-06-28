@@ -11,7 +11,6 @@ import {
   findRunnableAutomation,
   formatRunnableAutomation,
   recordAutomationRun,
-  updateAutomationCandidates,
 } from "./lib/automation";
 import type { AutomationState } from "./lib/automation";
 import { getProjectKBBasedir } from "./lib/project-kb";
@@ -48,7 +47,6 @@ import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./li
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
-import { writeDistilledSkill } from "./lib/distillation";
 
 import { filterActiveSources } from "./lib/conditional-source";
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
@@ -56,7 +54,6 @@ import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedE
 import type { SessionSearchMatch } from "./lib/session-search";
 import { writeNudge } from "./lib/nudge";
 import type { NudgeTarget } from "./lib/nudge";
-import { checkAutoDistill, prepareDistillPayloads, getAutoDistillStatus, markAutoDistillRun } from "./lib/auto-distill";
 import { ensureRouteMap } from "./lib/route-map";
 import { searchSemble } from "./lib/semble";
 import { parseRgOutput, rg } from "./lib/rg";
@@ -2167,16 +2164,6 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  const processAutomationCandidates = (stateObj: State, ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
-    const raw = stringifyForAutoMemory(recentMessages);
-    const automationCandidates = updateAutomationCandidates(stateObj.automation, raw, 3, cwd);
-    for (const candidate of automationCandidates) {
-      appendScratchpadSection(stateObj, cwd, "distill_candidate", `${candidate.markdown}\n\nPolicy source: ${stateObj.automationPromptSource}`, "Automation candidate");
-    }
-    if (automationCandidates.length) {
-      try { ctx.ui.notify(`Sherpa detected ${automationCandidates.length} automation candidate(s)`, "info"); } catch {}
-    }
-  };
 
   const recordLifecycleObservation = async (stateObj: State, cwd: string, recentMessages: unknown[]) => {
     const recentText = stringifyForAutoMemory(recentMessages);
@@ -2247,27 +2234,6 @@ export default function (pi: ExtensionAPI) {
     } catch { /* retrieval evaluation must never affect task completion */ }
   };
 
-  const maybeAutoDistillScratchpad = (stateObj: State, ctx: ExtensionContext, cwd: string, outcome: ReturnType<typeof classifyTaskOutcome>, changedFiles: string[]) => {
-    try {
-      const scratchpadRoot = scratchpadRootPath(stateObj, cwd);
-      const adCheck = checkAutoDistill({ outcome: outcome.outcome, changedFiles: changedFiles.length, hasDistillCandidates: true }, {
-        scratchpadRoot,
-        minChangedFiles: 3,
-        enabled: stateObj.config.enabled,
-      });
-      if (!adCheck.shouldTrigger) return;
-      const payloads = prepareDistillPayloads(adCheck.newCandidates);
-      const writes = payloads.map((payload) => writeDistilledSkill(payload, cwd, obsidianMemoryPath(stateObj)));
-      appendScratchpadSection(stateObj, cwd, "observation", [
-        `Auto-distill completed: ${adCheck.reason}`,
-        `Domains: ${[...new Set(payloads.map((p) => p.domain))].join(", ")}`,
-        `Candidates: ${payloads.length}`,
-        ...writes.map((w, i) => `${i + 1}. [${w.destination}] ${path.relative(ctx.cwd, w.skillPath)}`),
-      ].join("\n"), "Auto-distill completed");
-      markAutoDistillRun(scratchpadRoot);
-      try { ctx.ui.notify(`Sherpa auto-distilled ${writes.length} candidate(s)`, "info"); } catch {}
-    } catch { /* auto-distill is best-effort */ }
-  };
 
   const compactScratchpadAndNotify = (stateObj: State, ctx: ExtensionContext, cwd: string) => {
     const compacted = compactScratchpad(scratchpadRootPath(stateObj, cwd));
@@ -2280,10 +2246,8 @@ export default function (pi: ExtensionAPI) {
     if (!state?.config.enabled) return;
     const stateObj = state;
     try {
-      processAutomationCandidates(stateObj, ctx, cwd, recentMessages);
       const { recentText, outcome, changedFiles } = await recordLifecycleObservation(stateObj, cwd, recentMessages);
       await evaluateRecentBundle(stateObj, ctx, cwd, recentMessages, recentText, outcome, changedFiles);
-      maybeAutoDistillScratchpad(stateObj, ctx, cwd, outcome, changedFiles);
       compactScratchpadAndNotify(stateObj, ctx, cwd);
     } catch (error) {
       try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
@@ -3168,14 +3132,8 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(`Memory index: ${stats.documents} docs, ${stats.sourcePaths} sources, ${stats.scratchpadEntries} scratchpad, ${stats.catalogEntries} catalog, ${stats.evaluations} evals. Kinds: ${kinds}`, "info");
   }});
 
-  pi.registerCommand("sherpa:auto-distill:status", { description: "Show auto-distillation status", handler: async (_args, ctx) => {
-    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
-    const root = scratchpadRootPath(state, ctx.cwd);
-    const status = getAutoDistillStatus({ scratchpadRoot: root, enabled: state.config.enabled });
-    ctx.ui.notify(
-      `Auto-distill: ${status.enabled ? "on" : "off"}${status.suppressed ? " (suppressed)" : ""}`,
-      status.enabled ? "info" : "warning"
-    );
+  pi.registerCommand("sherpa:auto-distill:status", { description: "Show auto-distillation ownership", handler: async (_args, ctx) => {
+    ctx.ui.notify("Auto-distill moved to the reflect extension. Use /reflect stats/recent to inspect captured learning outputs.", "info");
   }});
 
   pi.registerCommand("sherpa:settings", { description: "Configure Sherpa", handler: async (_args, ctx) => {
