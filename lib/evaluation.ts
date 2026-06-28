@@ -45,6 +45,30 @@ export function stashBundle(state: { bundleRecords?: Map<string, ContextBundleRe
   for (const k of keys.slice(0, keys.length - 20)) state.bundleRecords.delete(k);
 }
 
+type ContextBundleLike = {
+  bundleId: string;
+  focus: string;
+  mode: string;
+  items: Array<{ handle: string; type: string; source: string; summary: string; inline?: boolean }>;
+};
+
+export function stashContextBundle(state: { lastBundleId?: string; bundleRecords?: Map<string, ContextBundleRecord> }, bundle: ContextBundleLike): void {
+  state.lastBundleId = bundle.bundleId;
+  stashBundle(state, {
+    bundleId: bundle.bundleId,
+    timestamp: Date.now(),
+    focus: bundle.focus,
+    mode: bundle.mode,
+    items: bundle.items.map((item) => ({
+      handle: item.handle,
+      type: item.type,
+      source: item.source,
+      summary: item.summary,
+      inline: item.inline,
+    })),
+  });
+}
+
 export function getBundle(state: { bundleRecords?: Map<string, ContextBundleRecord> }, bundleId: string): ContextBundleRecord | undefined {
   return state.bundleRecords?.get(bundleId);
 }

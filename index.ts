@@ -21,7 +21,7 @@ import {
   getBundle,
   readQualitySummary,
   readRecentEvaluations,
-  stashBundle,
+  stashContextBundle,
   summarizeEvaluations,
   writeEvaluation,
   writeQualitySummary,
@@ -655,23 +655,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
   return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan, bundle.bundleId);
-}
-
-function stashContextBundle(state: State, bundle: ContextBundle): void {
-  state.lastBundleId = bundle.bundleId;
-  stashBundle(state, {
-    bundleId: bundle.bundleId,
-    timestamp: Date.now(),
-    focus: bundle.focus,
-    mode: bundle.mode,
-    items: bundle.items.map((item) => ({
-      handle: item.handle,
-      type: item.type,
-      source: item.source,
-      summary: item.summary,
-      inline: item.inline,
-    })),
-  });
 }
 
 async function gitChanged(cwd: string) {
