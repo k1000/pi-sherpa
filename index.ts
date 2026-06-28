@@ -29,7 +29,8 @@ import {
   type ContextEvaluation,
 } from "./lib/evaluation";
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
-import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces, writeDspyTrace } from "./lib/dspy";
+import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces } from "./lib/dspy";
+import { recordDspyTrace } from "./lib/dspy-trace-recording";
 import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
 import { buildContextSignal } from "./lib/context-signal";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
@@ -52,7 +53,6 @@ import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
-import { traceDecisions, traceFeedbackStats, traceItem, traceStageLabels } from "./lib/trace-helpers";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
 import { extractUrls } from "./lib/url-utils";
 import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./lib/web-search";
@@ -655,46 +655,6 @@ async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, bu
 function bundleMarkdown(bundle: ContextBundle) {
   const signal = bundle.signal ?? buildContextSignal(bundle);
   return signalMarkdown(signal, bundle.mode, bundle.budgetUsedTokens, bundle.sourcePlan, bundle.bundleId);
-}
-
-function recordDspyTrace(cwd: string, bundle: ContextBundle, indicators: SearchIndicators, candidates: ContextItem[], curateResult: CurateResult, feedback?: { recentEvaluations?: number; qualitySummaryUsed?: boolean; penaltiesApplied?: number; boostsApplied?: number }) {
-  try {
-    const decisions = traceDecisions(bundle.focus, candidates, bundle.items, curateResult);
-    writeDspyTrace(cwd, {
-      version: 1,
-      at: new Date().toISOString(),
-      bundleId: bundle.bundleId,
-      focus: bundle.focus,
-      mode: bundle.mode,
-      stageLabels: traceStageLabels(bundle, candidates, curateResult),
-      sourcePlan: {
-        sources: bundle.sourcePlan?.sources ?? [],
-        reason: bundle.sourcePlan?.reason ?? "",
-        confidence: bundle.sourcePlan?.confidence ?? 0,
-        planner: bundle.sourcePlan?.planner ?? "unknown",
-      },
-      indicators: {
-        indicators: indicators.indicators,
-        reason: indicators.reason,
-        confidence: indicators.confidence,
-        planner: indicators.planner,
-      },
-      candidateCount: candidates.length,
-      candidates: candidates.slice(0, 60).map(traceItem),
-      selected: bundle.items.map(traceItem),
-      curate: {
-        abstain: curateResult.abstain,
-        abstainReason: curateResult.abstainReason,
-        confidence: curateResult.confidence,
-        planner: curateResult.planner,
-        plannerReason: curateResult.plannerReason,
-        rejected: curateResult.rejected.slice(0, 60),
-      },
-      decisions,
-      feedback: { ...traceFeedbackStats(0, false, decisions), ...(feedback ?? {}) },
-      disposition: bundle.signal?.disposition.kind,
-    });
-  } catch { /* tracing must never affect retrieval */ }
 }
 
 function stashContextBundle(state: State, bundle: ContextBundle): void {
