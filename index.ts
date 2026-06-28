@@ -78,7 +78,7 @@ import { searchSemble } from "./lib/semble";
 import { addSembleCandidates } from "./lib/semble-candidates";
 import { parseRgOutput, rg } from "./lib/rg";
 import { catalogMatches, readGlobalTaxonomy } from "./lib/catalog";
-import { addCurrentProjectMemory, addOntologyFallbackMemory, addOtherProjectMemory, addResearchMemory, addTaxonomyMemory } from "./lib/project-memory-readers";
+import { addProjectMemoryCandidates } from "./lib/project-memory-readers";
 import { parseGitStatusFiles } from "./lib/common";
 import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
 import type { RoutePlan } from "./lib/route-map";
@@ -669,19 +669,6 @@ async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: str
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
 }
 
-async function addProjectMemoryCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem) {
-  const root = obsidianMemoryPath(state);
-  const vault = obsidianVaultPath(state);
-  const indicatorText = indicators.indicators.join(" ");
-  const currentProjectMatches = addCurrentProjectMemory(root, indicatorText, add);
-  addResearchMemory(vault, indicatorText, add);
-  if (options.searchOtherProjects) addOtherProjectMemory(vault, path.resolve(root), indicatorText, add);
-  if (options.includeTaxonomy || /\b(taxonomy|tag|tags|label|labels|category|relationship|nomenclature)\b/i.test(focus)) addTaxonomyMemory(focus, add);
-  // If current project catalog is absent or did not match, fall back to current
-  // project's semantic ontology folders only. Do not scan legacy bucket folders.
-  if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
-}
-
 function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {
   const tasks: Promise<void>[] = [];
   if (enabled("files")) tasks.push(addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
@@ -693,7 +680,14 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
   if (enabled("git") && focusAllowsGitStatus(focus)) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
   if (enabled("web")) tasks.push((async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
-  if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
+  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addProjectMemoryCandidates(
+    obsidianMemoryPath(state),
+    obsidianVaultPath(state),
+    focus,
+    indicators.indicators.join(" "),
+    options,
+    add,
+  )));
   if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
   if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(ctx, focus, indicators, {
     scratchpadRoot: scratchpadRootPath(state, ctx.cwd),

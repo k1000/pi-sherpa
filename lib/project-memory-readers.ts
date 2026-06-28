@@ -11,8 +11,9 @@ import { score } from "./text-utils";
  * project catalog, research areas, other projects, global taxonomy, ontology
  * fallback dirs) and push matched snippets as candidates via `add`.
  *
- * The orchestrator addProjectMemoryCandidates (which resolves the vault paths
- * from State and fans these out) stays in index.ts.
+ * Path resolution stays in index.ts; this module owns fan-out across the
+ * provided current-project root, vault, research, other-project, taxonomy, and
+ * ontology fallback surfaces.
  */
 
 export type AddMemoryItem = (type: string, source: string, raw: string, relBoost?: number) => void;
@@ -98,4 +99,21 @@ export function addOntologyFallbackMemory(root: string, focus: string, add: AddM
       }
     } catch { /* ignore */ }
   }
+}
+
+export function addProjectMemoryCandidates(
+  root: string,
+  vault: string,
+  focus: string,
+  indicatorText: string,
+  options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean },
+  add: AddMemoryItem,
+) {
+  const currentProjectMatches = addCurrentProjectMemory(root, indicatorText, add);
+  addResearchMemory(vault, indicatorText, add);
+  if (options.searchOtherProjects) addOtherProjectMemory(vault, path.resolve(root), indicatorText, add);
+  if (options.includeTaxonomy || /\b(taxonomy|tag|tags|label|labels|category|relationship|nomenclature)\b/i.test(focus)) addTaxonomyMemory(focus, add);
+  // If current project catalog is absent or did not match, fall back to current
+  // project's semantic ontology folders only. Do not scan legacy bucket folders.
+  if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
 }
