@@ -35,6 +35,7 @@ import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTra
 import { recordDspyTrace } from "./lib/dspy-trace-recording";
 import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
 import { buildContextSignal } from "./lib/context-signal";
+import { createEmptyContextBundle } from "./lib/context-bundle";
 import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
@@ -619,23 +620,6 @@ async function runDspyPromptCompile(cwd: string) {
   return { ...result, candidateDir };
 }
 
-function createEmptyContextBundle(state: State, focus: string, mode: string, candidates: ContextItem[], sourcePlan: SourcePlan): ContextBundle {
-  state.bundles++;
-  const bundle: ContextBundle = {
-    bundleId: createBundleId(),
-    taskId: `sherpa-${Date.now()}`,
-    focus,
-    mode,
-    budgetUsedTokens: 0,
-    items: [],
-    candidateCount: candidates.length,
-    sourcePlan,
-  };
-  bundle.signal = buildContextSignal(bundle);
-  stashContextBundle(state, bundle);
-  return bundle;
-}
-
 function normalizedName(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -864,7 +848,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   }
 
   if (compileResult.abstain) {
-    const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan);
+    const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan) as ContextBundle;
     recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, compileResult, traceFeedback);
     return abstainBundle;
   }
