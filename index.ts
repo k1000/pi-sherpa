@@ -68,6 +68,7 @@ import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, 
 import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-tools";
 
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
+import { addMemoryIndexCandidates } from "./lib/memory-index-candidates";
 import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedEntryCount, closeSessionDb } from "./lib/session-search";
 import type { SessionSearchMatch } from "./lib/session-search";
 import { writeNudge } from "./lib/nudge";
@@ -681,28 +682,6 @@ async function addProjectMemoryCandidates(state: State, ctx: ExtensionContext, f
   if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
 }
 
-function addMemoryIndexCandidates(state: State, ctx: ExtensionContext, focus: string, indicators: SearchIndicators, add: AddContextItem) {
-  try {
-    const memoryConfig = {
-      scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
-      catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
-      evaluationRoot: obsidianMemoryPath(state),
-    };
-    indexSherpaMemory(ctx.cwd, memoryConfig);
-    const memoryHits = searchSherpaMemory(ctx.cwd, [focus, ...indicators.indicators].join(" "), 8, memoryConfig);
-    for (const hit of memoryHits) {
-      add("memory_index", `memory-index://${hit.kind}/${path.relative(ctx.cwd, hit.sourcePath)}`, [
-        `Kind: ${hit.kind}`,
-        `Title: ${hit.title}`,
-        hit.summary ? `Summary: ${hit.summary}` : "",
-        `Source: ${hit.sourcePath}`,
-        "",
-        hit.snippet || hit.summary,
-      ].filter(Boolean).join("\n"), 0.24);
-    }
-  } catch { /* memory index recall is opportunistic */ }
-}
-
 async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, candidates: ContextItem[], add: AddContextItem, enabled: (s: Source) => boolean) {
   if (mode !== "front-door" || !enabled("files") || postProcessCandidates(candidates, focus, mode).length !== 0) return;
   if (enabled("semble") && state.config.semble?.enabled) {
@@ -732,7 +711,11 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
   if (enabled("web")) tasks.push((async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
   if (enabled("project_memory")) tasks.push(addProjectMemoryCandidates(state, ctx, focus, indicators, options, add));
   if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
-  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(state, ctx, focus, indicators, add)));
+  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(ctx, focus, indicators, {
+    scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+    catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+    evaluationRoot: obsidianMemoryPath(state),
+  }, add)));
   return tasks;
 }
 
