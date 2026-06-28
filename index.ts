@@ -3121,6 +3121,74 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(msg.join(" | "), "info");
   }});
 
+  const buildMemoryDoctorReport = (ctx: ExtensionContext) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const reflectIndex = path.join(ctx.cwd, ".pi", "reflect", "index.jsonl");
+    const reflectMemory = path.join(ctx.cwd, ".pi", "reflect", "MEMORY.md");
+    const reflectAutomations = path.join(ctx.cwd, ".pi", "reflect", "AUTOMATIONS.md");
+    const reflectOutbox = path.join(ctx.cwd, ".pi", "reflect", "archivist-outbox.jsonl");
+    const reflectRows = existsSync(reflectIndex) ? readFileSync(reflectIndex, "utf8").split(/\r?\n/).filter(Boolean) : [];
+    const outboxRows = existsSync(reflectOutbox) ? readFileSync(reflectOutbox, "utf8").split(/\r?\n/).filter(Boolean) : [];
+    const stats = indexSherpaMemory(ctx.cwd, {
+      scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+      catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+      evaluationRoot: obsidianMemoryPath(state),
+    });
+    const reflectKinds = stats.kindCounts.filter((k) => k.kind.startsWith("reflect:")).map((k) => `${k.kind}:${k.count}`).join(", ") || "none";
+    const reflectSearchOk = reflectRows.length === 0 || searchSherpaMemory(ctx.cwd, "Reflect Memory", 1, {
+      scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+      catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+      evaluationRoot: obsidianMemoryPath(state),
+    }).some((result) => result.kind.startsWith("reflect:") || result.sourcePath.includes(".pi/reflect"));
+    return {
+      reflectIndexExists: existsSync(reflectIndex),
+      reflectMemoryExists: existsSync(reflectMemory),
+      reflectAutomationsExists: existsSync(reflectAutomations),
+      reflectRows: reflectRows.length,
+      reflectOutboxRows: outboxRows.length,
+      indexedDocuments: stats.documents,
+      reflectKinds,
+      reflectSearchOk,
+      dbPath: stats.dbPath,
+    };
+  };
+
+  pi.registerTool({
+    name: "sherpa_memory_doctor",
+    label: "Sherpa Memory Doctor",
+    description: "Audit Sherpa/Reflect memory alignment: reflect store, generated discovery files, outbox, and Sherpa memory index visibility.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const report = buildMemoryDoctorReport(ctx);
+      return { content: [{ type: "text" as const, text: [
+        "## Sherpa/Reflect Memory Doctor",
+        `Reflect index: ${report.reflectIndexExists ? "yes" : "no"} (${report.reflectRows} rows)`,
+        `Reflect MEMORY.md: ${report.reflectMemoryExists ? "yes" : "no"}`,
+        `Reflect AUTOMATIONS.md: ${report.reflectAutomationsExists ? "yes" : "no"}`,
+        `Archivist outbox rows: ${report.reflectOutboxRows}`,
+        `Sherpa indexed docs: ${report.indexedDocuments}`,
+        `Reflect indexed kinds: ${report.reflectKinds}`,
+        `Reflect search visible: ${report.reflectSearchOk ? "yes" : "no"}`,
+        `DB: ${report.dbPath}`,
+      ].join("\n") }], details: report };
+    },
+  });
+
+  pi.registerCommand("sherpa:memory-doctor", { description: "Audit Sherpa/Reflect memory alignment", handler: async (_args, ctx) => {
+    const report = buildMemoryDoctorReport(ctx);
+    ctx.ui.notify([
+      "## Sherpa/Reflect Memory Doctor",
+      `Reflect index: ${report.reflectIndexExists ? "yes" : "no"} (${report.reflectRows} rows)`,
+      `Reflect MEMORY.md: ${report.reflectMemoryExists ? "yes" : "no"}`,
+      `Reflect AUTOMATIONS.md: ${report.reflectAutomationsExists ? "yes" : "no"}`,
+      `Archivist outbox rows: ${report.reflectOutboxRows}`,
+      `Sherpa indexed docs: ${report.indexedDocuments}`,
+      `Reflect indexed kinds: ${report.reflectKinds}`,
+      `Reflect search visible: ${report.reflectSearchOk ? "yes" : "no"}`,
+      `DB: ${report.dbPath}`,
+    ].join("\n"), report.reflectSearchOk ? "info" : "warning");
+  }});
+
   pi.registerCommand("sherpa:memory-index:status", { description: "Show SQLite-backed Sherpa memory index status", handler: async (_args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const stats = indexSherpaMemory(ctx.cwd, {
