@@ -37,6 +37,7 @@ import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./l
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
+import { pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
@@ -351,13 +352,6 @@ function scratchpadRootRelative(state: State, cwd: string, target: string) {
   return path.relative(scratchpadRootPath(state, cwd), target);
 }
 
-function shouldAbstain(items: ContextItem[], mode: string) {
-  if (!items.length) return "no source-grounded context found";
-  const best = items[0]?.relevance ?? 0;
-  const threshold = mode === "front-door" ? 0.4 : 0.12;
-  if (best < threshold) return `best relevance ${best.toFixed(2)} below ${threshold}`;
-  return "";
-}
 const SHERPA_UI_KEY = "ai-sherpa";
 const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
 const SHERPA_CONTEXT_TYPE = "sherpa-context";
@@ -1309,17 +1303,6 @@ function applyRetrievalFeedback(state: State, focus: string, candidates: Context
     applySessionUsageFeedback(state, candidates);
     return {};
   }
-}
-
-function pickFinalContextItems(finalItems: ContextItem[], tokenBudget: number) {
-  const items: ContextItem[] = [];
-  let used = 0;
-  for (const c of finalItems) {
-    const t = approxTokens(c.summary) + 30;
-    if (used + t <= tokenBudget) { items.push(c); used += t; }
-    if (items.length >= 3) break;
-  }
-  return { items, used };
 }
 
 async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
