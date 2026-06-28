@@ -36,6 +36,7 @@ import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
 import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
+import { completeJsonObjectWithTimeout, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
 import { pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
@@ -46,7 +47,7 @@ import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt
 import { extractQueryTarget } from "./lib/query-target";
 import { applyConditionalSourceActivation } from "./lib/source-activation";
 import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
-import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
+import { extractJsonArray } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
@@ -364,20 +365,6 @@ const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
 
 function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode: string) {
   return postProcessCandidates(candidates, focus, mode);
-}
-
-function timeoutAfter<T>(ms: number, message: string): Promise<T> {
-  return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
-}
-
-async function completeJsonObjectWithTimeout(state: State, ctx: ExtensionContext, model: any, auth: any, message: UserMessage, timeoutMs: number, timeoutMessage: string) {
-  const response = await Promise.race([
-    complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
-    timeoutAfter<any>(timeoutMs, timeoutMessage),
-  ]);
-  if (response.stopReason === "aborted") return { aborted: true, parsed: null };
-  const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
-  return { aborted: false, parsed: extractJsonObject(text) };
 }
 
 async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus: string): Promise<SearchIndicators> {
