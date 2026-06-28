@@ -13,6 +13,7 @@ import {
   recordAutomationRun,
 } from "./lib/automation";
 import type { AutomationState } from "./lib/automation";
+import { graphifyAllowedForQuery, graphifyGraphPath, searchGraphify } from "./lib/graphify-search";
 import { getProjectKBBasedir } from "./lib/project-kb";
 import {
   createBundleId,
@@ -1364,40 +1365,6 @@ async function recordSurrealRetrievalFeedback(state: State, bundle: ContextBundl
     notes: evalRecord.reflection,
     createdAt: new Date().toISOString(),
   }).catch(() => undefined);
-}
-
-function graphifyGraphPath(cwd: string, cfg: SherpaConfig["graphify"]) {
-  const configured = cfg.graphPath || DEFAULT_CONFIG.graphify.graphPath;
-  return path.isAbsolute(configured) ? configured : path.join(cwd, configured);
-}
-
-function graphifyAllowedForQuery(focus: string) {
-  return /\b(architecture|architectural|topology|graph|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|subsystem|boundary|boundaries|community|communities|flow|pipeline|how\s+.+\s+fits|how\s+.+\s+connects)\b/i.test(focus);
-}
-
-async function searchGraphify(cwd: string, focus: string, cfg: SherpaConfig["graphify"]): Promise<string> {
-  if (!cfg?.enabled || !focus.trim()) return "";
-  const graph = graphifyGraphPath(cwd, cfg);
-  if (!existsSync(graph)) return "";
-  const timeout = Math.max(300, Math.min(10_000, Math.floor(cfg.timeoutMs || 1200)));
-  const budget = String(Math.max(300, Math.min(5000, Math.floor(cfg.budgetTokens || 1200))));
-  try {
-    const { stdout } = await execFileAsync(
-      cfg.command || "graphify",
-      ["query", focus, "--graph", graph, "--budget", budget],
-      { cwd, timeout, maxBuffer: 300_000 },
-    );
-    const lines = stdout.split("\n").map(line => line.trim()).filter(Boolean).slice(0, Math.max(3, Math.min(80, cfg.maxLines || 24)));
-    if (!lines.length) return "";
-    return [
-      "Graphify topology/routing hints. Use these as candidate nodes/files/functions; retrieve concrete code snippets with Semble or exact file reads before editing.",
-      `Graph: ${path.relative(cwd, graph) || graph}`,
-      "",
-      ...lines,
-    ].join("\n");
-  } catch {
-    return "";
-  }
 }
 
 function webSearchConfig(state: State, focus: string) {
