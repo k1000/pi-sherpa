@@ -55,6 +55,7 @@ import { conciseWebQuery, searchWebWithConfig, type WebSearchResult } from "./li
 export { isGloballyNoisySource }; // re-export so tests/global-noise.test.ts (imports from ../index) keep working
 export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so tests/golden-retrieval.test.ts keep working
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
+import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-tools";
 
 import { filterActiveSources } from "./lib/conditional-source";
 import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
@@ -697,60 +698,6 @@ async function compileContextWithModel(state: State, ctx: ExtensionContext, focu
 // Tool: find files by name/glob within scoped safe roots. This is the capability
 // the deterministic path lacks — rg refuses $HOME, so config files like
 // ~/.pi/agent/models.json are invisible to it. The model picks the pattern.
-const MODEL_SEARCH_FILE_ROOTS: string[] = (() => {
-  const roots: string[] = [];
-  const home = process.env.HOME;
-  if (home) roots.push(path.join(home, ".pi", "agent"));
-  return roots;
-})();
-
-function makeFileFinderTool(ctx: ExtensionContext): SearchTool {
-  return {
-    name: "find_file",
-    description: "Find files by name or glob under ~/.pi/agent (config, models, extensions). Use when the user asks about configuration, models, providers, or pi setup and the exact path is unknown. Pass a query like 'models' or 'sherpa.config'.",
-    async run({ query, limit }) {
-      const q = (query ?? "").trim().toLowerCase();
-      if (!q) return [];
-      const out: ModelSearchCandidate[] = [];
-      const seen = new Set<string>();
-      const max = Math.min(limit ?? 5, 5);
-      for (const root of MODEL_SEARCH_FILE_ROOTS) {
-        if (!existsSync(root)) continue;
-        let entries: string[];
-        try { entries = readdirSync(root); } catch { continue; }
-        for (const name of entries) {
-          if (seen.has(name)) continue;
-          if (name.toLowerCase().includes(q)) {
-            seen.add(name);
-            const abs = path.join(root, name);
-            try { if (!statSync(abs).isFile()) continue; } catch { continue; }
-            out.push({ source: pathSourceLabel(abs, ctx.cwd), summary: `File under ~/.pi/agent: ${name}`, relevance: 0.7 });
-            if (out.length >= max) return out;
-          }
-        }
-      }
-      return out;
-    },
-  };
-}
-
-// Tool: search Sherpa durable memory (scratchpad/catalog). Existing primitive reused.
-function makeMemorySearchTool(): SearchTool {
-  return {
-    name: "search_memory",
-    description: "Search past Sherpa observations, distillation candidates, and catalog entries for a keyword. Use for conventions, lessons, prior decisions.",
-    async run({ query, limit }) {
-      const q = (query ?? "").trim();
-      if (!q) return [];
-      try {
-        const hits = searchSherpaMemory("/Users/kamil/.pi-memory", q, Math.min(limit ?? 5, 5));
-        return hits.map((h) => ({ source: `kb://memory/${h.kind ?? ""}/${h.id ?? ""}`, summary: (h.title ? h.title + ": " : "") + (h.summary ?? "").slice(0, 200), relevance: 0.5 }));
-      } catch { return []; }
-    },
-  };
-}
-
-// Real modelStep: injects the sidecar completion into the pure loop controller.
 function makeModelStepRunner(state: State, ctx: ExtensionContext, timeoutMs = 8000) {
   return async (_transcript: string, toolsDescription: string): Promise<ModelStep | undefined> => {
     const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
