@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { postProcessCandidates } from "./candidate-postprocess";
 import type { AddContextItem } from "./context-adder";
 import { routeSkipsPath } from "./doc-discovery";
+import { searchSemble, type SembleConfig } from "./semble";
 import { fileSnippetAllowed } from "./source-guards";
 import { parseRgOutput, rg } from "./rg";
 import type { SearchIndicators, SourcePlan } from "./source-planning";
@@ -32,5 +34,30 @@ export async function addIndicatorFileCandidates(ctx: { cwd: string }, mode: str
   for (const { fileAndLine, content } of parseRgOutput(out, 30)) {
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicatorText, mode)) continue;
     add("file", `repo://${fileAndLine}`, content, 0.15);
+  }
+}
+
+export async function retryFrontDoorFileCandidates<T extends { source: string; relevance: number }>(
+  ctx: { cwd: string },
+  focus: string,
+  mode: string,
+  sourcePlan: SourcePlan,
+  candidates: T[],
+  add: AddContextItem,
+  enabled: (s: string) => boolean,
+  sembleConfig: SembleConfig,
+) {
+  if (mode !== "front-door" || !enabled("files") || postProcessCandidates(candidates, focus, mode).length !== 0) return;
+  if (enabled("semble") && sembleConfig?.enabled) {
+    const retrySemble = await searchSemble(ctx.cwd, focus, sembleConfig);
+    for (const result of retrySemble.slice(0, 8)) {
+      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
+      add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
+    }
+  }
+  const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
+  for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
+    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
+    add("file", `repo://${fileAndLine}`, content, 0.08);
   }
 }

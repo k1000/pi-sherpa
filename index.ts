@@ -42,7 +42,7 @@ import { inferTaskType, whyItemMatters } from "./lib/context-signal-helpers";
 import { routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
 import { labelRgSource, readSnippetAround } from "./lib/file-snippet";
-import { addIndicatorFileCandidates, addRoutedFileCandidates } from "./lib/file-candidates";
+import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "./lib/file-candidates";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
@@ -682,22 +682,6 @@ async function addProjectMemoryCandidates(state: State, ctx: ExtensionContext, f
   if (!currentProjectMatches.length) addOntologyFallbackMemory(root, focus, add);
 }
 
-async function retryFrontDoorFileCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, candidates: ContextItem[], add: AddContextItem, enabled: (s: Source) => boolean) {
-  if (mode !== "front-door" || !enabled("files") || postProcessCandidates(candidates, focus, mode).length !== 0) return;
-  if (enabled("semble") && state.config.semble?.enabled) {
-    const retrySemble = await searchSemble(ctx.cwd, focus, state.config.semble);
-    for (const result of retrySemble.slice(0, 8)) {
-      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
-      add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
-    }
-  }
-  const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
-  for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
-    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
-    add("file", `repo://${fileAndLine}`, content, 0.08);
-  }
-}
-
 function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {
   const tasks: Promise<void>[] = [];
   if (enabled("files")) tasks.push(addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
@@ -726,7 +710,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
 
   addUrlReferences(state, focus, add);
   await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled));
-  await retryFrontDoorFileCandidates(state, ctx, focus, mode, sourcePlan, candidates, add, enabled);
+  await retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled, state.config.semble);
 
   const traceFeedback = applyRetrievalFeedback(state, focus, candidates, obsidianMemoryPath(state));
   let compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
