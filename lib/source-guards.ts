@@ -96,3 +96,15 @@ export function isLikelyGenericOpeningNoise(item: RelevanceItemLike, focus = "")
   if (isGenericNoiseExplicitlyNeeded(source, focus.toLowerCase())) return false;
   return item.relevance < 0.25 || isGenericNoisePath(source);
 }
+
+export function fileSnippetAllowed(sourcePath: string, focus: string, mode: string) {
+  if (mode !== "front-door") return true;
+  const p = sourcePath.replace(/\\/g, "/").toLowerCase();
+  const f = focus.toLowerCase();
+  const wantsPi = /\b(pi|sherpa|agent|skill|theme|extension)\b/.test(f);
+  const wantsEnv = /\b(env|environment|token|secret|config|configuration)\b/.test(f);
+  if (!wantsPi && /(^|\/)\.pi\//.test(p)) return false;
+  if (!wantsEnv && /(^|\/)\.env/.test(p)) return false;
+  if (/implementation_summary\.md|backtest_results\.md|\.rsync-exclude|docker-compose|dockerfile/.test(p)) return false;
+  return true;
+}

@@ -39,7 +39,7 @@ import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evalua
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget, inferConditionalTaskType } from "./lib/query-target";
-import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
+import { fileSnippetAllowed, focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isLikelyGenericOpeningNoise, isPackageManifestSource, isRootReadmeSource, isSmallEditCandidate, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { approxTokens, conciseSummary, isTrivial, score, summarize } from "./lib/text-utils";
@@ -1230,18 +1230,6 @@ function stashContextBundle(state: State, bundle: ContextBundle): void {
       inline: item.inline,
     })),
   });
-}
-
-function fileSnippetAllowed(sourcePath: string, focus: string, mode: string) {
-  if (mode !== "front-door") return true;
-  const p = sourcePath.replace(/\\/g, "/").toLowerCase();
-  const f = focus.toLowerCase();
-  const wantsPi = /\b(pi|sherpa|agent|skill|theme|extension)\b/.test(f);
-  const wantsEnv = /\b(env|environment|token|secret|config|configuration)\b/.test(f);
-  if (!wantsPi && /(^|\/)\.pi\//.test(p)) return false;
-  if (!wantsEnv && /(^|\/)\.env/.test(p)) return false;
-  if (/implementation_summary\.md|backtest_results\.md|\.rsync-exclude|docker-compose|dockerfile/.test(p)) return false;
-  return true;
 }
 
 async function gitChanged(cwd: string) {
