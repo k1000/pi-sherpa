@@ -78,7 +78,7 @@ import { matchRoutePlan } from "./lib/route-match";
 import { applySessionUsageFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { signalItemMarkdownItem, signalMarkdown } from "./lib/signal-render";
-import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parseSourcePlan } from "./lib/source-planning";
+import { extractSearchTerms, heuristicIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parseSourcePlan, sourcePlanningMessage } from "./lib/source-planning";
 import { associativeMemoryProbes, inferSurrealMemoryTypes, inferSurrealResearchArea, mergeSurrealProbeResults, shouldSearchTranscendentalMemory, surrealArtifactIdFromSource, surrealProbeResults } from "./lib/surreal-retrieval";
 export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
 export { postProcessCandidates }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -438,45 +438,6 @@ function routedFallbackPlan(state: State, ctx: ExtensionContext, focus: string, 
   }
   fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
   return fallbackPlan;
-}
-
-function sourcePlanningMessage(focus: string): UserMessage {
-  return {
-    role: "user",
-    timestamp: Date.now(),
-    content: [{ type: "text", text: [
-      `User intent: ${focus}`,
-      "",
-      "You are Sherpa in Stage 1: inferring what to search for.",
-      "",
-      "TASK A — Search indicators: List 8-12 SPECIFIC technical identifiers",
-      "(function names, file patterns, module paths, domain terms) that would appear in",
-      'RELEVANT code — not just any code containing the raw keywords.',
-      'Return as JSON: {"indicators":{"indicators":["..."],"reason":"...","confidence":0.0}}',
-      "",
-      "TASK B — Source selection: Which sources should Sherpa search?",
-      "Available: files, semble, graphify, docs, git, project_memory, surreal_memory, web.",
-      "Act as a router:",
-      "- If the prompt is clearly reduced to source code, implementation, symbols, tests, errors, or exact files, choose files + semble.",
-      "- If the prompt asks about architecture, topology, call paths, dependencies, relationships, subsystem boundaries, or how X connects to Y, choose graphify + files + semble.",
-      "- If the prompt spans conceptual setup, flows, lifecycles, boundaries, or how code fits into a system, choose graphify + files + semble + project_memory, and docs when durable docs likely help.",
-      "Prefer the fewest sources likely to contain the answer.",
-      "Choose web only for current/latest/online facts not in the repo.",
-      'Also return as JSON: {"sources":{"sources":["..."],"reason":"...","confidence":0.0}}',
-      "",
-      `Return ONLY a single JSON object with both "indicators" and "sources" keys.`,
-    ].join("\n") }],
-  };
-}
-
-function parsePlannedIndicators(parsed: any, fallback: SearchIndicators): SearchIndicators {
-  if (!parsed?.indicators || !Array.isArray(parsed.indicators.indicators) || parsed.indicators.indicators.length === 0) return fallback;
-  return {
-    indicators: parsed.indicators.indicators.filter((s: unknown): s is string => typeof s === "string" && s.length >= 2).slice(0, 12),
-    reason: String(parsed.indicators.reason ?? "").slice(0, 240) || "model inference",
-    confidence: Math.max(0.1, Math.min(1, Number(parsed.indicators.confidence ?? 0.5))),
-    planner: "llm",
-  };
 }
 
 function parsePlannedSourcePlan(state: State, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
