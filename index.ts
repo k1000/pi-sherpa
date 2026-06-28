@@ -1,4 +1,4 @@
-import { complete, type UserMessage } from "@mariozechner/pi-ai";
+import type { UserMessage } from "@mariozechner/pi-ai";
 import { candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -39,7 +39,7 @@ import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
 import { addExplicitPathCandidates, pathSourceLabel } from "./lib/exact-source";
 import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } from "./lib/file-snippet";
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
-import { completeJsonObjectWithTimeout, timeoutAfter } from "./lib/model-completion";
+import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
 import { pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
@@ -613,40 +613,6 @@ async function escalateToModelSearch(state: State, ctx: ExtensionContext, focus:
   }));
 }
 
-async function llmSummarize(ctx: ExtensionContext, state: State, raw: string, budgetChars = 1200): Promise<string> {
-  if (state.config.model.heuristicOnly) return summarize(raw, budgetChars);
-  if (!state.config.privacy.allowRemoteModel && !state.config.model.useMainPiModel) return summarize(raw, budgetChars);
-  const model = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
-  if (!model) {
-    if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
-    throw new Error(`Sherpa model not found: ${state.config.model.provider}/${state.config.model.id}`);
-  }
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) {
-    if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
-    throw new Error((auth as any).error ?? `Auth failed for ${model.provider}`);
-  }
-  if (!auth.apiKey) {
-    if (state.config.model.fallbackToHeuristics) return summarize(raw, budgetChars);
-    throw new Error(`No API key for ${model.provider}`);
-  }
-  const message: UserMessage = {
-    role: "user",
-    content: [{ type: "text", text: raw.slice(0, 24000) }],
-    timestamp: Date.now(),
-  };
-  const response = await complete(
-    model,
-    {
-      systemPrompt: `${state.distillPrompt}\n\nTask: Summarize this coding-agent context/tool output for the main coding agent. Maximum ${budgetChars} characters. Preserve actionable facts, failures, commands, paths, and next steps. Do not include secrets or raw noisy output.`,
-      messages: [message],
-    },
-    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
-  );
-  if (response.stopReason === "aborted") return summarize(raw, budgetChars);
-  const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
-  return text ? (text.length > budgetChars ? text.slice(0, budgetChars - 1) + "…" : text) : summarize(raw, budgetChars);
-}
 async function runDspyPromptCompile(cwd: string) {
   const scriptPath = path.join(path.dirname(__filename), "scripts", "optimize-sherpa-dspy.py");
   const projectPrompt = path.join(cwd, ".pi", "sherpa", "prompts", "RETRIEVAL.md");
