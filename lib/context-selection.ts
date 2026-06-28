@@ -5,6 +5,16 @@ import { approxTokens } from "./text-utils";
 type ScoredItemLike = { relevance: number };
 type SummarizedItemLike = { summary: string };
 
+type CurateResultLike<T> = {
+  items: T[];
+  abstain: boolean;
+  abstainReason: string;
+  rejected: Array<{ index: number; reason: string; source: string }>;
+  confidence: number;
+  planner: "heuristic";
+  plannerReason: string;
+};
+
 export function shouldAbstain(items: ScoredItemLike[], mode: string) {
   if (!items.length) return "no source-grounded context found";
   const best = items[0]?.relevance ?? 0;
@@ -22,4 +32,8 @@ export function pickFinalContextItems<T extends SummarizedItemLike>(finalItems: 
     if (items.length >= 3) break;
   }
   return { items, used };
+}
+
+export function heuristicCurateResult<T>(items: T[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResultLike<T> {
+  return { items: items.slice(0, 5), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
 }

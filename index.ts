@@ -42,7 +42,7 @@ import { labelRgSource, latestTraceFiles, readSnippetAround, traceFileStats } fr
 import { getSherpaModelAuth, getSherpaModelAuthWithReason, notifySherpaModelFallback } from "./lib/model-auth";
 import { completeJsonObjectWithTimeout, llmSummarize, timeoutAfter } from "./lib/model-completion";
 import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial } from "./lib/config-merge";
-import { pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
+import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
@@ -490,10 +490,6 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
 const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operations, bash commands, "
   + "pi extensions, pi skills, Sherpa memory, Obsidian knowledge bases, coding tasks, "
   + "alphabot trading strategies, backtesting, and workspace operations.";
-
-function heuristicCurateResult(items: ContextItem[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResult {
-  return { items: items.slice(0, 5), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
-}
 
 // Directive: whatever Sherpa delivers must be filtered by the sidecar model before
 // reaching the main model. Under R1+R2, heuristic abstention without the model forces
