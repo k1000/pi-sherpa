@@ -30,7 +30,7 @@ import {
 } from "./lib/evaluation";
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
 import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces, writeDspyTrace } from "./lib/dspy";
-import { parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
+import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
 import { inferSuggestedCommands, inferTaskType, isDirectAnswerCandidate, whyItemMatters } from "./lib/context-signal-helpers";
 import { getDocFilesForFocus, routeSkipsPath } from "./lib/doc-discovery";
 import { explicitPathCandidates, pathSourceLabel, readExplicitSource } from "./lib/exact-source";
@@ -496,51 +496,6 @@ const PROJECT_DOMAIN = "pi coding agent, Sherpa context retrieval, file operatio
 
 function heuristicCurateResult(items: ContextItem[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResult {
   return { items: items.slice(0, 5), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
-}
-
-function contextCompilerManifest(ctx: ExtensionContext, items: ContextItem[], focus: string, mode: string, state: State) {
-  const taskType = inferTaskType(focus);
-  const text = sessionText(ctx);
-  const previousSources = previouslyShownSourceSet(items, state);
-  return items.map((item, index) => ({
-    index,
-    source: item.source,
-    type: item.type,
-    relevance: Number(candidateSortKey(item, focus, mode).toFixed(2)),
-    novelty: itemAlreadySeen(ctx, item, previousSources, text) ? "already_in_session" : "new",
-    summary: conciseSummary(item.summary, 320),
-    rawExcerpt: item.inline ? undefined : (item.raw ?? "").replace(/\s+/g, " ").trim().slice(0, 280),
-    whyCandidateMightMatter: whyItemMatters(item, taskType),
-  }));
-}
-
-function contextCompilerMessage(ctx: ExtensionContext, state: State, focus: string, mode: string, items: ContextItem[]): UserMessage {
-  return {
-    role: "user",
-    timestamp: Date.now(),
-    content: [{ type: "text", text: [
-      `User query: ${focus}`,
-      `Query target packet: ${JSON.stringify(extractQueryTarget(focus))}`,
-      "",
-      "You are Sherpa's single Context Compiler pass.",
-      "You replace separate evidence-judge, novelty-filter, compressor, and final-renderer judgment.",
-      "Given candidate context, output only novel context that directly changes the main agent's next action.",
-      "",
-      "Rules:",
-      "- Keep at most 3 items. Prefer 1. Abstain if nothing is directly useful.",
-      "- Keep only candidates with novelty='new'.",
-      "- Reject generic background, stale memory, adjacent research, broad docs, and keyword-only matches.",
-      "- Prefer candidates whose source/summary matches the query target packet and expected evidence type.",
-      "- Summary must be compact, factual, source-grounded, and action-oriented.",
-      "- Do not invent facts not present in candidate summary/rawExcerpt.",
-      "- Preserve source identity by selecting candidate indexes only; do not rewrite sources/handles.",
-      "",
-      "Return ONLY JSON:",
-      '{"abstain":false,"items":[{"index":0,"summary":"minimal context","why":"why this changes next action"}],"rejected":[{"index":1,"reason":"already in session"}],"reason":"overall judgment"}',
-      "",
-      JSON.stringify(contextCompilerManifest(ctx, items, focus, mode, state), null, 2),
-    ].join("\n") }],
-  };
 }
 
 // Directive: whatever Sherpa delivers must be filtered by the sidecar model before
