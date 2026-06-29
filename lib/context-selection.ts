@@ -35,5 +35,7 @@ export function pickFinalContextItems<T extends SummarizedItemLike>(finalItems: 
 }
 
 export function heuristicCurateResult<T>(items: T[], confidence = 0.3, plannerReason = "heuristic ordering"): CurateResultLike<T> {
-  return { items: items.slice(0, 5), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
+  // Aligned with context-compiler.ts model limit (3 items) to avoid
+  // returning more context via heuristic fallback than via model pass.
+  return { items: items.slice(0, 3), abstain: false, abstainReason: "", rejected: [], confidence, planner: "heuristic", plannerReason };
 }

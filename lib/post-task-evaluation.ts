@@ -261,6 +261,7 @@ export function applyReflectionModelOutput(base: ContextEvaluation, parsed: unkn
 }
 
 export function evaluatePostTaskContext(input: PostTaskEvaluationInput): ContextEvaluation {
+  const sourcePlanConfidence = input.bundle.sourcePlanConfidence;
   const usedFiles = evaluationUsedFiles(input);
   const items = input.bundle.items ?? [];
   const taskKind = classifyEvalTaskKind(input);
@@ -287,6 +288,7 @@ export function evaluatePostTaskContext(input: PostTaskEvaluationInput): Context
     reflection: evaluationReflection(input, taskKind, usedFiles, coveredFiles, missed, noise, { relevance, precision, recall }),
     improvementHint: evaluationImprovementHint(missed, noise, taskKind),
     evaluatedAt: new Date().toISOString(),
+    plannerConfidence: sourcePlanConfidence,
   };
 }
 

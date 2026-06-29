@@ -91,7 +91,7 @@ export { parseCompiledContextItems }; // re-export so tests/golden-retrieval.tes
 export { heuristicSourcePlan }; // re-export so tests/source-plan.test.ts and golden tests keep working
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync, openSync, closeSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -339,9 +339,28 @@ function scratchpadSectionRel(section: ScratchpadSection) {
 function readScratchpadSection(state: State, cwd: string, section: ScratchpadSection, limitChars = 12000) {
   const target = safeScratchpadPath(state, cwd, scratchpadSectionRel(section));
   if (!existsSync(target)) return { target, text: "" };
-  const raw = readFileSync(target, "utf8");
   const max = Math.max(1, Math.min(limitChars, 50000));
-  return { target, text: raw.length > max ? raw.slice(-max) : raw };
+  // Avoid reading the entire file for large scratchpad sections.
+  // Worst-case: 4 UTF-8 bytes per char, plus 1KB safety margin.
+  const tailByteBudget = max * 4 + 1024;
+  const fileSize = statSync(target).size;
+  if (fileSize <= tailByteBudget) {
+    // Small file: read all, then slice chars.
+    const raw = readFileSync(target, "utf8");
+    return { target, text: raw.length > max ? raw.slice(-max) : raw };
+  }
+  // Large file: read only the tail bytes, decode, then slice chars.
+  // Extra bytes handle UTF-8 multi-byte boundaries.
+  const readStart = fileSize - tailByteBudget;
+  const buf = Buffer.alloc(tailByteBudget);
+  const fd = openSync(target, "r");
+  try {
+    readSync(fd, buf, 0, tailByteBudget, readStart);
+    const decoded = buf.toString("utf8");
+    return { target, text: decoded.length > max ? decoded.slice(-max) : decoded };
+  } finally {
+    closeSync(fd);
+  }
 }
 function appendScratchpadSection(state: State, cwd: string, section: ScratchpadSection, text: string, title?: string) {
   const now = new Date().toISOString();
@@ -1299,7 +1318,12 @@ export default function (pi: ExtensionAPI) {
     // harder. Focus compression on noisy command/test/log output.
     if (!["bash", "run_experiment"].includes(event.toolName) && text.length < 100_000) return;
     if (text.length < state.config.summarization.maxToolResultChars) return;
-    const summary = await llmSummarize(ctx, state, text, state.config.summarization.replacementBudget * 4);
+    // Timeout guard: llmSummarize calls the sidecar model which could hang.
+    // Fall back to heuristic truncation on timeout or model error.
+    const summary = await Promise.race([
+      llmSummarize(ctx, state, text, state.config.summarization.replacementBudget * 4),
+      timeoutAfter<string>(10_000, "llmSummarize timed out"),
+    ]).catch(() => conciseSummary(text, state.config.summarization.replacementBudget * 4));
     const handle = `ctx-${state.nextHandle++}`;
     state.handles.set(handle, { handle, type: "tool_raw", source: `tool://${event.toolName}/${event.toolCallId}`, relevance: 1, summary, raw: text });
     const details = event.details && typeof event.details === "object" ? event.details : {};

@@ -1,0 +1,73 @@
+{
+  "name": "sherpa-audit-fixes",
+  "goal": "Fix the 9 devil's advocate audit findings in pi-sherpa: model call timeouts, missing tsconfig, unbounded model search, session reindex waste, confidence calibration, unused progressive-context tier, unconditional scratchpad reads, heuristic/model limit mismatch, and mutable parseEvaluationArgs.",
+  "mode": "dag-plan",
+  "parallelism": 2,
+  "maxIterationsPerStep": 3,
+  "autoCommitEachStep": true,
+  "plan": [
+    {
+      "id": "tsconfig-check",
+      "name": "Create tsconfig.check.json for proper TypeScript gating",
+      "dependsOn": [],
+      "taskPrompt": "Create a tsconfig.check.json file at the pi-sherpa extension root (/Users/kamil/.pi/agent/extensions/pi-sherpa/tsconfig.check.json) that the existing check-extension.ts script references. It must include the extension's lib modules and tests. Use strict settings: strictNullChecks, noImplicitAny, noUnusedLocals, etc. The existing scripts/check-extension.ts calls `tsc -p tsconfig.check.json` but the file doesn't exist yet — this is why the unresolved-symbol guard is \"non-gating\". After creating, verify the check script runs without regressions. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "model-search-bounds",
+      "name": "Cap model-search tool results to prevent prompt overflow",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/lib/model-search-tools.ts, add a maxResults cap (20 items) to the makeFileFinderTool and makeMemorySearchTool implementations so the sidecar model cannot flood the prompt with thousands of results. The makeFileFinderTool currently has no limit on results returned. Add the cap at the tool-run level (not the loop level) so it always applies regardless of caller. Verify with the existing model-search tests and the full check suite. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun test tests/model-search.test.ts && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "heuristic-limit-alignment",
+      "name": "Align heuristicCurateResult limit to match model compiler limit",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/lib/context-selection.ts, change the heuristicCurateResult function's slice from 5 to 3 so it matches the model compiler's limit in context-compiler.ts (line: `if (out.length >= 3) break;`). This prevents the counterintuitive behavior where a model failure (falling back to heuristics) returns more context than a successful model pass. Verify that all existing tests still pass. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "parse-evaluation-immutable",
+      "name": "Fix mutable array mutation in parseEvaluationArgs",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/lib/evaluation-command.ts, the shiftScore helper function mutates the caller's array via `parts.shift()`. Refactor parseEvaluationArgs to NOT mutate its arguments. Options: copy the parts array before passing to shiftScore, or rewrite shiftScore to be purely functional without side effects. The function should return the same values for the same inputs, without touching the input array. Verify by running evaluation-related tests and the full check suite. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "progressive-context-disposition",
+      "name": "Wire or remove unused progressive-context tier system",
+      "dependsOn": [],
+      "taskPrompt": "The file /Users/kamil/.pi/agent/extensions/pi-sherpa/lib/progressive-context.ts defines a full L0/L1/L2 tiered context system (~200 lines) but index.ts never calls assignTiers, promoteToL2, formatTieredItem, or renderTieredBundle — it uses buildContextSignal + bundleMarkdown instead. Options: (A) Wire assignTiers into the buildBundle pipeline so progressive disclosure is actually used, or (B) Delete the file and clean up any remaining references. Document the choice in a code comment explaining the design decision. Verify the full check suite passes. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "scratchpad-lazy-read",
+      "name": "Add lazy/partial read to scratchpad section reading",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/index.ts, the readScratchpadSection function reads the entire file into memory before applying limitChars slicing. For large scratchpad files (thousands of lines), this is wasteful. Refactor to use a streaming or bounded read approach: read only the last N characters directly (e.g., using fs.open + fs.read with a negative position offset to get the tail). Node.js fs.readFileSync always reads the full file — consider fs.open + fs.read with a computed start position, or fs.stat to get file size then read only the tail segment. Verify the check suite passes. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "llm-summarize-timeout",
+      "name": "Add timeout guard to llmSummarize in tool_result handler",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/index.ts, the tool_result event handler calls `await llmSummarize(ctx, state, text, ...)` to compress long bash output. This model call has no timeout guard and could stall the entire agent turn. Fix: wrap the llmSummarize call with a timeout (suggested: 10_000ms). Use the existing timeoutAfter helper from lib/model-completion.ts, or create a new timeout wrapper. If the model call times out, fall back gracefully: skip the compression (return the original text unchanged) rather than blocking. Verify the check suite passes. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "model-search-stop-delivery",
+      "name": "Fix model search stop action to still gate through model",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/lib/model-search.ts, when the model emits action:'stop' after having gathered context, the loop returns gathered candidates directly to the caller WITHOUT going through the model curation gate. This violates the SHERPA_SYSTEM.md directive that 'the model is the delivery gate'. Fix: when action:'stop' fires and there are gathered candidates, treat it as a 'deliver' — wrap the gathered items into a delivery response so they get curated by the model. If nothing was gathered, 'stop' is fine. Verify with the model-search tests and the full check suite. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun test tests/model-search.test.ts && bun scripts/check-extension.ts"
+    },
+    {
+      "id": "session-reindex-startup",
+      "name": "Avoid re-indexing session log on every startup",
+      "dependsOn": [],
+      "taskPrompt": "In /Users/kamil/.pi/agent/extensions/pi-sherpa/index.ts, the session_start event handler calls indexSessionLog(undefined, ctx.cwd) every time. For large session logs, this repeated full re-index wastes I/O. Fix: add a content-hash or mtime check so re-indexing only happens when the session log file has actually changed. Look at lib/session-search.ts for the indexSessionLog function to see how to implement incremental detection. Store the last-indexed mtime in the Sherpa state so it persists across sessions. Verify the check suite passes. End by calling tdd_loop_report.",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && bun test tests/session-search.test.ts && bun scripts/check-extension.ts"
+    }
+  ]
+}

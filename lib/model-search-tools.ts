@@ -15,6 +15,11 @@ import { type SearchTool, type ModelSearchCandidate } from "./model-search";
  * sidecar completion) stays in index.ts.
  */
 
+// Maximum results any model-search tool may return in a single call.
+// The loop controller passes limit=5 for operational tightness;
+// this is the safety/outer bound to prevent prompt flooding.
+export const MODEL_SEARCH_TOOL_MAX_RESULTS = 20;
+
 const MODEL_SEARCH_FILE_ROOTS: string[] = (() => {
   const roots: string[] = [];
   const home = process.env.HOME;
@@ -31,7 +36,7 @@ export function makeFileFinderTool(ctx: ExtensionContext): SearchTool {
       if (!q) return [];
       const out: ModelSearchCandidate[] = [];
       const seen = new Set<string>();
-      const max = Math.min(limit ?? 5, 5);
+      const max = Math.min(limit ?? MODEL_SEARCH_TOOL_MAX_RESULTS, MODEL_SEARCH_TOOL_MAX_RESULTS);
       for (const root of MODEL_SEARCH_FILE_ROOTS) {
         if (!existsSync(root)) continue;
         let entries: string[];
@@ -61,7 +66,7 @@ export function makeMemorySearchTool(): SearchTool {
       const q = (query ?? "").trim();
       if (!q) return [];
       try {
-        const hits = searchSherpaMemory("/Users/kamil/.pi-memory", q, Math.min(limit ?? 5, 5));
+        const hits = searchSherpaMemory("/Users/kamil/.pi-memory", q, Math.min(limit ?? MODEL_SEARCH_TOOL_MAX_RESULTS, MODEL_SEARCH_TOOL_MAX_RESULTS));
         return hits.map((h) => ({ source: `kb://memory/${h.kind ?? ""}/${h.id ?? ""}`, summary: (h.title ? h.title + ": " : "") + (h.summary ?? "").slice(0, 200), relevance: 0.5 }));
       } catch { return []; }
     },

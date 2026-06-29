@@ -142,6 +142,13 @@ export class SessionSearchDb {
     ).run(key, String(value));
   }
 
+  private getMeta(key: string, fallback = ""): string {
+    const row = this.db.query(
+      "SELECT value FROM session_meta WHERE key = ?",
+    ).get(key) as { value: string } | null;
+    return row?.value ?? fallback;
+  }
+
   private setLastIndexedOffset(offset: number): void {
     this.setMeta("last_indexed_offset", offset);
   }
@@ -169,8 +176,22 @@ export class SessionSearchDb {
   indexNewEntries(): number {
     if (!existsSync(this.sessionLogPath)) return 0;
 
+    const fileStat = statSync(this.sessionLogPath);
+
+    // Fast path: mtime + size match stored values — file has not changed
+    // since last index. Skips the DB offset SELECT entirely.
+    const storedMtime = this.getMeta("last_indexed_mtime", "0");
+    const storedSize = this.getMeta("last_indexed_size", "0");
+    if (
+      storedMtime !== "0" &&
+      fileStat.mtimeMs === Number(storedMtime) &&
+      fileStat.size === Number(storedSize)
+    ) {
+      return 0;
+    }
+
     let lastOffset = this.getLastIndexedOffset();
-    const fileSize = statSync(this.sessionLogPath).size;
+    const fileSize = fileStat.size;
 
     if (fileSize < lastOffset) {
       this.resetIndexProgress();
@@ -203,6 +224,7 @@ export class SessionSearchDb {
 
     this.setLastIndexedOffset(fileSize);
     this.setMeta("last_indexed_size", fileSize);
+    this.setMeta("last_indexed_mtime", String(fileStat.mtimeMs));
     this.setMeta("last_indexed_at", new Date().toISOString());
     return indexed;
   }

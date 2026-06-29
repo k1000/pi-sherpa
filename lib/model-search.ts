@@ -121,8 +121,22 @@ export async function runModelSearchLoop(args: {
       return { candidates: items.length ? items : gathered, rounds: round, toolCalls, delivered: true, events, stopReason: "model delivered" };
     }
     if (step.action === "stop") {
-      events.push({ round, step, note: "model chose to stop" });
-      stopReason = "model chose to stop";
+      if (gathered.length > 0) {
+        // Model chose to stop but gathered context — treat as a delivery
+        // so the loop returns delivered=true, preserving the contract
+        // that the model is the delivery gate.
+        events.push({ round, step, note: "stop with gathered context — treating as deliver" });
+        return {
+          candidates: gathered.map((c) => ({ ...c, relevance: Math.max(c.relevance ?? 0.5, 0.7) })),
+          rounds: round,
+          toolCalls,
+          delivered: true,
+          events,
+          stopReason: "stop with gathered context",
+        };
+      }
+      events.push({ round, step, note: "model chose to stop, nothing gathered" });
+      stopReason = "model chose to stop, nothing gathered";
       break;
     }
 

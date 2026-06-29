@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, classifyEvalTaskKind, evaluatePostTaskContext } from "../lib/post-task-evaluation";
-import { readQualitySummary, writeQualitySummary, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
+import { readQualitySummary, writeQualitySummary, summarizeEvaluations, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
 let passed = 0;
@@ -231,6 +231,43 @@ test("feedback does not boost unrelated generic page.tsx candidates", () => {
   assert(adjusted[0].relevance > 0.25, "expected exact page path boost");
   assert(adjusted[1].relevance === 0.25, "unrelated page.tsx should not be boosted by generic basename");
 });
+
+test("summarizeEvaluations computes averageConfidenceError from planner confidence vs recall", () => {
+  const evals: ContextEvaluation[] = [
+    makeBaseEval({ bundleId: "b1", plannerConfidence: 0.9, scores: { relevance: 0.8, precision: 0.7, recall: 0.8 } }),
+    makeBaseEval({ bundleId: "b2", plannerConfidence: 0.6, scores: { relevance: 0.5, precision: 0.5, recall: 0.5 } }),
+    makeBaseEval({ bundleId: "b3", plannerConfidence: 0.3, scores: { relevance: 0.3, precision: 0.3, recall: 0.2 } }),
+  ];
+  // confidence errors: |0.9-0.8|=0.1, |0.6-0.5|=0.1, |0.3-0.2|=0.1 → avg 0.1
+  const summary = summarizeEvaluations(evals);
+  assert(Math.abs(summary.averageConfidenceError - 0.1) < 0.001,
+    `expected avg confidenceError 0.1, got ${summary.averageConfidenceError}`);
+  assert(typeof summary.averageConfidenceError === "number", "averageConfidenceError should be a number");
+});
+
+test("summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence", () => {
+  const evals: ContextEvaluation[] = [
+    makeBaseEval({ bundleId: "b1" }),
+    makeBaseEval({ bundleId: "b2" }),
+  ];
+  const summary = summarizeEvaluations(evals);
+  assert(summary.averageConfidenceError === 0,
+    `expected 0 confidenceError, got ${summary.averageConfidenceError}`);
+});
+
+function makeBaseEval(overrides: Partial<ContextEvaluation> & { bundleId: string }): ContextEvaluation {
+  return {
+    bundleId: overrides.bundleId,
+    taskOutcome: overrides.taskOutcome ?? "unknown",
+    scores: overrides.scores ?? { relevance: 0.5, precision: 0.5, recall: 0.5 },
+    noise: overrides.noise ?? [],
+    missed: overrides.missed ?? [],
+    reflection: overrides.reflection ?? "",
+    improvementHint: overrides.improvementHint ?? "",
+    evaluatedAt: overrides.evaluatedAt ?? new Date().toISOString(),
+    plannerConfidence: overrides.plannerConfidence ?? undefined,
+  };
+}
 
 for (const { name, fn } of tests) {
   try { fn(); passed++; console.log(`✅ ${name}`); }

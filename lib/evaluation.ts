@@ -6,6 +6,7 @@ export type ContextBundleRecord = {
   timestamp: number;
   focus: string;
   mode: string;
+  sourcePlanConfidence?: number;  // Planner's self-assessed confidence for calibration tracking
   items: Array<{
     handle: string;
     type: string;
@@ -28,6 +29,7 @@ export type ContextEvaluation = {
   reflection: string;    // Free-form analysis
   improvementHint: string; // One-line prompt addition for future retrieval
   evaluatedAt: string;
+  plannerConfidence?: number;  // SourcePlan.confidence at retrieval time, for confidence-vs-recall calibration
 };
 
 const EVAL_DIR = "wiki/evidence/sherpa-evaluations";
@@ -52,13 +54,14 @@ type ContextBundleLike = {
   items: Array<{ handle: string; type: string; source: string; summary: string; inline?: boolean }>;
 };
 
-export function stashContextBundle(state: { lastBundleId?: string; bundleRecords?: Map<string, ContextBundleRecord> }, bundle: ContextBundleLike): void {
+export function stashContextBundle(state: { lastBundleId?: string; bundleRecords?: Map<string, ContextBundleRecord> }, bundle: ContextBundleLike & { sourcePlan?: { confidence?: number } }): void {
   state.lastBundleId = bundle.bundleId;
   stashBundle(state, {
     bundleId: bundle.bundleId,
     timestamp: Date.now(),
     focus: bundle.focus,
     mode: bundle.mode,
+    sourcePlanConfidence: bundle.sourcePlan?.confidence,
     items: bundle.items.map((item) => ({
       handle: item.handle,
       type: item.type,
@@ -96,6 +99,7 @@ export function writeEvaluation(projectRoot: string, evalRecord: ContextEvaluati
     `noise: [${evalRecord.noise.join(", ")}]`,
     `missed: [${evalRecord.missed.join(", ")}]`,
     `improvement_hint: ${JSON.stringify(evalRecord.improvementHint)}`,
+    `planner_confidence: ${evalRecord.plannerConfidence ?? ""}`,
     `evaluated_at: ${evalRecord.evaluatedAt}`,
     "type: evidence",
     "source: sherpa-self-evaluation",
@@ -145,6 +149,7 @@ export function readRecentEvaluations(projectRoot: string, limit = 50): ContextE
         reflection: raw.replace(/^---[\s\S]*?---\n*/, "").trim(),
         improvementHint: JSON.parse(fm.improvement_hint ?? '""'),
         evaluatedAt: fm.evaluated_at ?? new Date().toISOString(),
+        plannerConfidence: fm.planner_confidence ? Number(fm.planner_confidence) : undefined,
       });
     } catch { /* ignore malformed */ }
   }
@@ -165,6 +170,7 @@ export function summarizeEvaluations(evals: ContextEvaluation[]): {
   averageRelevance: number;
   averagePrecision: number;
   averageRecall: number;
+  averageConfidenceError: number;  // |plannerConfidence - recall| — 0 = perfectly calibrated
   topNoise: Array<{ source: string; count: number }>;
   topMissed: Array<{ pattern: string; count: number }>;
   topHints: Array<{ hint: string; count: number }>;
@@ -173,6 +179,9 @@ export function summarizeEvaluations(evals: ContextEvaluation[]): {
   const relevanceScores = evals.map((e) => e.scores.relevance);
   const precisionScores = evals.map((e) => e.scores.precision);
   const recallScores = evals.map((e) => e.scores.recall);
+  const confidenceErrors = evals
+    .filter((e) => e.plannerConfidence !== undefined)
+    .map((e) => Math.abs(e.plannerConfidence! - e.scores.recall));
 
   const noiseCounts = new Map<string, number>();
   for (const e of evals) for (const n of e.noise) noiseCounts.set(n, (noiseCounts.get(n) ?? 0) + 1);
@@ -188,6 +197,7 @@ export function summarizeEvaluations(evals: ContextEvaluation[]): {
     averageRelevance: avg(relevanceScores),
     averagePrecision: avg(precisionScores),
     averageRecall: avg(recallScores),
+    averageConfidenceError: confidenceErrors.length ? avg(confidenceErrors) : 0,
     topNoise: [...noiseCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([source, count]) => ({ source, count })),
     topMissed: [...missedCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([pattern, count]) => ({ pattern, count })),
     topHints: [...hintCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([hint, count]) => ({ hint, count })),
