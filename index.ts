@@ -171,7 +171,7 @@ type CurateResult = {
   planner: "heuristic" | "llm";
   plannerReason?: string;
 };
-type ContextBundle = { bundleId: string; taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; signal?: ContextSignalV1 };
+type ContextBundle = { bundleId: string; taskId: string; focus: string; mode: string; budgetUsedTokens: number; items: ContextItem[]; candidateCount?: number; sourcePlan?: SourcePlan; curation?: { planner?: string; confidence?: number; reason?: string }; signal?: ContextSignalV1 };
 
 type State = {
   config: SherpaConfig;
@@ -704,13 +704,15 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
 
   if (compileResult.abstain) {
     const abstainBundle = createEmptyContextBundle(state, focus, mode, candidates, sourcePlan) as ContextBundle;
+    abstainBundle.curation = { planner: compileResult.planner, confidence: compileResult.confidence, reason: compileResult.plannerReason || compileResult.abstainReason };
+    abstainBundle.signal = buildContextSignal(abstainBundle);
     recordDspyTrace(ctx.cwd, abstainBundle, indicators, candidates, compileResult, traceFeedback);
     return abstainBundle;
   }
 
   const { items, used } = pickFinalContextItems(compileResult.items, tokenBudget);
   state.bundles++;
-  const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan };
+  const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan, curation: { planner: compileResult.planner, confidence: compileResult.confidence, reason: compileResult.plannerReason } };
   bundle.signal = buildContextSignal(bundle);
   recordDspyTrace(ctx.cwd, bundle, indicators, candidates, compileResult, traceFeedback);
   stashContextBundle(state, bundle);

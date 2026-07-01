@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { conciseSummary, extractQueryTarget, heuristicSourcePlan, isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt, parseCompiledContextItems, postProcessCandidates, resolveModelFilterPool } from "../index";
+import { readSnippetAround } from "../lib/file-snippet";
+import { signalMarkdown } from "../lib/signal-render";
 
 type Candidate = Parameters<typeof postProcessCandidates>[0][number];
 
@@ -78,6 +83,7 @@ test("golden: pi-sherpa prompt routes to extension code instead of unrelated res
     candidate({ type: "file", source: "file://~/.pi/agent/extensions/pi-sherpa/index.ts:1145", relevance: 0.65, summary: "async function compileContextWithModel" }),
   ]);
   assertIncludesAny(actual, "extensions/pi-sherpa");
+  assert.equal(actual[0], "file://~/.pi/agent/extensions/pi-sherpa/index.ts:1145");
   assertExcludesAny(actual, "hipporag-long-term-memory-rag.md");
 });
 
@@ -157,6 +163,42 @@ test("golden: target term matches boost exact source over adjacent context", () 
     candidate({ type: "file", source: "repo://index.ts:1110", relevance: 0.4, summary: "compileContextWithModel context compiler" }),
   ]);
   assert.equal(actual[0], "repo://index.ts:1110");
+});
+
+test("golden: debug snippet extraction prefers declarations over imports", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sherpa-snippet-"));
+  const target = path.join(dir, "index.ts");
+  try {
+    writeFileSync(target, [
+      'import { compileContextWithModel } from "./compiler";',
+      "// filler ".repeat(40),
+      "export async function compileContextWithModel() {",
+      "  return 'implementation';",
+      "}",
+    ].join("\n"));
+    const snippet = readSnippetAround(target, ["compileContextWithModel"], 180) ?? "";
+    assert.ok(snippet.includes("export async function compileContextWithModel"), snippet);
+    assert.ok(!snippet.includes("import { compileContextWithModel"), snippet);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("golden: sherpa-context renders diagnostic planner metadata", () => {
+  const rendered = signalMarkdown({
+    version: "1",
+    focus: "review [sherpa-context] quality",
+    taskType: "analysis",
+    confidence: 0.8,
+    disposition: { kind: "provide_context", reason: "test" },
+    items: [{ handle: "ctx-1", type: "file", source: "repo://index.ts", relevance: 0.8, summary: "compileContextWithModel", why: "implementation evidence" }],
+    risks: [],
+    missingInfo: [],
+    suggestedCommands: [],
+    renderHints: { style: "minimal", maxItems: 3 },
+    diagnostics: { sourcesSearched: ["files"], candidateCount: 17, selectedCount: 1, sourcePlanner: "llm", curationPlanner: "llm", curationConfidence: 0.7 },
+  }, "front-door", 0, undefined, "bundle-test");
+  assert.ok(rendered.includes("Diagnostics: planner=llm; curator=llm; curatorConfidence=0.70; candidates=17; selected=1"), rendered);
 });
 
 test("golden: unified context compiler parser keeps valid unique indexes capped at 3", () => {

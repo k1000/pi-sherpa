@@ -66,7 +66,7 @@ export function contextCompilerManifest(ctx: ExtensionContext, items: CompilerCo
     relevance: Number(candidateSortKey(item, focus, mode).toFixed(2)),
     novelty: itemAlreadySeen(ctx, item, previousSources, text) ? "already_in_session" : "new",
     summary: conciseSummary(item.summary, 320),
-    rawExcerpt: item.inline ? undefined : (item.raw ?? "").replace(/\s+/g, " ").trim().slice(0, 280),
+    rawExcerpt: item.inline ? undefined : (item.raw ?? "").replace(/\s+/g, " ").trim().slice(0, item.type.includes("file") || item.type.includes("semantic_code") ? 900 : 280),
     whyCandidateMightMatter: whyItemMatters(item, taskType),
   }));
 }

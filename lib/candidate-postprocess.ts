@@ -48,6 +48,7 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   const targetHits = target.targetTerms.filter((term) => haystack.includes(term.replace(/[-_]/g, "")) || haystack.replace(/[-_]/g, "").includes(term.replace(/[-_]/g, ""))).length;
   if (targetHits) value += Math.min(0.45, targetHits * 0.12);
   if (target.evidenceType === "code" && (item.type.includes("file") || item.type.includes("semantic_code"))) value += 0.18;
+  if (item.type === "pi_extension_route") value -= target.evidenceType === "code" || wantsSource ? 0.75 : 0.35;
   if (target.evidenceType === "docs" && item.type.includes("doc")) value += 0.14;
   if (isGloballyNoisySource(item.source)) value -= 2.0;
   if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= 2.0;

@@ -56,5 +56,13 @@ export type ContextSignalV1 = {
     missingInfoNeeded: string[];
   };
   renderHints?: { style: "minimal" | "normal" | "detailed"; maxItems?: number };
-  diagnostics: { sourcesSearched: string[]; candidateCount: number; selectedCount: number };
+  diagnostics: {
+    sourcesSearched: string[];
+    candidateCount: number;
+    selectedCount: number;
+    sourcePlanner?: string;
+    curationPlanner?: string;
+    curationConfidence?: number;
+    curationReason?: string;
+  };
 };

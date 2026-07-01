@@ -19,8 +19,8 @@ export function addPiSherpaDebugSourceCandidates(ctx: { cwd: string }, focus: st
     if (raw) add("file", pathSourceLabel(dspyPath, ctx.cwd), raw, 0.82);
   }
   if (existsSync(indexPath)) {
-    const raw = readSnippetAround(indexPath, ["recordDspyTrace", "buildBundle", "compileContextWithModel", "planSources"]);
-    if (raw) add("file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.66);
+    const raw = readSnippetAround(indexPath, ["planSources", "compileContextWithModel", "buildBundle", "recordDspyTrace", "bundleMarkdown"], 5200);
+    if (raw) add("file", pathSourceLabel(indexPath, ctx.cwd), raw, 0.76);
   }
 }
 
@@ -39,7 +39,7 @@ export async function addPiExtensionCandidates(
       `Root: ${root}`,
       keyFiles.length ? `Key files: ${keyFiles.join(", ")}` : "Key files: none detected",
       isTraceLogMetricsPrompt(focus) ? "Trace logs: active cwd .pi-memory/sherpa-traces/*.jsonl" : "",
-    ].filter(Boolean).join("\n"), 0.7);
+    ].filter(Boolean).join("\n"), 0.5);
     addPiSherpaDebugSourceCandidates(ctx, focus, root, add);
 
     const query = [focus, ...indicators.indicators].join(" ");

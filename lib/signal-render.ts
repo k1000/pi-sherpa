@@ -24,10 +24,28 @@ export function signalItemMarkdownItem(i: ContextSignalV1["items"][number]): str
   return `- ${i.handle} — ${shortSource}${body}`;
 }
 
+function shouldShowDiagnostics(signal: ContextSignalV1): boolean {
+  return /\b(?:sherpa-context|pi-sherpa|sherpa context|context curation|context compiler)\b/i.test(signal.focus);
+}
+
+function diagnosticLine(signal: ContextSignalV1): string {
+  if (!shouldShowDiagnostics(signal)) return "";
+  const diagnostics = signal.diagnostics;
+  const parts = [
+    diagnostics.sourcePlanner ? `planner=${diagnostics.sourcePlanner}` : "",
+    diagnostics.curationPlanner ? `curator=${diagnostics.curationPlanner}` : "",
+    typeof diagnostics.curationConfidence === "number" ? `curatorConfidence=${diagnostics.curationConfidence.toFixed(2)}` : "",
+    `candidates=${diagnostics.candidateCount}`,
+    `selected=${diagnostics.selectedCount}`,
+  ].filter(Boolean);
+  return parts.length ? `\nDiagnostics: ${parts.join("; ")}` : "";
+}
+
 export function signalMarkdown(signal: ContextSignalV1, mode: string, budgetUsedTokens: number, sourcePlan?: unknown, bundleId?: string) {
   const bundleLine = bundleId ? `\nBundle: ${bundleId}` : "";
+  const diagnostics = diagnosticLine(signal);
   if (signal.disposition.kind === "abstain") return "";
-  return `## Context${bundleLine}\n${signal.items.slice(0, signal.renderHints?.maxItems ?? 5).map(signalItemMarkdownItem).join("\n")}`;
+  return `## Context${bundleLine}${diagnostics}\n${signal.items.slice(0, signal.renderHints?.maxItems ?? 5).map(signalItemMarkdownItem).join("\n")}`;
 }
 
 export function bundleMarkdown(bundle: BundleLike) {

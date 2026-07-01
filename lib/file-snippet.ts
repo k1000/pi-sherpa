@@ -12,11 +12,29 @@ export function labelRgSource(fileAndLine: string, cwd: string): string {
   return `${source}:${line}`;
 }
 
+function snippetNeedleIndex(raw: string, needles: string[]): number {
+  const declarationPatterns = needles.flatMap((needle) => {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return [
+      new RegExp(`\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}\\b`, "i"),
+      new RegExp(`\\b(?:export\\s+)?(?:const|let|var)\\s+${escaped}\\b`, "i"),
+      new RegExp(`\\b(?:export\\s+)?class\\s+${escaped}\\b`, "i"),
+    ];
+  });
+  const declarationHits = declarationPatterns
+    .map((pattern) => raw.search(pattern))
+    .filter((n) => n >= 0)
+    .sort((a, b) => a - b);
+  if (declarationHits.length) return declarationHits[0];
+
+  const lower = raw.toLowerCase();
+  return needles.map((needle) => lower.indexOf(needle.toLowerCase())).filter((n) => n >= 0).sort((a, b) => a - b)[0] ?? 0;
+}
+
 export function readSnippetAround(abs: string, needles: string[], max = 3600): string | undefined {
   try {
     const raw = readFileSync(abs, "utf8");
-    const lower = raw.toLowerCase();
-    const idx = needles.map((needle) => lower.indexOf(needle.toLowerCase())).filter((n) => n >= 0).sort((a, b) => a - b)[0] ?? 0;
+    const idx = snippetNeedleIndex(raw, needles);
     const start = Math.max(0, idx - Math.floor(max / 3));
     const end = Math.min(raw.length, start + max);
     const prefix = start > 0 ? `... excerpt from ${path.basename(abs)} ...\n` : "";

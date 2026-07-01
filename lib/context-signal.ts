@@ -19,7 +19,8 @@ type ContextBundleLike = {
   mode: string;
   items: ContextItemLike[];
   candidateCount?: number;
-  sourcePlan?: { sources?: string[] };
+  sourcePlan?: { sources?: string[]; planner?: string };
+  curation?: { planner?: string; confidence?: number; reason?: string };
 };
 
 export function buildOpeningRecommendation(signal: Omit<ContextSignalV1, "openingRecommendation">): ContextSignalV1["openingRecommendation"] | undefined {
@@ -99,7 +100,15 @@ export function buildContextSignal(bundle: ContextBundleLike): ContextSignalV1 {
     missingInfo,
     suggestedCommands,
     renderHints: { style: bundle.mode === "front-door" ? "minimal" as const : "normal" as const, maxItems: 3 },
-    diagnostics: { sourcesSearched: bundle.sourcePlan?.sources ?? [], candidateCount: bundle.candidateCount ?? bundle.items.length, selectedCount: bundle.items.length },
+    diagnostics: {
+      sourcesSearched: bundle.sourcePlan?.sources ?? [],
+      candidateCount: bundle.candidateCount ?? bundle.items.length,
+      selectedCount: bundle.items.length,
+      sourcePlanner: bundle.sourcePlan?.planner,
+      curationPlanner: bundle.curation?.planner,
+      curationConfidence: bundle.curation?.confidence,
+      curationReason: bundle.curation?.reason,
+    },
   };
   return { ...signalBase, openingRecommendation: buildOpeningRecommendation(signalBase) };
 }
