@@ -1793,12 +1793,55 @@ export default function (pi: ExtensionAPI) {
     catch { return 0; }
   };
 
-  pi.registerCommand("sherpa:memory:status", { description: "Show Sherpa memory status", handler: async (_args, ctx) => {
+  const countJsonl = (file: string) => {
+    try { return existsSync(file) ? readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).length : 0; }
+    catch { return 0; }
+  };
+  const readJsonFile = (file: string): any => {
+    try { return JSON.parse(readFileSync(file, "utf8")); }
+    catch { return undefined; }
+  };
+  const memoryApiHealthLine = async (cfg: any) => {
+    const api = cfg?.memoryApi;
+    if (!api?.enabled || !api?.url) return "Inquirer API: disabled";
+    try {
+      const headers: Record<string, string> = { "User-Agent": "pi-sherpa-memory-status" };
+      if (api.token) headers["Authorization"] = `Basic ${api.token}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`${String(api.url).replace(/\/$/, "")}/api/v1/memory/health`, { headers, signal: controller.signal });
+        if (!response.ok) return `Inquirer API: HTTP ${response.status}`;
+        const health: any = await response.json();
+        const embedding = health.embedding ?? {};
+        return `Inquirer API: ${health.status ?? "unknown"}; artifacts=${health.artifacts ?? "?"}; chunks=${health.chunks ?? "?"}; embedding=${embedding.configuredProvider ?? "?"}/${embedding.lastMode ?? "?"}; fallbacks=${embedding.fallbackCount ?? "?"}`;
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return `Inquirer API: unreachable (${message})`;
+    }
+  };
+  const buildUnifiedMemoryStatus = async (ctx: ExtensionContext) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    const cfg: any = state.config;
     const projectScratchpad = getProjectKBBasedir(ctx.cwd);
     const obsidianMemory = obsidianMemoryPath(state);
+    const reflectDir = path.join(ctx.cwd, ".pi", "reflect");
+    const archivistConfig = readJsonFile(path.join(homedir(), ".pi", "archivist.config.json"));
+    const scriptsDir = path.join(homedir(), ".hermes", "scripts");
+    const outboxScript = path.join(scriptsDir, "consume-archivist-outbox.py");
+    const vaultIngestScript = path.join(scriptsDir, "vault-bulk-ingest.py");
+    const inquirer = await memoryApiHealthLine(cfg);
     const lines = [
-      "## Sherpa Memory Status",
+      "## Memory / Extension Status",
+      "",
+      inquirer,
+      `Sherpa: ${cfg.enabled ? cfg.mode : "off"}; surreal=${cfg.surreal_memory ? "on" : "off"}; proactive=${cfg.proactive?.enabled ? "on" : "off"}; allowNetwork=${cfg.privacy?.allowNetwork ? "on" : "off"}; dspy=${cfg.dspy?.enabled ? "on" : "off"}`,
+      `Archivist: ${archivistConfig?.enabled ? "enabled" : "disabled/unknown"}; model=${archivistConfig?.model?.provider ?? "?"}/${archivistConfig?.model?.id ?? "?"}; mirror=${archivistConfig?.memoryApi?.enabled ? "on" : "off"}`,
+      `Reflect: index=${countJsonl(path.join(reflectDir, "index.jsonl"))}; outbox=${countJsonl(path.join(reflectDir, "archivist-outbox.jsonl"))}; memory=${existsSync(path.join(reflectDir, "MEMORY.md")) ? "yes" : "no"}`,
+      `Automation scripts: outbox-consumer=${existsSync(outboxScript) ? "present" : "missing"}; vault-ingest=${existsSync(vaultIngestScript) ? "present" : "missing"}`,
       "",
       `Sherpa memory dir: ${SHERPA_MEMORY_DIR}`,
       `Project scratchpad: ${projectScratchpad}`,
@@ -1816,7 +1859,17 @@ export default function (pi: ExtensionAPI) {
       `Obsidian journal: ${countMd(path.join(obsidianMemory, "journal"))}`,
       `Obsidian inbox: ${countMd(path.join(obsidianMemory, "inbox"))}`,
     ];
-    ctx.ui.notify(lines.join("\n"), "info");
+    return lines;
+  };
+
+  pi.registerCommand("memory:status", { description: "Show unified Sherpa/Archivist/Reflect/Inquirer memory status", handler: async (_args, ctx) => {
+    const lines = await buildUnifiedMemoryStatus(ctx);
+    ctx.ui.notify(lines.join("\n"), lines.some((line) => /unreachable|disabled\/unknown|missing/.test(line)) ? "warning" : "info");
+  }});
+
+  pi.registerCommand("sherpa:memory:status", { description: "Show unified Sherpa/Archivist/Reflect/Inquirer memory status", handler: async (_args, ctx) => {
+    const lines = await buildUnifiedMemoryStatus(ctx);
+    ctx.ui.notify(lines.join("\n"), lines.some((line) => /unreachable|disabled\/unknown|missing/.test(line)) ? "warning" : "info");
   }});
 
   pi.registerCommand("sherpa:checkpoint", { description: "Write project working-context and daily session checkpoint to repo-local scratchpad", handler: async (args, ctx) => {

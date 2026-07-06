@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const sherpaDir = path.resolve(__dirname, "..");
+const bun = process.execPath;
 function run(command: string[], cwd = sherpaDir) {
   const result = Bun.spawnSync(command, { cwd, stdout: "inherit", stderr: "inherit" });
   if (result.exitCode !== 0) process.exit(result.exitCode);
@@ -53,12 +54,12 @@ checkNoUnresolvedTypeScriptSymbols();
 for (const test of tests) {
   const testPath = path.join(testsDir, test);
   console.log(`\n▶ ${test}`);
-  run(["bun", testPath]);
+  run([bun, testPath]);
 }
 
 console.log("\n▶ bundle check");
 run([
-  "bun",
+  bun,
   "build",
   path.join(sherpaDir, "index.ts"),
   "--target=node",
