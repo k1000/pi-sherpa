@@ -646,7 +646,7 @@ async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: str
   addExplicitPathCandidates(ctx.cwd, focus, add);
   addRuntimeTraceCandidates(ctx, focus, add);
   await addPiExtensionCandidates(ctx, focus, indicators, mentionedPiExtensionRoots(focus), add);
-  await addRoutedFileCandidates(ctx, focus, sourcePlan, add);
+  await addRoutedFileCandidates(ctx, focus, mode, sourcePlan, add);
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
 }
 

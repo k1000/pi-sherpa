@@ -44,7 +44,7 @@ Archivist owns:
 
 ## Model configuration
 
-Sherpa uses a dedicated sidecar model unless `useMainPiModel` is explicitly enabled in `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`. This installation's global Sherpa config uses `minimax/MiniMax-M2.7-highspeed` so Sherpa stays aligned with Archivist while remaining separate from the main Pi model.
+Sherpa uses a dedicated sidecar model unless `useMainPiModel` is explicitly enabled in `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`. This installation's global Sherpa config uses `deepseek/deepseek-v4-flash` so Sherpa stays aligned with Archivist while remaining separate from the main Pi model.
 
 ## Verification
 
