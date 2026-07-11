@@ -176,8 +176,8 @@ test("index resets when session log is truncated", () => withTemp((dir) => {
   const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
   assertEqual(db.indexNewEntries(), 8, "initial entries indexed");
   writeFileSync(logPath, JSON.stringify({ sessionId: "new", ts: "2026-06-05T10:00:00.000Z", kind: "prompt", prompt: "after rotation" }) + "\n");
-  assertEqual(db.indexNewEntries(), 1, "truncated log reindexed from start");
-  assertEqual(db.getIndexedEntryCount(), 1, "old entries removed after truncation");
+  assertEqual(db.indexNewEntries(), 1, "truncated log reindexed new entry");
+  assertEqual(db.getIndexedEntryCount(), 9, "old entries preserved after truncation + 1 new");
   db.close();
 }));
 

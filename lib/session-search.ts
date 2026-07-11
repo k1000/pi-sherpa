@@ -8,7 +8,7 @@
  * See: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
  */
 
-import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
@@ -40,10 +40,12 @@ export type SessionSearchResult = {
 export type SessionSearchConfig = {
   /** Path to the SQLite FTS5 database file. Default: ~/.pi-memory/session-search.db */
   dbPath?: string;
-  /** Path to the session log JSONL file. Default: ~/hyperpod-tmp/session.jsonl */
+  /** Path to the session log file or directory of .jsonl files. Default: ~/hyperpod-tmp/session.jsonl */
   sessionLogPath?: string;
   /** Maximum results per search query. Default: 10 */
   maxResults?: number;
+  /** Max new files to scan per indexNewEntries call (0 = unlimited). Default: 50 */
+  maxFilesPerRun?: number;
 };
 
 // ── Defaults ────────────────────────────────────────────────────────
@@ -59,6 +61,7 @@ export class SessionSearchDb {
   private dbPath: string;
   private sessionLogPath: string;
   private maxResults: number;
+  private maxFilesPerRun: number;
 
   constructor(baseDir: string, config?: SessionSearchConfig) {
     this.dbPath = path.resolve(baseDir, config?.dbPath ?? DEFAULT_DB_PATH);
@@ -66,6 +69,7 @@ export class SessionSearchDb {
       config?.sessionLogPath ?? path.join(homedir(), DEFAULT_SESSION_LOG),
     );
     this.maxResults = config?.maxResults ?? 10;
+    this.maxFilesPerRun = config?.maxFilesPerRun ?? 50;
 
     // Ensure parent directory exists
     const dir = path.dirname(this.dbPath);
@@ -170,41 +174,63 @@ export class SessionSearchDb {
   }
 
   /**
-   * Index any new entries from the session log.
+   * Index any new entries from the session log directory.
    * Returns the number of new entries indexed.
    */
+  private sessionLogFiles(maxFiles = 0): string[] {
+    if (!existsSync(this.sessionLogPath)) return [];
+    const stat = statSync(this.sessionLogPath);
+    if (stat.isFile()) return [this.sessionLogPath];
+    const all: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isFile() && entry.name.endsWith(".jsonl")) all.push(full);
+      }
+    };
+    walk(this.sessionLogPath);
+    // Sort newest-first so the first N files are the most recent sessions
+    all.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    return maxFiles > 0 ? all.slice(0, maxFiles) : all;
+  }
+
   indexNewEntries(): number {
-    if (!existsSync(this.sessionLogPath)) return 0;
+    const files = this.sessionLogFiles(this.maxFilesPerRun);
+    if (files.length === 0) return 0;
+    let total = 0;
+    for (const file of files) {
+      total += this.indexFile(file);
+    }
+    return total;
+  }
 
-    const fileStat = statSync(this.sessionLogPath);
+  private indexFile(filePath: string): number {
+    if (!existsSync(filePath)) return 0;
+    const fileStat = statSync(filePath);
+    if (!fileStat.isFile()) return 0;
 
-    // Fast path: mtime + size match stored values — file has not changed
-    // since last index. Skips the DB offset SELECT entirely.
-    const storedMtime = this.getMeta("last_indexed_mtime", "0");
-    const storedSize = this.getMeta("last_indexed_size", "0");
-    if (
-      storedMtime !== "0" &&
-      fileStat.mtimeMs === Number(storedMtime) &&
-      fileStat.size === Number(storedSize)
-    ) {
+    const mtimeKey = `last_indexed_mtime:${filePath}`;
+    const sizeKey = `last_indexed_size:${filePath}`;
+    const offsetKey = `last_offset:${filePath}`;
+
+    const storedMtime = this.getMeta(mtimeKey, "0");
+    const storedSize = this.getMeta(sizeKey, "0");
+    if (storedMtime !== "0" && fileStat.mtimeMs === Number(storedMtime) && fileStat.size === Number(storedSize)) {
       return 0;
     }
 
-    let lastOffset = this.getLastIndexedOffset();
+    let lastOffset = Number(this.getMeta(offsetKey, "0"));
     const fileSize = fileStat.size;
+    if (fileSize < lastOffset) { lastOffset = 0; }
+    if (fileSize === lastOffset) return 0;
 
-    if (fileSize < lastOffset) {
-      this.resetIndexProgress();
-      lastOffset = 0;
-    }
-    if (fileSize === lastOffset) return 0; // Nothing new
-
-    const buffer = readFileSync(this.sessionLogPath);
+    const buffer = readFileSync(filePath);
     const remaining = buffer.subarray(lastOffset).toString("utf8");
     const lines = remaining.split("\n").filter(Boolean);
 
     if (lines.length === 0) {
-      this.setLastIndexedOffset(fileSize);
+      this.setMeta(offsetKey, String(fileSize));
       return 0;
     }
 
@@ -222,9 +248,9 @@ export class SessionSearchDb {
     });
     insertEntries(lines);
 
-    this.setLastIndexedOffset(fileSize);
-    this.setMeta("last_indexed_size", fileSize);
-    this.setMeta("last_indexed_mtime", String(fileStat.mtimeMs));
+    this.setMeta(offsetKey, String(fileSize));
+    this.setMeta(sizeKey, String(fileSize));
+    this.setMeta(mtimeKey, String(fileStat.mtimeMs));
     this.setMeta("last_indexed_at", new Date().toISOString());
     return indexed;
   }

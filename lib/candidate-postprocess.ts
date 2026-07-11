@@ -38,6 +38,7 @@ export function sourceDedupeKey(source: string) {
 export function candidateSortKey(item: ContextItemLike, focus: string, mode: string) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const target = extractQueryTarget(focus);
+  const isEvalQuery = /\b(eval|metrics|quality|relevance|precision|recall|improvement)\b/i.test(focus);
   let value = item.relevance;
   if (wantsSource) {
     value += item.type === "file" ? 0.35
@@ -51,6 +52,10 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   if (item.type === "pi_extension_route") value -= target.evidenceType === "code" || wantsSource ? 0.75 : 0.35;
   if (target.evidenceType === "docs" && item.type.includes("doc")) value += 0.14;
   if (isGloballyNoisySource(item.source)) value -= 2.0;
+  if (item.source.includes("sherpa-evaluations") && !isEvalQuery) value -= 0.6;
+  if ((target.targetTerms.length > 0) && (target.targetTerms.some((term) => item.source.includes(term) || item.summary.toLowerCase().includes(term)))) {
+    value += 0.2;
+  }
   if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= 2.0;
   if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) value -= 1.5;
   if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) value -= 1.2;

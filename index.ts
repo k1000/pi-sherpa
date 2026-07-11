@@ -447,7 +447,7 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
 async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
   const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
   const overridden = normalizeSources(sourceOverride, mode);
-  if (overridden.length) return { sourcePlan: { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan }, indicators: await inferSearchIndicators(state, ctx, focus) };
+  if (overridden.length) return { sourcePlan: { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan }, indicators: heuristicSearchIndicators(focus) };
 
   const fallbackPlan = routedFallbackPlan(state, focus, mode, routePlan) as SourcePlan;
   const heuristicInds = heuristicSearchIndicators(focus);
@@ -1043,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
     setSherpaStatus(ctx);
     // Index new session log entries for FTS5 search
     try {
-      const indexed = indexSessionLog(undefined, ctx.cwd);
+      const indexed = indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd);
       if (indexed > 0) {
         const total = getIndexedEntryCount(undefined, ctx.cwd);
         try { ctx.ui.notify(`Sherpa indexed ${indexed} new session entries (${total} total)`, "info"); } catch {}
@@ -1133,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
       if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
       try {
         // Index new entries first for fresh data
-        const indexed = indexSessionLog(undefined, ctx.cwd);
+        const indexed = indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd);
 
         if (params.listSessions) {
           const sessions = listSessions(undefined, ctx.cwd);
@@ -1829,10 +1829,26 @@ export default function (pi: ExtensionAPI) {
     const projectScratchpad = getProjectKBBasedir(ctx.cwd);
     const obsidianMemory = obsidianMemoryPath(state);
     const reflectDir = path.join(ctx.cwd, ".pi", "reflect");
+    const reflectGlobalDir = path.join(homedir(), ".pi", "reflect");
     const archivistConfig = readJsonFile(path.join(homedir(), ".pi", "archivist.config.json"));
+    const bobConfig = readJsonFile(path.join(homedir(), ".pi", "agent", "bob.json"));
+    const projectSherpaConfig = readJsonFile(path.join(ctx.cwd, ".pi", "sherpa.config.json"));
+    const globalSherpaConfig = readJsonFile(path.join(homedir(), ".pi", "sherpa.config.json"));
+    const archivistAuth = (() => {
+    if (!archivistConfig?.memoryApi?.enabled) return { configured: false, source: "disabled" };
+    const tokenEnv = archivistConfig.memoryApi.tokenEnv || "SHERPA_MEMORY_API_TOKEN";
+    const hasToken = process.env[tokenEnv] || archivistConfig.memoryApi.token;
+    if (hasToken) return { configured: true, source: `env:${tokenEnv}` };
+    const url = archivistConfig.memoryApi.url || "";
+    if (url.includes("localhost") || url.includes("127.0.0.1")) return { configured: true, source: "dev-localhost (no token needed)" };
+    return { configured: false, source: `env:${tokenEnv} (missing)` };
+  })();
     const scriptsDir = path.join(homedir(), ".hermes", "scripts");
     const outboxScript = path.join(scriptsDir, "consume-archivist-outbox.py");
     const vaultIngestScript = path.join(scriptsDir, "vault-bulk-ingest.py");
+    const sessionSearchDb = path.join(ctx.cwd, ".pi-memory", "session-search.db");
+    let sessionSearchStaleness = "?";
+    try { const st = statSync(sessionSearchDb); sessionSearchStaleness = `${Math.round((Date.now() - st.mtimeMs) / 86400000)}d ago`; } catch {}
     const inquirer = await memoryApiHealthLine(cfg);
     const lines = [
       "## Memory / Extension Status",
@@ -1840,7 +1856,12 @@ export default function (pi: ExtensionAPI) {
       inquirer,
       `Sherpa: ${cfg.enabled ? cfg.mode : "off"}; surreal=${cfg.surreal_memory ? "on" : "off"}; proactive=${cfg.proactive?.enabled ? "on" : "off"}; allowNetwork=${cfg.privacy?.allowNetwork ? "on" : "off"}; dspy=${cfg.dspy?.enabled ? "on" : "off"}`,
       `Archivist: ${archivistConfig?.enabled ? "enabled" : "disabled/unknown"}; model=${archivistConfig?.model?.provider ?? "?"}/${archivistConfig?.model?.id ?? "?"}; mirror=${archivistConfig?.memoryApi?.enabled ? "on" : "off"}`,
+      `Archivist auth: ${archivistAuth.configured ? `${archivistAuth.source}=configured` : `unconfigured (${archivistAuth.source})`}`,
       `Reflect: index=${countJsonl(path.join(reflectDir, "index.jsonl"))}; outbox=${countJsonl(path.join(reflectDir, "archivist-outbox.jsonl"))}; memory=${existsSync(path.join(reflectDir, "MEMORY.md")) ? "yes" : "no"}`,
+      `Reflect global: index=${countJsonl(path.join(reflectGlobalDir, "index.jsonl"))}; outbox=${countJsonl(path.join(reflectGlobalDir, "archivist-outbox.jsonl"))}`,
+      `Bob: model=${bobConfig?.model ?? "?"}/${bobConfig?.id ?? "?"}; provider=${bobConfig?.provider ?? "?"}`,
+      `Session search DB: ${sessionSearchStaleness}`,
+      `Config split-brain: ${JSON.stringify(projectSherpaConfig?.proactive?.enabled)}(${path.basename(ctx.cwd)}) vs ${JSON.stringify(globalSherpaConfig?.proactive?.enabled)}(global)`,
       `Automation scripts: outbox-consumer=${existsSync(outboxScript) ? "present" : "missing"}; vault-ingest=${existsSync(vaultIngestScript) ? "present" : "missing"}`,
       "",
       `Sherpa memory dir: ${SHERPA_MEMORY_DIR}`,
@@ -1926,7 +1947,7 @@ export default function (pi: ExtensionAPI) {
     const query = parts.length > 1 ? parts[0]! : (args ?? "").trim();
     const limit = parts.length > 1 ? parseInt(parts[1]!, 10) : 5;
     if (!query) { ctx.ui.notify("Usage: /sherpa:session-search <query> [limit]", "warning"); return; }
-    const indexed = indexSessionLog(undefined, ctx.cwd);
+    const indexed = indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd);
     const results = searchSessions(query, limit, undefined, ctx.cwd);
     const total = getIndexedEntryCount(undefined, ctx.cwd);
     if (!results.length) { ctx.ui.notify(`Session search: no results for "${query}" (${total} entries indexed)`, "info"); return; }

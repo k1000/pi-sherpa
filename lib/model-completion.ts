@@ -20,6 +20,40 @@ export function timeoutAfter<T>(ms: number, message: string): Promise<T> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms));
 }
 
+async function completeWithAbortableTimeout(
+  model: any,
+  systemPrompt: string,
+  messages: UserMessage[],
+  auth: any,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  timeoutMessage: string,
+) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const abortFromContext = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener?.("abort", abortFromContext, { once: true });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      complete(model, { systemPrompt, messages }, { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal }),
+      new Promise<any>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timedOut) controller.abort();
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener?.("abort", abortFromContext);
+  }
+}
+
 export async function completeJsonObjectWithTimeout(
   state: RetrievalPromptStateLike,
   ctx: ExtensionContext,
@@ -29,10 +63,7 @@ export async function completeJsonObjectWithTimeout(
   timeoutMs: number,
   timeoutMessage: string,
 ) {
-  const response = await Promise.race([
-    complete(model, { systemPrompt: state.retrievalPrompt, messages: [message] }, { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal }),
-    timeoutAfter<any>(timeoutMs, timeoutMessage),
-  ]);
+  const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage);
   if (response.stopReason === "aborted") return { aborted: true, parsed: null };
   const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
   return { aborted: false, parsed: extractJsonObject(text) };
@@ -60,13 +91,14 @@ export async function llmSummarize(ctx: ExtensionContext, state: SummarizeStateL
     content: [{ type: "text", text: raw.slice(0, 24000) }],
     timestamp: Date.now(),
   };
-  const response = await complete(
+  const response = await completeWithAbortableTimeout(
     model,
-    {
-      systemPrompt: `${state.distillPrompt}\n\nTask: Summarize this coding-agent context/tool output for the main coding agent. Maximum ${budgetChars} characters. Preserve actionable facts, failures, commands, paths, and next steps. Do not include secrets or raw noisy output.`,
-      messages: [message],
-    },
-    { apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+    `${state.distillPrompt}\n\nTask: Summarize this coding-agent context/tool output for the main coding agent. Maximum ${budgetChars} characters. Preserve actionable facts, failures, commands, paths, and next steps. Do not include secrets or raw noisy output.`,
+    [message],
+    auth,
+    ctx.signal,
+    10_000,
+    "llmSummarize timed out",
   );
   if (response.stopReason === "aborted") return summarize(raw, budgetChars);
   const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map(c => c.text).join("\n").trim();
