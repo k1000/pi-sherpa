@@ -269,3 +269,81 @@ Stdout:
 Results: 19 passed, 0 failed
 
 ```
+
+## Iteration 8.1 — final-verifier — done — 2026-07-13T07:46:27.787Z
+
+Final verifier after: Implemented self-verification overlap monitoring. Added source-overlap calculation, `replayPastQueries`, and `checkRetrievalRegression` in post-task evaluation; regressions below the configured threshold log scratchpad observation warnings and return false. Added `selfVerification` config defaults (`enabled: true`, `overlapThreshold: 0.7`) and wired the DSPy compile flow to run overlap replay before exporting/compiling, aborting compilation if regressions are detected. Tests cover identical/partial/zero overlap, regression detection at threshold 0.7, warning logging, and pass behavior when replayed retrieval overlaps original sources. Red-phase rationale: old behavior had no overlap replay/check functions, no threshold config, and no DSPy compile guard, so these tests would fail. Deferred edge cases: full historical replay depends on in-memory bundle records currently retained by Sherpa; broader persisted bundle replay is not implemented in this slice.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts` exited 0
+Artifacts:
+- lib/post-task-evaluation.ts
+- index.ts
+- tests/post-task-evaluation.test.ts
+- tsx tests/post-task-evaluation.test.ts
+- tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts
+
+Stdout:
+```
+✅ All 25 ranking tests passed
+✅ classifyTaskOutcome detects core outcomes
+✅ suggestVerificationCommands maps changed files to checks
+✅ suggestVerificationCommands recommends focused frontend checks
+✅ detectKnowledgeGaps finds repeated capitalized entities missing from catalog
+✅ detectKnowledgeGaps filters catalog entries and below-threshold mentions
+✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity
+✅ postProcessCandidates filters archived items and downranks fading items
+✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries
+✅ compactScratchpad archives large sections
+Results: 9 passed, 0 failed
+✅ scores high recall when bundle covers edited file
+✅ marks missed files and noisy generic snippets
+✅ does not treat pre-existing dirty git files as missed recall ground truth
+✅ meta-analysis evaluates intent-matching memory without file ground truth
+✅ feedback penalizes noise and boosts missed filename candidates
+✅ feedback penalizes generic source classes even without exact prior noise
+✅ project quality summary penalties apply even without recent eval objects
+✅ generic source penalties are skipped when focus explicitly asks for that source class
+✅ quality summary can be written and read back
+✅ sidecar reflection output overrides usefulness, missed/noisy context, and lesson
+✅ feedback does not boost unrelated generic page.tsx candidates
+✅ summarizeEvaluations computes averageConfidenceError from planner confidence vs recall
+✅ simulateParameterChange computes replay overlap and sign-test significance
+✅ applyParameterChangeIfSignificant rejects too few or mixed evaluations
+✅ applyParameterChangeIfSignificant applies and logs significant improvements
+✅ source overlap calculation handles identical, partial, and empty overlap
+✅ self-verification flags overlap regression and logs warnings
+✅ self-verification passes when replayed retrieval overlaps original sources
+✅ summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence
+Results: 19 passed, 0 failed
+source-plan tests passed=9
+✅ golden: code prompt keeps exact implementation file and strips generic noise
+✅ golden: git status is only returned when the prompt asks for changed files
+✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not
+✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory
+✅ golden: compressed summaries preserve expand pointers
+✅ golden: source planner includes files for Sherpa quality review
+✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation
+✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool
+✅ golden: query target extraction identifies action, targets, and evidence type
+✅ golden: old journal memory is stripped unless history/session is requested
+✅ golden: research memory is stripped unless research is requested
+✅ golden: target term matches boost exact source over adjacent context
+✅ golden: debug snippet extraction prefers declarations over imports
+✅ golden: sherpa-context renders diagnostic planner metadata
+✅ golden: knowledge gap candidate is visible in context compiler message
+✅ golden: inquirer graph traversal adds related artifacts with reduced relevance
+✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds
+✅ golden: unified context compiler parser keeps valid unique indexes capped at 3
+Results: 18 passed, 0 failed
+✅ proposeDspyScoringParams proposes tuning from gated evaluation data
+✅ summarizeDspyTraces aggregates decisions and reasons
+Results: 2 passed, 0 failed
+✅ parseSembleSearchOutput parses markdown results
+✅ parseSembleSearchOutput ignores malformed or empty blocks
+✅ Semble state is persisted under .pi/sherpa
+✅ Inquirer candidates return empty for missing config
+✅ Inquirer candidates return empty when API search fails
+✅ Inquirer vector search results become memory candidates
+Res
+...[truncated 25 chars]
+```
