@@ -6,14 +6,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { applyEvaluationFeedbackToCandidates, applyParameterChangeIfSignificant, applyReflectionModelOutput, classifyEvalTaskKind, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, signTestPValue, simulateParameterChange } from "../lib/post-task-evaluation";
+import { applyEvaluationFeedbackToCandidates, applyParameterChangeIfSignificant, applyReflectionModelOutput, calculateSourceOverlap, checkRetrievalRegression, classifyEvalTaskKind, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, replayPastQueries, signTestPValue, simulateParameterChange } from "../lib/post-task-evaluation";
 import { readQualitySummary, writeQualitySummary, summarizeEvaluations, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
 
-const tests: Array<{ name: string; fn: () => void }> = [];
+const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [];
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void) { tests.push({ name, fn }); }
+function test(name: string, fn: () => void | Promise<void>) { tests.push({ name, fn }); }
 function assert(condition: unknown, message: string) { if (!condition) throw new Error(message); }
 function withTemp(fn: (dir: string) => void) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "sherpa-eval-"));
@@ -286,6 +286,44 @@ test("applyParameterChangeIfSignificant applies and logs significant improvement
   assert(notes.some((message) => message.includes("evidence-gated replay")), "expected observation note");
 });
 
+test("source overlap calculation handles identical, partial, and empty overlap", () => {
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }, { source: "repo://b.ts" }], [{ source: "repo://a.ts" }, { source: "repo://b.ts" }]) === 1, "identical sources should fully overlap");
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }, { source: "repo://b.ts" }], [{ source: "repo://a.ts" }]) === 0.5, "half overlap should be 0.5");
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }], [{ source: "repo://c.ts" }]) === 0, "disjoint overlap should be 0");
+});
+
+test("self-verification flags overlap regression and logs warnings", async () => {
+  const original = bundle([
+    { handle: "ctx-1", type: "file", source: "repo://a.ts", summary: "A" },
+    { handle: "ctx-2", type: "file", source: "repo://b.ts", summary: "B" },
+  ]);
+  const evals = [makeBaseEval({ bundleId: original.bundleId })];
+  const state = {
+    config: { selfVerification: { enabled: true, overlapThreshold: 0.7 } },
+    bundleRecords: new Map([[original.bundleId, original]]),
+    replayQuery: () => ({ items: [{ handle: "ctx-new", type: "file", source: "repo://a.ts", summary: "A" }] }),
+  };
+  const report = await replayPastQueries(evals, state, {});
+  assert(report.checked === 1, "expected one replayed query");
+  assert(report.regressions.length === 1, "expected overlap regression");
+  assert(report.regressions[0]!.overlap === 0.5, `expected 0.5 overlap, got ${report.regressions[0]!.overlap}`);
+  const notes: string[] = [];
+  const ok = await checkRetrievalRegression({ note: (message) => notes.push(message) }, state, evals);
+  assert(!ok, "regression should fail self-verification");
+  assert(notes.some((message) => message.includes("overlap=0.50")), "expected scratchpad warning note");
+});
+
+test("self-verification passes when replayed retrieval overlaps original sources", async () => {
+  const original = bundle([{ handle: "ctx-1", type: "file", source: "repo://a.ts", summary: "A" }]);
+  const evals = [makeBaseEval({ bundleId: original.bundleId })];
+  const ok = await checkRetrievalRegression({ note: () => { throw new Error("should not log"); } }, {
+    config: { selfVerification: { enabled: true, overlapThreshold: 0.7 } },
+    bundleRecords: new Map([[original.bundleId, original]]),
+    replayQuery: () => ({ items: [{ handle: "ctx-1b", type: "file", source: "repo://a.ts:10", summary: "A" }] }),
+  }, evals);
+  assert(ok, "matching replay should pass self-verification");
+});
+
 test("summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence", () => {
   const evals: ContextEvaluation[] = [
     makeBaseEval({ bundleId: "b1" }),
@@ -311,7 +349,7 @@ function makeBaseEval(overrides: Partial<ContextEvaluation> & { bundleId: string
 }
 
 for (const { name, fn } of tests) {
-  try { fn(); passed++; console.log(`✅ ${name}`); }
+  try { await fn(); passed++; console.log(`✅ ${name}`); }
   catch (error) { failed++; console.error(`❌ ${name}`); console.error(error); }
 }
 

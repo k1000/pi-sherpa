@@ -47,7 +47,7 @@ import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, compactScratchpadLifecycle, classifyTaskOutcome, detectKnowledgeGaps, formatKnowledgeGapsForCompiler, suggestVerificationCommands, type KnowledgeGap } from "./lib/lifecycle";
-import { applyParameterChangeIfSignificant, applyReflectionModelOutput, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, type ScoringParams } from "./lib/post-task-evaluation";
+import { applyParameterChangeIfSignificant, applyReflectionModelOutput, checkRetrievalRegression, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, type ScoringParams } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
@@ -159,6 +159,7 @@ type SherpaConfig = {
     autoCompile: { enabled: boolean; minTraces: number; bundleInterval: number; onEvaluate: boolean; onSessionShutdown: boolean; maxOncePerDay: boolean };
   };
   curiosity: { enabled: boolean; gapThreshold: number };
+  selfVerification: { enabled: boolean; overlapThreshold: number };
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
 };
 
@@ -269,6 +270,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
   dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
   curiosity: { enabled: true, gapThreshold: 2 },
+  selfVerification: { enabled: true, overlapThreshold: 0.7 },
   prompts: {
     retrieval: { projectPath: ".pi/sherpa/prompts/RETRIEVAL.md", globalPath: "prompts/RETRIEVAL.md" },
     distillation: { projectPath: ".pi/sherpa/prompts/DISTILLATION.md", globalPath: "prompts/DISTILLATION.md" },
@@ -872,6 +874,18 @@ export default function (pi: ExtensionAPI) {
     const cwd = ctx.cwd;
     const limit = 2000;
     const evals = readRecentEvaluations(obsidianMemoryPath(state), limit);
+    if (state.config.selfVerification?.enabled) {
+      const regressionOk = await checkRetrievalRegression({
+        note: (message) => appendScratchpadSection(state!, cwd, "observation", message, "Sherpa self-verification"),
+      }, {
+        ...state,
+        replayQuery: async (bundle: ContextBundleRecord) => {
+          const { sourcePlan, indicators } = await planSources(state!, ctx, bundle.focus, "front-door");
+          return buildBundle(state!, ctx, bundle.focus, "front-door", state!.config.frontDoor.tokenBudget, sourcePlan, indicators);
+        },
+      }, evals.slice(0, 20));
+      if (!regressionOk) return { ran: false, reason: "self-verification overlap regression detected" };
+    }
     const exported = exportDspyDataset(cwd, evals, { limit });
     if (exported.traces < state.config.dspy.autoCompile.minTraces) return { ran: false, reason: `need ${state.config.dspy.autoCompile.minTraces} traces; have ${exported.traces}` };
     if (!options.force) {

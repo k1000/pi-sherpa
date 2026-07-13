@@ -26,6 +26,14 @@ export type SimulationResult = {
   apply: boolean;
 };
 
+export type OverlapReport = {
+  checked: number;
+  averageOverlap: number;
+  threshold: number;
+  regressions: Array<{ bundleId: string; focus: string; overlap: number; originalSources: string[]; replayedSources: string[] }>;
+  ok: boolean;
+};
+
 export const DEFAULT_SCORING_PARAMS: ScoringParams = { relevanceWeight: 0.6, recencyWeight: 0.2, frequencyWeight: 0.2 };
 
 export type PostTaskEvaluationInput = {
@@ -132,6 +140,61 @@ export function signTestPValue(improved: number, worsened: number): number {
     tail += comb * Math.pow(0.5, n);
   }
   return Math.min(1, tail * 2);
+}
+
+function itemSource(item: { source?: string }): string {
+  return String(item.source ?? "").replace(/:\d+(?::\d+)?$/, "");
+}
+
+export function calculateSourceOverlap(original: Array<{ source?: string }>, replayed: Array<{ source?: string }>): number {
+  const originalSources = new Set(original.map(itemSource).filter(Boolean));
+  if (!originalSources.size) return replayed.length ? 0 : 1;
+  const replayedSources = new Set(replayed.map(itemSource).filter(Boolean));
+  let hits = 0;
+  for (const source of originalSources) if (replayedSources.has(source)) hits++;
+  return hits / originalSources.size;
+}
+
+export async function replayPastQueries(
+  evaluations: ContextEvaluation[],
+  state: { bundleRecords?: Map<string, ContextBundleRecord>; replayQuery?: (bundle: ContextBundleRecord, ctx: unknown) => Promise<{ items: ContextBundleRecord["items"] }> | { items: ContextBundleRecord["items"] }; config?: { selfVerification?: { overlapThreshold?: number } } },
+  ctx: unknown,
+): Promise<OverlapReport> {
+  const threshold = state.config?.selfVerification?.overlapThreshold ?? 0.7;
+  const regressions: OverlapReport["regressions"] = [];
+  let total = 0;
+  let checked = 0;
+  for (const evaluation of evaluations.slice(0, 20)) {
+    const bundle = state.bundleRecords?.get(evaluation.bundleId);
+    if (!bundle) continue;
+    const replayed = state.replayQuery ? await state.replayQuery(bundle, ctx) : { items: bundle.items };
+    const overlap = calculateSourceOverlap(bundle.items, replayed.items ?? []);
+    checked++;
+    total += overlap;
+    if (overlap < threshold) {
+      regressions.push({
+        bundleId: bundle.bundleId,
+        focus: bundle.focus,
+        overlap,
+        originalSources: bundle.items.map(itemSource).filter(Boolean),
+        replayedSources: (replayed.items ?? []).map(itemSource).filter(Boolean),
+      });
+    }
+  }
+  return { checked, averageOverlap: total / (checked || 1), threshold, regressions, ok: regressions.length === 0 };
+}
+
+export async function checkRetrievalRegression(
+  ctx: { note?: (message: string) => void } | undefined,
+  state: { bundleRecords?: Map<string, ContextBundleRecord>; replayQuery?: (bundle: ContextBundleRecord, ctx: unknown) => Promise<{ items: ContextBundleRecord["items"] }> | { items: ContextBundleRecord["items"] }; config?: { selfVerification?: { enabled?: boolean; overlapThreshold?: number } } },
+  evaluations: ContextEvaluation[],
+): Promise<boolean> {
+  if (state.config?.selfVerification?.enabled === false) return true;
+  const report = await replayPastQueries(evaluations, state, ctx);
+  for (const regression of report.regressions) {
+    ctx?.note?.(`Sherpa retrieval overlap regression: ${regression.bundleId} overlap=${regression.overlap.toFixed(2)} below threshold=${report.threshold.toFixed(2)} focus=${regression.focus}`);
+  }
+  return report.ok;
 }
 
 export function simulateParameterChange(evaluations: ContextEvaluation[], currentParams: ScoringParams, proposedParams: ScoringParams): SimulationResult {

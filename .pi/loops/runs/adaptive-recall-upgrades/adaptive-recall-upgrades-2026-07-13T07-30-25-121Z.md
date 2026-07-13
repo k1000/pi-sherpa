@@ -232,3 +232,40 @@ Results: 9 passed, 0 failed
 Results: 18 passed, 0 failed
 
 ```
+
+## Iteration 8.1 — Self-verification overlap monitoring — done — 2026-07-13T07:46:27.310Z
+
+Implemented self-verification overlap monitoring. Added source-overlap calculation, `replayPastQueries`, and `checkRetrievalRegression` in post-task evaluation; regressions below the configured threshold log scratchpad observation warnings and return false. Added `selfVerification` config defaults (`enabled: true`, `overlapThreshold: 0.7`) and wired the DSPy compile flow to run overlap replay before exporting/compiling, aborting compilation if regressions are detected. Tests cover identical/partial/zero overlap, regression detection at threshold 0.7, warning logging, and pass behavior when replayed retrieval overlaps original sources. Red-phase rationale: old behavior had no overlap replay/check functions, no threshold config, and no DSPy compile guard, so these tests would fail. Deferred edge cases: full historical replay depends on in-memory bundle records currently retained by Sherpa; broader persisted bundle replay is not implemented in this slice.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/post-task-evaluation.test.ts` exited 0
+Artifacts:
+- lib/post-task-evaluation.ts
+- index.ts
+- tests/post-task-evaluation.test.ts
+- tsx tests/post-task-evaluation.test.ts
+- tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts
+
+Stdout:
+```
+✅ scores high recall when bundle covers edited file
+✅ marks missed files and noisy generic snippets
+✅ does not treat pre-existing dirty git files as missed recall ground truth
+✅ meta-analysis evaluates intent-matching memory without file ground truth
+✅ feedback penalizes noise and boosts missed filename candidates
+✅ feedback penalizes generic source classes even without exact prior noise
+✅ project quality summary penalties apply even without recent eval objects
+✅ generic source penalties are skipped when focus explicitly asks for that source class
+✅ quality summary can be written and read back
+✅ sidecar reflection output overrides usefulness, missed/noisy context, and lesson
+✅ feedback does not boost unrelated generic page.tsx candidates
+✅ summarizeEvaluations computes averageConfidenceError from planner confidence vs recall
+✅ simulateParameterChange computes replay overlap and sign-test significance
+✅ applyParameterChangeIfSignificant rejects too few or mixed evaluations
+✅ applyParameterChangeIfSignificant applies and logs significant improvements
+✅ source overlap calculation handles identical, partial, and empty overlap
+✅ self-verification flags overlap regression and logs warnings
+✅ self-verification passes when replayed retrieval overlaps original sources
+✅ summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence
+Results: 19 passed, 0 failed
+
+```
