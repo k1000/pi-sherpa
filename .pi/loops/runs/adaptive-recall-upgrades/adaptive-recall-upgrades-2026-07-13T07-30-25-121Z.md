@@ -123,3 +123,28 @@ Stdout:
 Results: 17 passed, 0 failed
 
 ```
+
+## Iteration 5.1 — Memory lifecycle with confidence-driven fading — done — 2026-07-13T07:39:46.672Z
+
+Implemented memory lifecycle staging for context ranking and scratchpad maintenance. Added `computeLifecycleStage` with active/fading/archived thresholds and high-confidence immunity, added optional lifecycle/confidence fields to `ContextItem`, made candidate post-processing filter archived items and apply a 0.5 relevance multiplier to fading items, and wired `compactScratchpadLifecycle` into scratchpad compaction notifications. Lifecycle tests now cover stage classification, high-confidence protection, default-active compatibility, candidate filtering/downranking, and moving archived scratchpad entries to `.archived/` while preserving recent/high-confidence entries. Red-phase rationale: the old code had no lifecycle helper, no archived filtering/fading penalty, and no scratchpad lifecycle archiving, so these public behavior tests would fail. Deferred edge cases: parsing richer metadata formats/frontmatter and explicit re-fetch flows for archived memories.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts` exited 0
+Artifacts:
+- lib/lifecycle.ts
+- lib/candidate-postprocess.ts
+- index.ts
+- tests/lifecycle.test.ts
+- tsx tests/lifecycle.test.ts
+
+Stdout:
+```
+✅ classifyTaskOutcome detects core outcomes
+✅ suggestVerificationCommands maps changed files to checks
+✅ suggestVerificationCommands recommends focused frontend checks
+✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity
+✅ postProcessCandidates filters archived items and downranks fading items
+✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries
+✅ compactScratchpad archives large sections
+Results: 7 passed, 0 failed
+
+```

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import path from "node:path";
 
 export type TaskOutcome = "completed" | "partial" | "blocked" | "failed" | "reverted" | "unknown";
+export type LifecycleStage = "active" | "fading" | "archived";
 
 export type VerificationAdvice = {
   commands: Array<{ command: string; reason: string }>;
@@ -10,6 +11,16 @@ export type VerificationAdvice = {
 };
 
 const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|sql|json|md|yml|yaml)$/i;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export function computeLifecycleStage(lastAccessedAt: number | undefined, confidence: number | undefined, now = Date.now()): LifecycleStage {
+  if (typeof confidence === "number" && confidence >= 8) return "active";
+  if (lastAccessedAt === undefined) return "active";
+  const daysSinceAccess = Math.max(0, (now - lastAccessedAt) / DAY_MS);
+  if (daysSinceAccess > 60) return "archived";
+  if (daysSinceAccess > 30) return "fading";
+  return "active";
+}
 
 export function classifyTaskOutcome(text: string): { outcome: TaskOutcome; reason: string } {
   const lower = text.toLowerCase();
@@ -54,6 +65,59 @@ export function suggestVerificationCommands(changedFiles: string[]): Verificatio
 
   const unique = new Map(commands.map((item) => [item.command, item]));
   return { commands: [...unique.values()].slice(0, 8), docsReview: !hasDocs && changedFiles.some((file) => SOURCE_EXT.test(file)), catalogReview: changedFiles.some((file) => file === "catalog.csv" || file.startsWith("scripts/") || file.includes("docs/") || file.includes("package.json")) };
+}
+
+function splitScratchpadEntries(raw: string): string[] {
+  const matches = [...raw.matchAll(/^### .*$/gm)];
+  if (!matches.length) return raw.trim() ? [raw] : [];
+  return matches.map((match, index) => raw.slice(match.index!, matches[index + 1]?.index ?? raw.length));
+}
+
+function entryLastAccessedAt(entry: string): number | undefined {
+  const match = entry.match(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z\b/);
+  if (!match) return undefined;
+  const time = Date.parse(match[0]);
+  return Number.isFinite(time) ? time : undefined;
+}
+
+function entryConfidence(entry: string): number | undefined {
+  const match = entry.match(/\bconfidence\s*[:=]\s*(\d+(?:\.\d+)?)\b/i);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+export function compactScratchpadLifecycle(root: string, options: { now?: number; archiveDir?: string } = {}) {
+  const sectionsDir = path.join(root, "sections");
+  if (!existsSync(sectionsDir)) return { archived: [] as string[] };
+  const archiveDir = options.archiveDir ?? path.join(root, ".archived");
+  const now = options.now ?? Date.now();
+  const archived: string[] = [];
+
+  for (const file of readdirSync(sectionsDir)) {
+    if (!file.endsWith(".md")) continue;
+    const target = path.join(sectionsDir, file);
+    const stat = statSync(target);
+    if (!stat.isFile()) continue;
+    const raw = readFileSync(target, "utf8");
+    const entries = splitScratchpadEntries(raw);
+    const keep: string[] = [];
+    const move: string[] = [];
+    for (const entry of entries) {
+      const stage = computeLifecycleStage(entryLastAccessedAt(entry), entryConfidence(entry), now);
+      if (stage === "archived") move.push(entry.trim());
+      else keep.push(entry.trim());
+    }
+    if (!move.length) continue;
+    mkdirSync(archiveDir, { recursive: true });
+    const archivePath = path.join(archiveDir, file);
+    const existing = existsSync(archivePath) ? readFileSync(archivePath, "utf8").trim() : "";
+    writeFileSync(archivePath, [existing, ...move].filter(Boolean).join("\n\n") + "\n");
+    writeFileSync(target, keep.length ? keep.join("\n\n") + "\n" : "");
+    archived.push(file);
+  }
+
+  return { archived };
 }
 
 export function compactScratchpad(root: string, options: { maxBytes?: number; archiveDir?: string } = {}) {

@@ -46,7 +46,7 @@ import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial 
 import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
-import { compactScratchpad, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
+import { compactScratchpad, compactScratchpadLifecycle, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
 import { applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
@@ -159,7 +159,7 @@ type SherpaConfig = {
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
 };
 
-type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean; lastAccessedAt?: number; accessCount?: number };
+type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean; lastAccessedAt?: number; accessCount?: number; lifecycle_stage?: "active" | "fading" | "archived"; confidence?: number };
 type SourcePlan = { sources: Source[]; reason: string; confidence: number; planner: "heuristic" | "llm" | "override" | "fallback"; routePlan?: RoutePlan };
 // Sherpa three-stage retrieval pipeline types
 type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
@@ -1041,9 +1041,14 @@ export default function (pi: ExtensionAPI) {
 
 
   const compactScratchpadAndNotify = (stateObj: State, ctx: ExtensionContext, cwd: string) => {
-    const compacted = compactScratchpad(scratchpadRootPath(stateObj, cwd));
-    if (compacted.compacted.length) {
-      try { ctx.ui.notify(`Sherpa compacted scratchpad sections: ${compacted.compacted.join(", ")}`, "info"); } catch {}
+    const root = scratchpadRootPath(stateObj, cwd);
+    const lifecycle = compactScratchpadLifecycle(root);
+    const compacted = compactScratchpad(root);
+    const messages: string[] = [];
+    if (lifecycle.archived.length) messages.push(`archived stale scratchpad entries: ${lifecycle.archived.join(", ")}`);
+    if (compacted.compacted.length) messages.push(`compacted scratchpad sections: ${compacted.compacted.join(", ")}`);
+    if (messages.length) {
+      try { ctx.ui.notify(`Sherpa ${messages.join("; ")}`, "info"); } catch {}
     }
   };
 

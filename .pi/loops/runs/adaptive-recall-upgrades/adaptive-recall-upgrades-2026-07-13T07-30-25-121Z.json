@@ -77,17 +77,18 @@
     "specVersion": 1,
     "finalVerifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts"
   },
-  "iteration": 4,
+  "iteration": 5,
   "stepIteration": 1,
   "currentStepIndex": 0,
-  "currentTaskId": "graph-traversal",
+  "currentTaskId": "memory-lifecycle",
   "completedTaskIds": [
     "recency-scoring",
-    "vector-similarity"
+    "vector-similarity",
+    "graph-traversal"
   ],
   "status": "running",
   "startedAt": "2026-07-13T07:30:25.121Z",
-  "updatedAt": "2026-07-13T07:38:01.679Z",
+  "updatedAt": "2026-07-13T07:39:46.672Z",
   "history": [
     {
       "taskId": "recency-scoring",
@@ -182,6 +183,29 @@
       "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/golden-retrieval.test.ts",
       "verifyExitCode": 0,
       "verifyStdout": "✅ golden: code prompt keeps exact implementation file and strips generic noise\n✅ golden: git status is only returned when the prompt asks for changed files\n✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not\n✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory\n✅ golden: compressed summaries preserve expand pointers\n✅ golden: source planner includes files for Sherpa quality review\n✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation\n✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool\n✅ golden: query target extraction identifies action, targets, and evidence type\n✅ golden: old journal memory is stripped unless history/session is requested\n✅ golden: research memory is stripped unless research is requested\n✅ golden: target term matches boost exact source over adjacent context\n✅ golden: debug snippet extraction prefers declarations over imports\n✅ golden: sherpa-context renders diagnostic planner metadata\n✅ golden: inquirer graph traversal adds related artifacts with reduced relevance\n✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds\n✅ golden: unified context compiler parser keeps valid unique indexes capped at 3\nResults: 17 passed, 0 failed\n",
+      "verifyStderr": ""
+    },
+    {
+      "taskId": "memory-lifecycle",
+      "summary": "Implemented memory lifecycle staging for context ranking and scratchpad maintenance. Added `computeLifecycleStage` with active/fading/archived thresholds and high-confidence immunity, added optional lifecycle/confidence fields to `ContextItem`, made candidate post-processing filter archived items and apply a 0.5 relevance multiplier to fading items, and wired `compactScratchpadLifecycle` into scratchpad compaction notifications. Lifecycle tests now cover stage classification, high-confidence protection, default-active compatibility, candidate filtering/downranking, and moving archived scratchpad entries to `.archived/` while preserving recent/high-confidence entries. Red-phase rationale: the old code had no lifecycle helper, no archived filtering/fading penalty, and no scratchpad lifecycle archiving, so these public behavior tests would fail. Deferred edge cases: parsing richer metadata formats/frontmatter and explicit re-fetch flows for archived memories.",
+      "blocked": false,
+      "artifacts": [
+        "lib/lifecycle.ts",
+        "lib/candidate-postprocess.ts",
+        "index.ts",
+        "tests/lifecycle.test.ts",
+        "tsx tests/lifecycle.test.ts"
+      ],
+      "iteration": 5,
+      "stepIteration": 1,
+      "stepId": "memory-lifecycle",
+      "stepName": "Memory lifecycle with confidence-driven fading",
+      "timestamp": "2026-07-13T07:39:46.672Z",
+      "status": "done",
+      "verification": "`cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts` exited 0",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts",
+      "verifyExitCode": 0,
+      "verifyStdout": "✅ classifyTaskOutcome detects core outcomes\n✅ suggestVerificationCommands maps changed files to checks\n✅ suggestVerificationCommands recommends focused frontend checks\n✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity\n✅ postProcessCandidates filters archived items and downranks fading items\n✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries\n✅ compactScratchpad archives large sections\nResults: 7 passed, 0 failed\n",
       "verifyStderr": ""
     }
   ],

@@ -1,5 +1,6 @@
 import { focusAllowsGenericSource, genericSourceClass } from "./generic-source";
 import { isGloballyNoisySource } from "./noise-filter";
+import { computeLifecycleStage, type LifecycleStage } from "./lifecycle";
 import { isCodePrompt, isSourceLookupPrompt } from "./query-classifier";
 import { extractQueryTarget } from "./query-target";
 import {
@@ -24,6 +25,8 @@ type ContextItemLike = {
   relevance: number;
   lastAccessedAt?: number;
   accessCount?: number;
+  lifecycle_stage?: LifecycleStage;
+  confidence?: number;
 };
 
 export function sourceCorrespondenceThreshold(focus: string, mode: string) {
@@ -69,6 +72,9 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   if (isGenericNoiseSource(item.source)) value -= wantsSource ? 0.3 : 0.12;
   if (isStickyGenericSnippet(item)) value -= 0.5;
   if (/repo:\/\/(docs\/sherpa-|\.pi\/sherpa-)/.test(item.source) && !/\bsherpa\b/i.test(focus)) value -= 0.45;
+  const lifecycleStage = item.lifecycle_stage ?? computeLifecycleStage(item.lastAccessedAt, item.confidence, now ?? Date.now());
+  if (lifecycleStage === "archived") return Number.NEGATIVE_INFINITY;
+  if (lifecycleStage === "fading") value *= 0.5;
   // Apply ACT-R recency + frequency boost: 0.6 original + 0.2 recency + 0.2 frequency
   const halfLifeDays = 14;
   const baselineCount = 5;
@@ -88,6 +94,8 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
   const seen = new Set<string>();
   let readmeCount = 0;
   for (const item of sorted) {
+    const lifecycleStage = item.lifecycle_stage ?? computeLifecycleStage(item.lastAccessedAt, item.confidence, _now);
+    if (lifecycleStage === "archived") continue;
     if (isGloballyNoisySource(item.source)) continue;
     if (genericSourceClass(item.source) && !focusAllowsGenericSource(item.source, focus)) continue;
     if (item.type === "git_status" && !focusAllowsGitStatus(focus)) continue;
