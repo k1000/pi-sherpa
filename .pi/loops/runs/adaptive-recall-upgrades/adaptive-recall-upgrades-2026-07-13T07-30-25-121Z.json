@@ -77,18 +77,19 @@
     "specVersion": 1,
     "finalVerifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts"
   },
-  "iteration": 5,
+  "iteration": 6,
   "stepIteration": 1,
   "currentStepIndex": 0,
-  "currentTaskId": "memory-lifecycle",
+  "currentTaskId": "evidence-gating",
   "completedTaskIds": [
     "recency-scoring",
     "vector-similarity",
-    "graph-traversal"
+    "graph-traversal",
+    "memory-lifecycle"
   ],
   "status": "running",
   "startedAt": "2026-07-13T07:30:25.121Z",
-  "updatedAt": "2026-07-13T07:39:46.672Z",
+  "updatedAt": "2026-07-13T07:42:35.291Z",
   "history": [
     {
       "taskId": "recency-scoring",
@@ -206,6 +207,30 @@
       "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts",
       "verifyExitCode": 0,
       "verifyStdout": "✅ classifyTaskOutcome detects core outcomes\n✅ suggestVerificationCommands maps changed files to checks\n✅ suggestVerificationCommands recommends focused frontend checks\n✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity\n✅ postProcessCandidates filters archived items and downranks fading items\n✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries\n✅ compactScratchpad archives large sections\nResults: 7 passed, 0 failed\n",
+      "verifyStderr": ""
+    },
+    {
+      "taskId": "evidence-gating",
+      "summary": "Implemented evidence-gated scoring-parameter learning. Added `ScoringParams`, default coefficients, replay simulation over the last 50 evaluations, a two-sided sign-test p-value, and gated application requiring enough evaluations, more wins than losses, and p<0.05. Added DSPy proposal plumbing so successful DSPy compile proposes scoring coefficients, runs the evidence gate, logs accepted changes to scratchpad observations, saves config on apply, and reports replay stats. Added Sherpa config scoring defaults, status display, and `/sherpa:scoring:reset`. Tests cover significant improvement simulation, sign-test significance, rejection for too-few/mixed evaluations, accepted changes with observation logging, and DSPy tuning proposal. Red-phase rationale: the old code had no scoring params, replay simulation, sign-test gate, DSPy proposal, or reset command, so these public tests would fail. Deferred edge case: per-query candidate scorer injection of non-default weights remains minimal because this step's file ownership did not include `candidate-postprocess.ts`.",
+      "blocked": false,
+      "artifacts": [
+        "lib/post-task-evaluation.ts",
+        "lib/dspy.ts",
+        "index.ts",
+        "tests/post-task-evaluation.test.ts",
+        "tests/dspy-trace-report.test.ts",
+        "tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts"
+      ],
+      "iteration": 6,
+      "stepIteration": 1,
+      "stepId": "evidence-gating",
+      "stepName": "Evidence-gated parameter learning",
+      "timestamp": "2026-07-13T07:42:35.291Z",
+      "status": "done",
+      "verification": "`cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts` exited 0",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts",
+      "verifyExitCode": 0,
+      "verifyStdout": "✅ scores high recall when bundle covers edited file\n✅ marks missed files and noisy generic snippets\n✅ does not treat pre-existing dirty git files as missed recall ground truth\n✅ meta-analysis evaluates intent-matching memory without file ground truth\n✅ feedback penalizes noise and boosts missed filename candidates\n✅ feedback penalizes generic source classes even without exact prior noise\n✅ project quality summary penalties apply even without recent eval objects\n✅ generic source penalties are skipped when focus explicitly asks for that source class\n✅ quality summary can be written and read back\n✅ sidecar reflection output overrides usefulness, missed/noisy context, and lesson\n✅ feedback does not boost unrelated generic page.tsx candidates\n✅ summarizeEvaluations computes averageConfidenceError from planner confidence vs recall\n✅ simulateParameterChange computes replay overlap and sign-test significance\n✅ applyParameterChangeIfSignificant rejects too few or mixed evaluations\n✅ applyParameterChangeIfSignificant applies and logs significant improvements\n✅ summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence\nResults: 16 passed, 0 failed\n✅ proposeDspyScoringParams proposes tuning from gated evaluation data\n✅ summarizeDspyTraces aggregates decisions and reasons\nResults: 2 passed, 0 failed\n",
       "verifyStderr": ""
     }
   ],

@@ -3,7 +3,7 @@
  * Run with: tsx tests/dspy-trace-report.test.ts
  */
 
-import { summarizeDspyTraces, type DspyTraceRecord } from "../lib/dspy";
+import { proposeDspyScoringParams, summarizeDspyTraces, type DspyTraceRecord } from "../lib/dspy";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
 let passed = 0;
@@ -28,6 +28,20 @@ function trace(partial: Partial<DspyTraceRecord>): DspyTraceRecord {
     ...partial,
   };
 }
+
+test("proposeDspyScoringParams proposes tuning from gated evaluation data", () => {
+  const params = proposeDspyScoringParams(Array.from({ length: 12 }, (_, index) => ({
+    bundleId: `eval-${index}`,
+    taskOutcome: "completed" as const,
+    scores: { relevance: 0.2, precision: 0.2, recall: 0.9 },
+    noise: [],
+    missed: [],
+    reflection: "",
+    improvementHint: "",
+    evaluatedAt: new Date().toISOString(),
+  })), { relevanceWeight: 0.6, recencyWeight: 0.2, frequencyWeight: 0.2 });
+  assert(params.frequencyWeight > 0.2, "DSPy scoring proposal should increase frequency/recall weight when recall lags precision");
+});
 
 test("summarizeDspyTraces aggregates decisions and reasons", () => {
   const report = summarizeDspyTraces([

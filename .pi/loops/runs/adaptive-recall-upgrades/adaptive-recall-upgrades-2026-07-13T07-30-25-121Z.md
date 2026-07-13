@@ -148,3 +148,41 @@ Stdout:
 Results: 7 passed, 0 failed
 
 ```
+
+## Iteration 6.1 — Evidence-gated parameter learning — done — 2026-07-13T07:42:35.291Z
+
+Implemented evidence-gated scoring-parameter learning. Added `ScoringParams`, default coefficients, replay simulation over the last 50 evaluations, a two-sided sign-test p-value, and gated application requiring enough evaluations, more wins than losses, and p<0.05. Added DSPy proposal plumbing so successful DSPy compile proposes scoring coefficients, runs the evidence gate, logs accepted changes to scratchpad observations, saves config on apply, and reports replay stats. Added Sherpa config scoring defaults, status display, and `/sherpa:scoring:reset`. Tests cover significant improvement simulation, sign-test significance, rejection for too-few/mixed evaluations, accepted changes with observation logging, and DSPy tuning proposal. Red-phase rationale: the old code had no scoring params, replay simulation, sign-test gate, DSPy proposal, or reset command, so these public tests would fail. Deferred edge case: per-query candidate scorer injection of non-default weights remains minimal because this step's file ownership did not include `candidate-postprocess.ts`.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts` exited 0
+Artifacts:
+- lib/post-task-evaluation.ts
+- lib/dspy.ts
+- index.ts
+- tests/post-task-evaluation.test.ts
+- tests/dspy-trace-report.test.ts
+- tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts
+
+Stdout:
+```
+✅ scores high recall when bundle covers edited file
+✅ marks missed files and noisy generic snippets
+✅ does not treat pre-existing dirty git files as missed recall ground truth
+✅ meta-analysis evaluates intent-matching memory without file ground truth
+✅ feedback penalizes noise and boosts missed filename candidates
+✅ feedback penalizes generic source classes even without exact prior noise
+✅ project quality summary penalties apply even without recent eval objects
+✅ generic source penalties are skipped when focus explicitly asks for that source class
+✅ quality summary can be written and read back
+✅ sidecar reflection output overrides usefulness, missed/noisy context, and lesson
+✅ feedback does not boost unrelated generic page.tsx candidates
+✅ summarizeEvaluations computes averageConfidenceError from planner confidence vs recall
+✅ simulateParameterChange computes replay overlap and sign-test significance
+✅ applyParameterChangeIfSignificant rejects too few or mixed evaluations
+✅ applyParameterChangeIfSignificant applies and logs significant improvements
+✅ summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence
+Results: 16 passed, 0 failed
+✅ proposeDspyScoringParams proposes tuning from gated evaluation data
+✅ summarizeDspyTraces aggregates decisions and reasons
+Results: 2 passed, 0 failed
+
+```

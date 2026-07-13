@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import type { ContextEvaluation } from "./evaluation";
+import { proposeScoringParamsFromEvaluations, type ScoringParams } from "./post-task-evaluation";
 
 export type DspyTraceCandidate = {
   handle: string;
@@ -224,6 +225,10 @@ function exampleFromTrace(trace: DspyTraceRecord, evaluation?: ContextEvaluation
     reflection: evaluation?.reflection,
     improvementHint: evaluation?.improvementHint,
   };
+}
+
+export function proposeDspyScoringParams(evaluations: ContextEvaluation[], current: ScoringParams): ScoringParams {
+  return proposeScoringParamsFromEvaluations(evaluations, current);
 }
 
 export function exportDspyDataset(cwd: string, evaluations: ContextEvaluation[], options: { limit?: number; devRatio?: number } = {}): { trainPath: string; devPath: string; metaPath: string; train: number; dev: number; traces: number; matchedEvaluations: number; averageMetric: number; highScoringExamples: number; lowScoringExamples: number } {

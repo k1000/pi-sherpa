@@ -31,7 +31,7 @@ import {
   type ContextEvaluation,
 } from "./lib/evaluation";
 import { defaultEvaluationReflection, evaluationImprovementHint, formatEvaluationSummary, parseEvaluationArgs } from "./lib/evaluation-command";
-import { exportDspyDataset, readCompiledPrompt, readDspyTraces, summarizeDspyTraces } from "./lib/dspy";
+import { exportDspyDataset, proposeDspyScoringParams, readCompiledPrompt, readDspyTraces, summarizeDspyTraces } from "./lib/dspy";
 import { recordDspyTrace } from "./lib/dspy-trace-recording";
 import { addRuntimeTraceCandidates } from "./lib/runtime-trace-candidates";
 import { contextCompilerManifest, contextCompilerMessage, parseCompiledContextItems, parseCurationRejected, preserveExpandHint, type RejectionManifestItem } from "./lib/context-compiler";
@@ -47,7 +47,7 @@ import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
 import { compactScratchpad, compactScratchpadLifecycle, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
-import { applyReflectionModelOutput, evaluatePostTaskContext } from "./lib/post-task-evaluation";
+import { applyParameterChangeIfSignificant, applyReflectionModelOutput, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, type ScoringParams } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
@@ -149,6 +149,7 @@ type SherpaConfig = {
   semble: { enabled: boolean; command: string; topK: number; timeoutMs: number };
   graphify: { enabled: boolean; command: string; graphPath: string; timeoutMs: number; budgetTokens: number; maxLines: number; };
   inquirer: { enabled: boolean; url: string; token?: string; tokenEnv: string; searchLimit: number };
+  scoring: ScoringParams;
   routeMap: { enabled: boolean; path: string; applyTo: "all" | "front-door" | "explicit" };
   dedupe: { urls: { enabled: boolean; normalize: boolean; scope: "bundle" } };
   dspy: {
@@ -261,6 +262,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
   graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
   inquirer: { enabled: true, url: "https://api.enquirer.app", tokenEnv: "SHERPA_MEMORY_API_TOKEN", searchLimit: 8 },
+  scoring: DEFAULT_SCORING_PARAMS,
   routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
   dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
@@ -853,9 +855,14 @@ export default function (pi: ExtensionAPI) {
     // Run DSPy compile in background child process so Pi TUI stays responsive.
     // stdout is fire-and-forget; we don't block on the result.
     runDspyPromptCompile(cwd).then(({ stdout }) => {
+      const proposedScoring = proposeDspyScoringParams(evals, state!.config.scoring ?? DEFAULT_SCORING_PARAMS);
+      const scoringSimulation = applyParameterChangeIfSignificant(state!, {
+        note: (message) => appendScratchpadSection(state!, cwd, "observation", message, "Sherpa scoring tuning"),
+      }, proposedScoring, evals.slice(0, 50));
+      if (scoringSimulation.apply) saveConfig(cwd, state!.config);
       state!.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state!.bundles };
       persist();
-      if (notify) safeNotify(ctx, [`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
+      if (notify) safeNotify(ctx, [`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `scoringReplay=Δ${scoringSimulation.averageDelta.toFixed(3)} p=${scoringSimulation.pValue.toFixed(4)} applied=${scoringSimulation.apply}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
     }).catch((error) => {
       const msg = error instanceof Error ? error.message : String(error);
       if (notify) safeNotify(ctx, `Sherpa DSPy auto-compile failed: ${msg}`, "warning");
@@ -1956,6 +1963,13 @@ export default function (pi: ExtensionAPI) {
     ].join("\n"), compiled ? "info" : "warning");
   }});
 
+  pi.registerCommand("sherpa:scoring:reset", { description: "Reset Sherpa scoring coefficients to defaults", handler: async (_args, ctx) => {
+    if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    state.config.scoring = DEFAULT_SCORING_PARAMS;
+    saveConfig(ctx.cwd, state.config);
+    ctx.ui.notify("Sherpa scoring coefficients reset to relevance=0.6 recency=0.2 frequency=0.2", "info");
+  }});
+
   pi.registerCommand("sherpa:status", { description: "Show Sherpa status", handler: async (_args, ctx) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const configuredModel = state.config.model.useMainPiModel ? ctx.model : ctx.modelRegistry.find(state.config.model.provider, state.config.model.id);
@@ -1968,6 +1982,7 @@ export default function (pi: ExtensionAPI) {
       `documentationPrompt=${state.documentationPromptSource}`,
       `automationPrompt=${state.automationPromptSource}`,
       `inquirerMemory=managed-by-Archivist/Inquirer (Sherpa has no direct Surreal source)`,
+      `scoring=relevance:${state.config.scoring.relevanceWeight.toFixed(2)} recency:${state.config.scoring.recencyWeight.toFixed(2)} frequency:${state.config.scoring.frequencyWeight.toFixed(2)}`,
       `lastSkip=${state.lastSkip}`,
     ].join("\n"), "info");
   }});

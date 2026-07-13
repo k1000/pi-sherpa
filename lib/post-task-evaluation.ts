@@ -13,6 +13,21 @@ export type TaskFileEvidence = {
 
 export type EvalTaskKind = "code_edit" | "debug" | "docs" | "meta_analysis" | "ops" | "unknown";
 
+export type ScoringParams = { relevanceWeight: number; recencyWeight: number; frequencyWeight: number };
+export type SimulationResult = {
+  evaluations: number;
+  improved: number;
+  worsened: number;
+  unchanged: number;
+  averageCurrent: number;
+  averageProposed: number;
+  averageDelta: number;
+  pValue: number;
+  apply: boolean;
+};
+
+export const DEFAULT_SCORING_PARAMS: ScoringParams = { relevanceWeight: 0.6, recencyWeight: 0.2, frequencyWeight: 0.2 };
+
 export type PostTaskEvaluationInput = {
   bundle: ContextBundleRecord;
   outcome: TaskOutcome;
@@ -87,6 +102,91 @@ function isGenericNoise(item: ContextBundleRecord["items"][number]): boolean {
 
 function clamp01(n: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
+}
+
+function normalizeScoringParams(params: ScoringParams): ScoringParams {
+  const relevanceWeight = Math.max(0, params.relevanceWeight);
+  const recencyWeight = Math.max(0, params.recencyWeight);
+  const frequencyWeight = Math.max(0, params.frequencyWeight);
+  const total = relevanceWeight + recencyWeight + frequencyWeight || 1;
+  return { relevanceWeight: relevanceWeight / total, recencyWeight: recencyWeight / total, frequencyWeight: frequencyWeight / total };
+}
+
+function scoreEvaluationWithParams(evaluation: ContextEvaluation, params: ScoringParams): number {
+  const p = normalizeScoringParams(params);
+  return clamp01(
+    (p.relevanceWeight * evaluation.scores.relevance)
+    + (p.recencyWeight * evaluation.scores.precision)
+    + (p.frequencyWeight * evaluation.scores.recall),
+  );
+}
+
+export function signTestPValue(improved: number, worsened: number): number {
+  const n = improved + worsened;
+  if (n === 0) return 1;
+  const wins = Math.max(improved, worsened);
+  let tail = 0;
+  for (let k = wins; k <= n; k++) {
+    let comb = 1;
+    for (let i = 1; i <= k; i++) comb = comb * (n - i + 1) / i;
+    tail += comb * Math.pow(0.5, n);
+  }
+  return Math.min(1, tail * 2);
+}
+
+export function simulateParameterChange(evaluations: ContextEvaluation[], currentParams: ScoringParams, proposedParams: ScoringParams): SimulationResult {
+  const window = evaluations.slice(0, 50);
+  let improved = 0;
+  let worsened = 0;
+  let unchanged = 0;
+  let currentTotal = 0;
+  let proposedTotal = 0;
+  for (const evaluation of window) {
+    const current = scoreEvaluationWithParams(evaluation, currentParams);
+    const proposed = scoreEvaluationWithParams(evaluation, proposedParams);
+    currentTotal += current;
+    proposedTotal += proposed;
+    const delta = proposed - current;
+    if (delta > 0.0001) improved++;
+    else if (delta < -0.0001) worsened++;
+    else unchanged++;
+  }
+  const pValue = signTestPValue(improved, worsened);
+  const averageCurrent = currentTotal / (window.length || 1);
+  const averageProposed = proposedTotal / (window.length || 1);
+  return {
+    evaluations: window.length,
+    improved,
+    worsened,
+    unchanged,
+    averageCurrent,
+    averageProposed,
+    averageDelta: averageProposed - averageCurrent,
+    pValue,
+    apply: window.length >= 10 && improved > worsened && pValue < 0.05,
+  };
+}
+
+export function applyParameterChangeIfSignificant<TState extends { config: { scoring?: ScoringParams } }>(state: TState, ctx: { note?: (message: string) => void } | undefined, proposedParams: ScoringParams, evaluations: ContextEvaluation[]): SimulationResult {
+  const current = state.config.scoring ?? DEFAULT_SCORING_PARAMS;
+  const simulation = simulateParameterChange(evaluations, current, proposedParams);
+  if (simulation.apply) {
+    state.config.scoring = normalizeScoringParams(proposedParams);
+    ctx?.note?.(`Sherpa scoring coefficients updated after evidence-gated replay: Δ=${simulation.averageDelta.toFixed(3)}, p=${simulation.pValue.toFixed(4)}`);
+  }
+  return simulation;
+}
+
+export function proposeScoringParamsFromEvaluations(evaluations: ContextEvaluation[], current: ScoringParams = DEFAULT_SCORING_PARAMS): ScoringParams {
+  const recent = evaluations.slice(0, 50);
+  if (!recent.length) return current;
+  const avg = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+  const relevance = avg(recent.map((e) => e.scores.relevance));
+  const precision = avg(recent.map((e) => e.scores.precision));
+  const recall = avg(recent.map((e) => e.scores.recall));
+  if (recall > Math.max(relevance, precision) + 0.1) return normalizeScoringParams({ ...current, frequencyWeight: current.frequencyWeight + 0.1, relevanceWeight: Math.max(0, current.relevanceWeight - 0.1) });
+  if (precision > Math.max(relevance, recall) + 0.1) return normalizeScoringParams({ ...current, recencyWeight: current.recencyWeight + 0.1, relevanceWeight: Math.max(0, current.relevanceWeight - 0.1) });
+  return normalizeScoringParams(current);
 }
 
 function isDocumentationFile(file: string): boolean {

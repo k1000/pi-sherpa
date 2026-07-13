@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { applyEvaluationFeedbackToCandidates, applyReflectionModelOutput, classifyEvalTaskKind, evaluatePostTaskContext } from "../lib/post-task-evaluation";
+import { applyEvaluationFeedbackToCandidates, applyParameterChangeIfSignificant, applyReflectionModelOutput, classifyEvalTaskKind, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, signTestPValue, simulateParameterChange } from "../lib/post-task-evaluation";
 import { readQualitySummary, writeQualitySummary, summarizeEvaluations, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
@@ -243,6 +243,47 @@ test("summarizeEvaluations computes averageConfidenceError from planner confiden
   assert(Math.abs(summary.averageConfidenceError - 0.1) < 0.001,
     `expected avg confidenceError 0.1, got ${summary.averageConfidenceError}`);
   assert(typeof summary.averageConfidenceError === "number", "averageConfidenceError should be a number");
+});
+
+test("simulateParameterChange computes replay overlap and sign-test significance", () => {
+  const evals = Array.from({ length: 12 }, (_, index) => makeBaseEval({
+    bundleId: `better-${index}`,
+    scores: { relevance: 0.2, precision: 0.2, recall: 0.9 },
+  }));
+  const result = simulateParameterChange(evals, DEFAULT_SCORING_PARAMS, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 });
+  assert(result.improved === 12, `expected all improved, got ${result.improved}`);
+  assert(result.worsened === 0, `expected none worsened, got ${result.worsened}`);
+  assert(result.averageProposed > result.averageCurrent, "expected proposed params to improve replay score");
+  assert(result.pValue < 0.05, `expected significant p-value, got ${result.pValue}`);
+  assert(result.apply, "expected simulation to pass evidence gate");
+  assert(signTestPValue(12, 0) < 0.05, "expected sign test to be significant for 12 wins");
+});
+
+test("applyParameterChangeIfSignificant rejects too few or mixed evaluations", () => {
+  const state = { config: { scoring: { ...DEFAULT_SCORING_PARAMS } } };
+  const notes: string[] = [];
+  const few = Array.from({ length: 5 }, (_, index) => makeBaseEval({ bundleId: `few-${index}`, scores: { relevance: 0.2, precision: 0.2, recall: 0.9 } }));
+  const fewResult = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, few);
+  assert(!fewResult.apply, "too few evaluations should not apply");
+  assert(state.config.scoring.relevanceWeight === DEFAULT_SCORING_PARAMS.relevanceWeight, "params should remain unchanged for too few evals");
+
+  const mixed = Array.from({ length: 12 }, (_, index) => makeBaseEval({
+    bundleId: `mixed-${index}`,
+    scores: index % 2 === 0 ? { relevance: 0.2, precision: 0.2, recall: 0.9 } : { relevance: 0.9, precision: 0.2, recall: 0.2 },
+  }));
+  const mixedResult = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, mixed);
+  assert(!mixedResult.apply, "mixed evaluations should not apply");
+  assert(notes.length === 0, "rejected changes should not write observation notes");
+});
+
+test("applyParameterChangeIfSignificant applies and logs significant improvements", () => {
+  const state = { config: { scoring: { ...DEFAULT_SCORING_PARAMS } } };
+  const notes: string[] = [];
+  const evals = Array.from({ length: 12 }, (_, index) => makeBaseEval({ bundleId: `apply-${index}`, scores: { relevance: 0.2, precision: 0.2, recall: 0.9 } }));
+  const result = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, evals);
+  assert(result.apply, "significant improvement should apply");
+  assert(state.config.scoring.frequencyWeight > DEFAULT_SCORING_PARAMS.frequencyWeight, "frequency weight should increase");
+  assert(notes.some((message) => message.includes("evidence-gated replay")), "expected observation note");
 });
 
 test("summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence", () => {
