@@ -158,7 +158,7 @@ type SherpaConfig = {
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
 };
 
-type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean };
+type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean; lastAccessedAt?: number; accessCount?: number };
 type SourcePlan = { sources: Source[]; reason: string; confidence: number; planner: "heuristic" | "llm" | "override" | "fallback"; routePlan?: RoutePlan };
 // Sherpa three-stage retrieval pipeline types
 type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
@@ -714,6 +714,18 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   }
 
   const { items, used } = pickFinalContextItems(compileResult.items, tokenBudget);
+  // Update access tracking for selected items
+  const now = Date.now();
+  for (const item of items) {
+    item.lastAccessedAt = now;
+    item.accessCount = (item.accessCount ?? 0) + 1;
+    // Also update the source candidate in the handles map for future reference
+    const existing = state.handles.get(item.handle);
+    if (existing) {
+      existing.lastAccessedAt = now;
+      existing.accessCount = (existing.accessCount ?? 0) + 1;
+    }
+  }
   state.bundles++;
   const bundle: ContextBundle = { bundleId: createBundleId(), taskId: `sherpa-${Date.now()}`, focus, mode, budgetUsedTokens: used, items, candidateCount: candidates.length, sourcePlan, curation: { planner: compileResult.planner, confidence: compileResult.confidence, reason: compileResult.plannerReason } };
   bundle.signal = buildContextSignal(bundle);

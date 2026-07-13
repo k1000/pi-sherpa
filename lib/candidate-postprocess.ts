@@ -21,6 +21,8 @@ type ContextItemLike = {
   summary: string;
   raw?: string;
   relevance: number;
+  lastAccessedAt?: number;
+  accessCount?: number;
 };
 
 export function sourceCorrespondenceThreshold(focus: string, mode: string) {
@@ -35,7 +37,7 @@ export function sourceDedupeKey(source: string) {
   return source.replace(/:\d+(?::\d+)?$/, "");
 }
 
-export function candidateSortKey(item: ContextItemLike, focus: string, mode: string) {
+export function candidateSortKey(item: ContextItemLike, focus: string, mode: string, now?: number) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const target = extractQueryTarget(focus);
   const isEvalQuery = /\b(eval|metrics|quality|relevance|precision|recall|improvement)\b/i.test(focus);
@@ -65,12 +67,21 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   if (isGenericNoiseSource(item.source)) value -= wantsSource ? 0.3 : 0.12;
   if (isStickyGenericSnippet(item)) value -= 0.5;
   if (/repo:\/\/(docs\/sherpa-|\.pi\/sherpa-)/.test(item.source) && !/\bsherpa\b/i.test(focus)) value -= 0.45;
+  // Apply ACT-R recency + frequency boost: 0.6 original + 0.2 recency + 0.2 frequency
+  const halfLifeDays = 14;
+  const baselineCount = 5;
+  const recencyScore = item.lastAccessedAt !== undefined
+    ? decayScore(item.lastAccessedAt, now ?? Date.now(), halfLifeDays)
+    : 1.0;
+  const freqScore = frequencyScore(item.accessCount ?? 0, baselineCount);
+  value = 0.6 * value + 0.2 * recencyScore + 0.2 * freqScore;
   return value;
 }
 
-export function postProcessCandidates<T extends ContextItemLike>(candidates: T[], focus: string, mode: string): T[] {
+export function postProcessCandidates<T extends ContextItemLike>(candidates: T[], focus: string, mode: string, now?: number): T[] {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
-  const sorted = [...candidates].sort((a, b) => candidateSortKey(b, focus, mode) - candidateSortKey(a, focus, mode));
+  const _now = now ?? Date.now();
+  const sorted = [...candidates].sort((a, b) => candidateSortKey(b, focus, mode, _now) - candidateSortKey(a, focus, mode, _now));
   const out: T[] = [];
   const seen = new Set<string>();
   let readmeCount = 0;
@@ -89,10 +100,46 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
       if (wantsSource && isStickyGenericSnippet(item)) continue;
       readmeCount++;
     }
-    if (candidateSortKey(item, focus, mode) < sourceCorrespondenceThreshold(focus, mode)) continue;
+    if (candidateSortKey(item, focus, mode, _now) < sourceCorrespondenceThreshold(focus, mode)) continue;
     if (wantsSource && /repo:\/\/(docs\/sherpa-|\.pi\/sherpa-)/.test(item.source) && !/\bsherpa\b/i.test(focus)) continue;
     seen.add(key);
     out.push(item);
   }
   return out;
+}
+
+/**
+ * ACT-R-inspired exponential decay score based on time since last access.
+ * Returns 1.0 for today, ~0.5 for halfLifeDays ago, ~0.25 for 2x halfLife.
+ */
+export function decayScore(lastAccessTimestamp: number, now: number, halfLifeDays: number = 14): number {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const daysSinceAccess = Math.max(0, (now - lastAccessTimestamp) / msPerDay);
+  return Math.exp(-daysSinceAccess / halfLifeDays);
+}
+
+/**
+ * Frequency score based on access count, capped at 1.0.
+ * Reaches baseline (1.0) when accessCount >= baselineCount * 2.
+ */
+export function frequencyScore(accessCount: number, baselineCount: number = 5): number {
+  return Math.min(1.0, accessCount / (baselineCount * 2));
+}
+
+/**
+ * Apply recency + frequency boost to a candidate's score.
+ * finalScore = 0.6 * originalRelevance + 0.2 * recencyScore + 0.2 * frequencyScore.
+ */
+export function applyRecencyBoost(item: ContextItemLike, now: number): number {
+  const halfLifeDays = 14;
+  const baselineCount = 5;
+
+  // If no lastAccessedAt, default to max recency (1.0) — no penalty for missing data
+  const recencyScore = item.lastAccessedAt !== undefined
+    ? decayScore(item.lastAccessedAt, now, halfLifeDays)
+    : 1.0;
+
+  const freqScore = frequencyScore(item.accessCount ?? 0, baselineCount);
+
+  return 0.6 * item.relevance + 0.2 * recencyScore + 0.2 * freqScore;
 }
