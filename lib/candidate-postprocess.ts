@@ -5,6 +5,7 @@ import { extractQueryTarget } from "./query-target";
 import {
   focusAllowsGitStatus,
   focusAllowsHistoricalMemory,
+  focusAllowsInquirerMemory,
   focusAllowsPackageManifest,
   focusAllowsResearchMemory,
   isGenericNoiseSource,
@@ -60,6 +61,7 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   }
   if (item.type === "git_status" && !focusAllowsGitStatus(focus)) value -= 2.0;
   if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) value -= 1.5;
+  if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) value -= 1.0;
   if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) value -= 1.2;
   if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus)) value -= wantsSource ? 0.65 : 0.25;
   if (isRootReadmeSource(item.source) && !permitsRootReadme(focus)) value -= 1.0;
@@ -90,6 +92,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (genericSourceClass(item.source) && !focusAllowsGenericSource(item.source, focus)) continue;
     if (item.type === "git_status" && !focusAllowsGitStatus(focus)) continue;
     if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) continue;
+    if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
     const key = sourceDedupeKey(item.source);

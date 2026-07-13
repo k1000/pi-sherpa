@@ -1,5 +1,5 @@
 import type { UserMessage } from "@mariozechner/pi-ai";
-import { addDocCandidates, addSessionCandidates, addUrlReferences } from "./lib/basic-candidate-sources";
+import { addDocCandidates, addInquirerCandidates, addSessionCandidates, addUrlReferences } from "./lib/basic-candidate-sources";
 import { candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -52,7 +52,7 @@ import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
 import { extractQueryTarget } from "./lib/query-target";
 import { retrievalEnabled } from "./lib/source-activation";
-import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
+import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsInquirerMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { conciseSummary, isTrivial } from "./lib/text-utils";
@@ -132,7 +132,7 @@ function loadSherpaSystemPrompt(cwd: string, config?: Partial<SherpaConfig>) {
 
 
 type Mode = "auto" | "explicit" | "proactive" | "off";
-type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "semble" | "graphify";
+type Source = "files" | "git" | "docs" | "session" | "web" | "logs" | "project_memory" | "semble" | "graphify" | "inquirer";
 
 type SherpaConfig = {
   enabled: boolean;
@@ -148,6 +148,7 @@ type SherpaConfig = {
   web: { enabled: boolean; provider: "brave" | "tavily" | "serpapi"; apiKeyEnv: string; maxResults: number; timeoutMs: number; cacheTtlMs: number };
   semble: { enabled: boolean; command: string; topK: number; timeoutMs: number };
   graphify: { enabled: boolean; command: string; graphPath: string; timeoutMs: number; budgetTokens: number; maxLines: number; };
+  inquirer: { enabled: boolean; url: string; token?: string; tokenEnv: string; searchLimit: number };
   routeMap: { enabled: boolean; path: string; applyTo: "all" | "front-door" | "explicit" };
   dedupe: { urls: { enabled: boolean; normalize: boolean; scope: "bundle" } };
   dspy: {
@@ -251,7 +252,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   frontDoor: { enabled: true, tokenBudget: 1200 },
   explicit: { enabled: true, tokenBudget: 3000 },
   proactive: { enabled: false, tokenBudget: 800, cooldownTurns: 3 },
-  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true, semble: true, graphify: true },
+  sources: { files: true, git: true, docs: true, session: true, web: false, logs: false, project_memory: true, semble: true, graphify: true, inquirer: true },
   privacy: { allowNetwork: false, allowRemoteModel: false },
   model: { provider: "olmx", id: "Qwen3.6-35B-A3B-4bit", useMainPiModel: false, heuristicOnly: false, fallbackToHeuristics: true },
   summarization: { maxToolResultChars: 12000, replacementBudget: 1500 },
@@ -259,6 +260,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   web: { enabled: false, provider: "brave", apiKeyEnv: "BRAVE_SEARCH_API_KEY", maxResults: 5, timeoutMs: 5000, cacheTtlMs: 6 * 60 * 60 * 1000 },
   semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
   graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
+  inquirer: { enabled: true, url: "https://api.enquirer.app", tokenEnv: "SHERPA_MEMORY_API_TOKEN", searchLimit: 8 },
   routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
   dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
@@ -678,6 +680,7 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
     catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
     evaluationRoot: obsidianMemoryPath(state),
   }, add)));
+  if (enabled("inquirer") && focusAllowsInquirerMemory(focus)) tasks.push(addInquirerCandidates(state.config.inquirer, focus, add));
   return tasks;
 }
 

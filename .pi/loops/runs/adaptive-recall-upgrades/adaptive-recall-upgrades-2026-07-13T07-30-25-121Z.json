@@ -77,14 +77,16 @@
     "specVersion": 1,
     "finalVerifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts"
   },
-  "iteration": 2,
-  "stepIteration": 2,
+  "iteration": 3,
+  "stepIteration": 1,
   "currentStepIndex": 0,
-  "currentTaskId": "recency-scoring",
-  "completedTaskIds": [],
+  "currentTaskId": "vector-similarity",
+  "completedTaskIds": [
+    "recency-scoring"
+  ],
   "status": "running",
   "startedAt": "2026-07-13T07:30:25.121Z",
-  "updatedAt": "2026-07-13T07:33:01.099Z",
+  "updatedAt": "2026-07-13T07:36:23.966Z",
   "history": [
     {
       "taskId": "recency-scoring",
@@ -131,6 +133,32 @@
       "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts",
       "verifyExitCode": 0,
       "verifyStdout": "✅ All 25 ranking tests passed\n",
+      "verifyStderr": ""
+    },
+    {
+      "taskId": "vector-similarity",
+      "summary": "Implemented the vector-similarity retrieval slice by adding an `inquirer` source backed by Archivist's existing `MemoryApiStore`. Sherpa now has default Inquirer config, includes `inquirer` in source types/planning/conditional activation, guards it with `focusAllowsInquirerMemory`, queries the Memory API via `addInquirerCandidates`, maps vector results to `inquirer_memory` candidates, and wires the source into retrieval when enabled. Tests cover missing config, API failure, mocked vector search mapping, heuristic source plans including Inquirer for memory/architecture prompts, source guard allow/deny, and config-enabled retrieval gating. Red-phase rationale: old behavior would fail the new tests because `addInquirerCandidates`, `inquirer` source planning, and source guard support did not exist. Deferred edge cases: no persistence of vector feedback or graph expansion in this step; those are separate DAG tasks.",
+      "blocked": false,
+      "artifacts": [
+        "lib/basic-candidate-sources.ts",
+        "lib/source-guards.ts",
+        "lib/source-planning.ts",
+        "lib/conditional-source.ts",
+        "index.ts",
+        "tests/semble.test.ts",
+        "tests/source-plan.test.ts",
+        "tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts"
+      ],
+      "iteration": 3,
+      "stepIteration": 1,
+      "stepId": "vector-similarity",
+      "stepName": "Vector similarity search via Inquirer Memory API",
+      "timestamp": "2026-07-13T07:36:23.966Z",
+      "status": "done",
+      "verification": "`cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts` exited 0",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts",
+      "verifyExitCode": 0,
+      "verifyStdout": "✅ parseSembleSearchOutput parses markdown results\n✅ parseSembleSearchOutput ignores malformed or empty blocks\n✅ Semble state is persisted under .pi/sherpa\n✅ Inquirer candidates return empty for missing config\n✅ Inquirer candidates return empty when API search fails\n✅ Inquirer vector search results become memory candidates\nResults: 6 passed, 0 failed\nsource-plan tests passed=9\n✅ golden: code prompt keeps exact implementation file and strips generic noise\n✅ golden: git status is only returned when the prompt asks for changed files\n✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not\n✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory\n✅ golden: compressed summaries preserve expand pointers\n✅ golden: source planner includes files for Sherpa quality review\n✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation\n✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool\n✅ golden: query target extraction identifies action, targets, and evidence type\n✅ golden: old journal memory is stripped unless history/session is requested\n✅ golden: research memory is stripped unless research is requested\n✅ golden: target term matches boost exact source over adjacent context\n✅ golden: debug snippet extraction prefers declarations over imports\n✅ golden: sherpa-context renders diagnostic planner metadata\n✅ golden: unified context compiler parser keeps valid unique indexes capped at 3\nResults: 15 passed, 0 failed\n",
       "verifyStderr": ""
     }
   ],

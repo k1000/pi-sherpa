@@ -90,6 +90,13 @@ const BUILT_IN_SOURCES: ConditionalSource[] = [
     },
   },
   {
+    id: "inquirer",
+    label: "Inquirer vector memory",
+    when: {
+      minRelevance: 0.2,
+    },
+  },
+  {
     id: "logs",
     label: "Log files",
     when: {

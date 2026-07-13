@@ -26,6 +26,10 @@ export function focusAllowsHistoricalMemory(focus: string) {
   return /\b(previous|earlier|history|historical|journal|timeline|session|last time|recent session|past session|what happened|we discussed)\b/i.test(focus);
 }
 
+export function focusAllowsInquirerMemory(focus: string) {
+  return /\b(memory|remember|convention|pattern|known\s+issue|lesson|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|context|retrieval|previous|earlier|history)\b/i.test(focus);
+}
+
 export function isHistoricalMemorySource(item: SourceLike) {
   const source = item.source.toLowerCase();
   return source.startsWith("kb://journal/") || source.includes("/journal/") || item.type === "session_recent";
