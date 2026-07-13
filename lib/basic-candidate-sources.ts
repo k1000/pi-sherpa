@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import { getDocFilesForFocus } from "./doc-discovery";
 import { extractUrls } from "./url-utils";
-import { MemoryApiStore, type ArchivistMemoryApiConfig } from "../../archivist/lib/memory-api";
+import { MemoryApiStore, memoryApiGet, type ArchivistMemoryApiConfig, type MemoryArtifact, type MemoryRelation } from "../../archivist/lib/memory-api";
 
 /** Basic low-coupling candidate source readers. */
 
@@ -41,27 +41,103 @@ export function addSessionCandidates(ctx: ExtensionContext, add: AddCandidateIte
   add("session_recent", "session://recent", recent, 0.05);
 }
 
+function memoryApiConfig(config: InquirerCandidateConfig): ArchivistMemoryApiConfig {
+  return {
+    mode: "memory-api",
+    namespace: "pi",
+    database: "memory",
+    tokenEnv: "SHERPA_MEMORY_API_TOKEN",
+    ...config,
+    enabled: true,
+    url: config.url!,
+  } as ArchivistMemoryApiConfig;
+}
+
+function artifactText(artifact: MemoryArtifact): string {
+  const title = typeof artifact.title === "string" ? artifact.title : artifact.id;
+  const body = String(artifact.summary ?? artifact.text ?? title ?? "").slice(0, 4000);
+  return body.trim() ? `${title}\n${body}` : "";
+}
+
+function normalizedScore(score: unknown, fallback = 0.25): number {
+  return typeof score === "number" && Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : fallback;
+}
+
+function relationArtifact(relation: MemoryRelation): MemoryArtifact | undefined {
+  const raw = (relation as any).artifact ?? (relation as any).toArtifact ?? (relation as any).targetArtifact;
+  return raw && typeof raw === "object" && typeof raw.id === "string" ? raw as MemoryArtifact : undefined;
+}
+
+async function getRelations(config: InquirerCandidateConfig, from: string): Promise<MemoryRelation[]> {
+  try {
+    const result = await memoryApiGet({ memoryApi: memoryApiConfig(config) } as any, `/api/v1/memory/relations?from=${encodeURIComponent(from)}`);
+    return Array.isArray(result?.relations) ? result.relations : Array.isArray(result) ? result : [];
+  } catch {
+    return [];
+  }
+}
+
+async function addGraphCandidates(config: InquirerCandidateConfig, store: MemoryApiStore, seeds: Array<{ id: string; score: number }>, seenArtifacts: Set<string>, add: AddCandidateItem): Promise<void> {
+  const queued = seeds.map((seed) => ({ ...seed, hop: 0 }));
+  const seenRelations = new Set<string>();
+  let added = 0;
+  while (queued.length && added < (config.searchLimit || 8)) {
+    const current = queued.shift()!;
+    if (current.hop >= 2) continue;
+    const relations = await getRelations(config, current.id);
+    for (const relation of relations) {
+      const target = String(relation.to ?? "").trim();
+      if (!target || seenRelations.has(`${current.id}->${target}`)) continue;
+      seenRelations.add(`${current.id}->${target}`);
+      const graphScore = current.score * 0.7;
+      const embedded = relationArtifact(relation);
+      if (embedded && !seenArtifacts.has(embedded.id)) {
+        const raw = artifactText(embedded);
+        if (raw) {
+          seenArtifacts.add(embedded.id);
+          add("inquirer_graph", `inquirer_graph://${embedded.id}`, raw, graphScore);
+          added++;
+        }
+      } else if (!seenArtifacts.has(target)) {
+        try {
+          const related = await store.search({ text: target, limit: 1 });
+          for (const result of related) {
+            const artifact = result.artifact;
+            if (!artifact?.id || seenArtifacts.has(artifact.id)) continue;
+            const raw = artifactText(artifact);
+            if (!raw) continue;
+            seenArtifacts.add(artifact.id);
+            add("inquirer_graph", `inquirer_graph://${artifact.id}`, raw, graphScore * normalizedScore(result.score, 1));
+            added++;
+          }
+        } catch {
+          // Graph expansion is opportunistic; direct vector results remain useful.
+        }
+      }
+      queued.push({ id: target, score: graphScore, hop: current.hop + 1 });
+      if (added >= (config.searchLimit || 8)) break;
+    }
+  }
+}
+
 export async function addInquirerCandidates(config: InquirerCandidateConfig | undefined, focus: string, add: AddCandidateItem): Promise<void> {
   if (!config?.enabled || !config.url) return;
   try {
-    const store = new MemoryApiStore({
-      mode: "memory-api",
-      namespace: "pi",
-      database: "memory",
-      tokenEnv: "SHERPA_MEMORY_API_TOKEN",
-      ...config,
-      enabled: true,
-      url: config.url,
-    } as ArchivistMemoryApiConfig);
+    const store = new MemoryApiStore(memoryApiConfig(config));
     const results = await store.search({ text: focus, limit: config.searchLimit || 8 });
+    const seeds: Array<{ id: string; score: number }> = [];
+    const seenArtifacts = new Set<string>();
     for (const result of results) {
       const artifact = result.artifact;
-      const title = typeof artifact.title === "string" ? artifact.title : artifact.id;
-      const body = String(artifact.summary ?? artifact.text ?? title ?? "").slice(0, 4000);
-      if (!body.trim()) continue;
-      const score = typeof result.score === "number" && Number.isFinite(result.score) ? Math.max(0, Math.min(1, result.score)) : 0.25;
-      add("inquirer_memory", `inquirer_memory://${artifact.id}`, `${title}\n${body}`, score);
+      if (!artifact?.id) continue;
+      const raw = artifactText(artifact);
+      if (!raw) continue;
+      const score = normalizedScore(result.score);
+      seenArtifacts.add(artifact.id);
+      seeds.push({ id: artifact.id, score });
+      add("inquirer_memory", `inquirer_memory://${artifact.id}`, raw, score);
     }
+    if (seeds.length) await addGraphCandidates(config, store, seeds, seenArtifacts, add);
   } catch {
     return;
   }

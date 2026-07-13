@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { conciseSummary, extractQueryTarget, heuristicSourcePlan, isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt, parseCompiledContextItems, postProcessCandidates, resolveModelFilterPool } from "../index";
+import { addInquirerCandidates } from "../lib/basic-candidate-sources";
 import { readSnippetAround } from "../lib/file-snippet";
+import { MemoryApiStore } from "../../archivist/lib/memory-api";
 import { signalMarkdown } from "../lib/signal-render";
 
 type Candidate = Parameters<typeof postProcessCandidates>[0][number];
@@ -39,10 +41,10 @@ function assertExcludesAny(actual: string[], forbiddenFragment: string): void {
   );
 }
 
-const tests: Array<{ name: string; fn: () => void }> = [];
+const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [];
 let passed = 0;
 let failed = 0;
-function test(name: string, fn: () => void) { tests.push({ name, fn }); }
+function test(name: string, fn: () => void | Promise<void>) { tests.push({ name, fn }); }
 
 test("golden: code prompt keeps exact implementation file and strips generic noise", () => {
   const prompt = "fix parseSembleSearchOutput in lib/semble.ts";
@@ -201,6 +203,55 @@ test("golden: sherpa-context renders diagnostic planner metadata", () => {
   assert.ok(rendered.includes("Diagnostics: planner=llm; curator=llm; curatorConfidence=0.70; candidates=17; selected=1"), rendered);
 });
 
+test("golden: inquirer graph traversal adds related artifacts with reduced relevance", async () => {
+  const originalSearch = MemoryApiStore.prototype.search;
+  const originalFetch = globalThis.fetch;
+  try {
+    MemoryApiStore.prototype.search = async function (query: { text: string; limit?: number }) {
+      if (query.text === "remember source routing") return [{ artifact: { id: "artifact-a", title: "Source routing", summary: "Primary routing memory" }, score: 0.8 }];
+      if (query.text === "entity-routing") return [{ artifact: { id: "artifact-b", title: "Related routing", summary: "Related graph memory" }, score: 1 }];
+      return [];
+    };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const text = String(url);
+      if (text.includes("from=artifact-a")) {
+        return new Response(JSON.stringify({ relations: [{ from: "artifact-a", relation: "mentions", to: "entity-routing" }] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ relations: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const added: Array<{ type: string; source: string; raw: string; relBoost?: number }> = [];
+    await addInquirerCandidates({ enabled: true, url: "http://localhost:3000", searchLimit: 4 }, "remember source routing", (type, source, raw, relBoost) => added.push({ type, source, raw, relBoost }));
+    assert.ok(added.some((item) => item.source === "inquirer_memory://artifact-a"), "expected direct vector artifact");
+    const related = added.find((item) => item.source === "inquirer_graph://artifact-b");
+    assert.ok(related, `expected related graph artifact; got ${added.map((item) => item.source).join(", ")}`);
+    assert.equal(related!.relBoost, 0.8 * 0.7, "related graph item should receive 0.7x origin relevance");
+  } finally {
+    MemoryApiStore.prototype.search = originalSearch;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds", async () => {
+  const originalSearch = MemoryApiStore.prototype.search;
+  const originalFetch = globalThis.fetch;
+  try {
+    MemoryApiStore.prototype.search = async function (query: { text: string }) {
+      if (query.text === "no vector hits") return [];
+      return [{ artifact: { id: "artifact-a", title: "Source routing", summary: "Primary routing memory" }, score: 0.8 }];
+    };
+    globalThis.fetch = (async () => new Response("not found", { status: 404 })) as typeof fetch;
+    const missingEndpoint: unknown[] = [];
+    await addInquirerCandidates({ enabled: true, url: "http://localhost:3000", searchLimit: 4 }, "remember source routing", (...args) => missingEndpoint.push(args));
+    assert.equal(missingEndpoint.length, 1, "relation endpoint failure should keep direct result and skip graph additions");
+    const empty: unknown[] = [];
+    await addInquirerCandidates({ enabled: true, url: "http://localhost:3000", searchLimit: 4 }, "no vector hits", (...args) => empty.push(args));
+    assert.equal(empty.length, 0, "empty vector search should not run graph traversal additions");
+  } finally {
+    MemoryApiStore.prototype.search = originalSearch;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("golden: unified context compiler parser keeps valid unique indexes capped at 3", () => {
   assert.deepEqual(parseCompiledContextItems({ items: [
     { index: 1, summary: "use this file", why: "exact target" },
@@ -218,7 +269,7 @@ test("golden: unified context compiler parser keeps valid unique indexes capped 
 
 for (const { name, fn } of tests) {
   try {
-    fn();
+    await fn();
     passed++;
     console.log(`✅ ${name}`);
   } catch (error) {

@@ -77,16 +77,17 @@
     "specVersion": 1,
     "finalVerifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts"
   },
-  "iteration": 3,
+  "iteration": 4,
   "stepIteration": 1,
   "currentStepIndex": 0,
-  "currentTaskId": "vector-similarity",
+  "currentTaskId": "graph-traversal",
   "completedTaskIds": [
-    "recency-scoring"
+    "recency-scoring",
+    "vector-similarity"
   ],
   "status": "running",
   "startedAt": "2026-07-13T07:30:25.121Z",
-  "updatedAt": "2026-07-13T07:36:23.966Z",
+  "updatedAt": "2026-07-13T07:38:01.679Z",
   "history": [
     {
       "taskId": "recency-scoring",
@@ -159,6 +160,28 @@
       "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts",
       "verifyExitCode": 0,
       "verifyStdout": "✅ parseSembleSearchOutput parses markdown results\n✅ parseSembleSearchOutput ignores malformed or empty blocks\n✅ Semble state is persisted under .pi/sherpa\n✅ Inquirer candidates return empty for missing config\n✅ Inquirer candidates return empty when API search fails\n✅ Inquirer vector search results become memory candidates\nResults: 6 passed, 0 failed\nsource-plan tests passed=9\n✅ golden: code prompt keeps exact implementation file and strips generic noise\n✅ golden: git status is only returned when the prompt asks for changed files\n✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not\n✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory\n✅ golden: compressed summaries preserve expand pointers\n✅ golden: source planner includes files for Sherpa quality review\n✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation\n✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool\n✅ golden: query target extraction identifies action, targets, and evidence type\n✅ golden: old journal memory is stripped unless history/session is requested\n✅ golden: research memory is stripped unless research is requested\n✅ golden: target term matches boost exact source over adjacent context\n✅ golden: debug snippet extraction prefers declarations over imports\n✅ golden: sherpa-context renders diagnostic planner metadata\n✅ golden: unified context compiler parser keeps valid unique indexes capped at 3\nResults: 15 passed, 0 failed\n",
+      "verifyStderr": ""
+    },
+    {
+      "taskId": "graph-traversal",
+      "summary": "Implemented graph traversal as a secondary Inquirer retrieval strategy. `addInquirerCandidates` now keeps vector-hit seeds, queries the Memory API relations endpoint via `memoryApiGet`, follows up to 2 hops, searches related relation targets, de-duplicates direct hits, and adds related `inquirer_graph` candidates with a 0.7x relevance penalty per hop. Relation endpoint failures and empty vector searches are graceful no-ops. Golden tests now cover graph expansion, reduced relevance, missing relation endpoint handling, and no graph additions when vector search returns nothing. Red-phase rationale: old behavior only emitted direct vector candidates, so the new graph-related artifact and reduced-score assertions would fail. Deferred edge cases: richer relation directionality/reverse-edge traversal and dedicated graph source toggles beyond the existing Inquirer-enabled/results guard.",
+      "blocked": false,
+      "artifacts": [
+        "lib/basic-candidate-sources.ts",
+        "tests/golden-retrieval.test.ts",
+        "tsx tests/golden-retrieval.test.ts",
+        "tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts"
+      ],
+      "iteration": 4,
+      "stepIteration": 1,
+      "stepId": "graph-traversal",
+      "stepName": "Knowledge graph traversal as a retrieval strategy",
+      "timestamp": "2026-07-13T07:38:01.679Z",
+      "status": "done",
+      "verification": "`cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/golden-retrieval.test.ts` exited 0",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/golden-retrieval.test.ts",
+      "verifyExitCode": 0,
+      "verifyStdout": "✅ golden: code prompt keeps exact implementation file and strips generic noise\n✅ golden: git status is only returned when the prompt asks for changed files\n✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not\n✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory\n✅ golden: compressed summaries preserve expand pointers\n✅ golden: source planner includes files for Sherpa quality review\n✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation\n✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool\n✅ golden: query target extraction identifies action, targets, and evidence type\n✅ golden: old journal memory is stripped unless history/session is requested\n✅ golden: research memory is stripped unless research is requested\n✅ golden: target term matches boost exact source over adjacent context\n✅ golden: debug snippet extraction prefers declarations over imports\n✅ golden: sherpa-context renders diagnostic planner metadata\n✅ golden: inquirer graph traversal adds related artifacts with reduced relevance\n✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds\n✅ golden: unified context compiler parser keeps valid unique indexes capped at 3\nResults: 17 passed, 0 failed\n",
       "verifyStderr": ""
     }
   ],

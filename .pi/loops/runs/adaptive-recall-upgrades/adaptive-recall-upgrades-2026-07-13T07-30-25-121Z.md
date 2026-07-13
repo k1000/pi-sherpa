@@ -89,3 +89,37 @@ source-plan tests passed=9
 Results: 15 passed, 0 failed
 
 ```
+
+## Iteration 4.1 — Knowledge graph traversal as a retrieval strategy — done — 2026-07-13T07:38:01.679Z
+
+Implemented graph traversal as a secondary Inquirer retrieval strategy. `addInquirerCandidates` now keeps vector-hit seeds, queries the Memory API relations endpoint via `memoryApiGet`, follows up to 2 hops, searches related relation targets, de-duplicates direct hits, and adds related `inquirer_graph` candidates with a 0.7x relevance penalty per hop. Relation endpoint failures and empty vector searches are graceful no-ops. Golden tests now cover graph expansion, reduced relevance, missing relation endpoint handling, and no graph additions when vector search returns nothing. Red-phase rationale: old behavior only emitted direct vector candidates, so the new graph-related artifact and reduced-score assertions would fail. Deferred edge cases: richer relation directionality/reverse-edge traversal and dedicated graph source toggles beyond the existing Inquirer-enabled/results guard.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/golden-retrieval.test.ts` exited 0
+Artifacts:
+- lib/basic-candidate-sources.ts
+- tests/golden-retrieval.test.ts
+- tsx tests/golden-retrieval.test.ts
+- tsx tests/semble.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts
+
+Stdout:
+```
+✅ golden: code prompt keeps exact implementation file and strips generic noise
+✅ golden: git status is only returned when the prompt asks for changed files
+✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not
+✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory
+✅ golden: compressed summaries preserve expand pointers
+✅ golden: source planner includes files for Sherpa quality review
+✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation
+✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool
+✅ golden: query target extraction identifies action, targets, and evidence type
+✅ golden: old journal memory is stripped unless history/session is requested
+✅ golden: research memory is stripped unless research is requested
+✅ golden: target term matches boost exact source over adjacent context
+✅ golden: debug snippet extraction prefers declarations over imports
+✅ golden: sherpa-context renders diagnostic planner metadata
+✅ golden: inquirer graph traversal adds related artifacts with reduced relevance
+✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds
+✅ golden: unified context compiler parser keeps valid unique indexes capped at 3
+Results: 17 passed, 0 failed
+
+```
