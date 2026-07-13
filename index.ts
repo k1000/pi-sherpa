@@ -53,7 +53,7 @@ import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt
 import { extractQueryTarget } from "./lib/query-target";
 import { retrievalEnabled } from "./lib/source-activation";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
-import { extractJsonArray } from "./lib/json-utils";
+import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
 import { conciseSummary, isTrivial } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
@@ -445,6 +445,9 @@ async function inferSearchIndicators(state: State, ctx: ExtensionContext, focus:
 }
 
 async function planSources(state: State, ctx: ExtensionContext, focus: string, mode: string, sourceOverride?: string[]): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators }> {
+  // Reload disk config before model-gated planning so privacy/model changes made
+  // outside the running session take effect without requiring a Pi restart.
+  state.config = loadConfig(ctx.cwd);
   const routePlan = matchRoutePlan(state, ctx.cwd, focus, mode);
   const overridden = normalizeSources(sourceOverride, mode);
   if (overridden.length) return { sourcePlan: { sources: overridden, reason: "explicit source override", confidence: 1, planner: "override", routePlan }, indicators: heuristicSearchIndicators(focus) };
@@ -832,10 +835,18 @@ export default function (pi: ExtensionAPI) {
       if (exported.averageMetric < DSPY_COMPILE_MIN_AVG_METRIC) return { ran: false, reason: `average metric ${exported.averageMetric.toFixed(2)} below ${DSPY_COMPILE_MIN_AVG_METRIC}` };
       if (exported.highScoringExamples < DSPY_COMPILE_MIN_HIGH_EXAMPLES) return { ran: false, reason: `need ${DSPY_COMPILE_MIN_HIGH_EXAMPLES} high-scoring examples; have ${exported.highScoringExamples}` };
     }
-    const { stdout } = await runDspyPromptCompile(cwd);
-    state.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state.bundles };
-    persist();
-    if (notify) safeNotify(ctx, [`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
+    // Run DSPy compile in background child process so Pi TUI stays responsive.
+    // stdout is fire-and-forget; we don't block on the result.
+    runDspyPromptCompile(cwd).then(({ stdout }) => {
+      state!.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state!.bundles };
+      persist();
+      if (notify) safeNotify(ctx, [`Sherpa DSPy-style prompt-feedback candidate compiled (${reason})`, `traces=${exported.traces}; matched=${exported.matchedEvaluations}; avgMetric=${exported.averageMetric.toFixed(2)}; high=${exported.highScoringExamples}`, `train=${exported.train}; dev=${exported.dev}`, stdout.trim()].filter(Boolean).join("\n"), "info");
+    }).catch((error) => {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (notify) safeNotify(ctx, `Sherpa DSPy auto-compile failed: ${msg}`, "warning");
+      state!.dspyAuto = { lastCompileAt: new Date().toISOString(), lastCompileDate: todayIsoDate(), lastBundleCount: state!.bundles };
+      persist();
+    });
     return { ran: true, reason, exported };
   };
 
@@ -855,6 +866,7 @@ export default function (pi: ExtensionAPI) {
 
   const runSidecarSmoke = async (ctx: ExtensionContext) => {
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
+    state.config = loadConfig(ctx.cwd);
     const modelAuth = await getSherpaModelAuthWithReason(state, ctx);
     if (!modelAuth.ok) return { ok: false, lines: [`❌ model auth: ${modelAuth.reason}`] };
     const { model, auth } = modelAuth.value;
@@ -1020,13 +1032,193 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * Run post-task model reflection in a background child process.
+   *
+   * The LLM call (completeJsonObjectWithTimeout -> complete() -> HTTP fetch)
+   * blocks the event loop when called in-process. By delegating to a child
+   * process via execFileAsync, Pi's TUI stays responsive.
+   *
+   * On completion, the background worker writes a result file,
+   * which we poll for and process. If the worker fails or times out,
+   * we fall back to the deterministic evaluation only.
+   */
+  const runBackgroundTaskReflection = (
+    stateObj: State,
+    ctx: ExtensionContext,
+    cwd: string,
+    bundle: ContextBundleRecord,
+    deterministicEval: ContextEvaluation,
+    outcome: ReturnType<typeof classifyTaskOutcome>,
+    evidence: ReturnType<typeof collectRecentTaskFileEvidence>,
+    referencedFiles: string[],
+    changedFiles: string[],
+    recentText: string,
+    recentMessages: unknown[],
+  ) => {
+    // If model reflection is disabled, use deterministic-only path immediately.
+    if (stateObj.config.model.heuristicOnly) {
+      deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+      return;
+    }
+
+    const workerScript = path.join(path.dirname(__filename), "scripts", "background-model-worker.ts");
+    const reflectionMessage = taskReflectionMessage(bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+
+    // Resolve model auth. If unavailable, fall back to deterministic.
+    getSherpaModelAuth(stateObj, ctx).then((modelAuth) => {
+      if (!modelAuth) {
+        deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+        return;
+      }
+      const { model, auth } = modelAuth;
+      const inputWithAuth = JSON.stringify({
+        retrievalPrompt: stateObj.retrievalPrompt,
+        model: { provider: model.provider, id: model.id, api: model.api, baseUrl: model.baseUrl },
+        auth: { apiKey: auth.apiKey, headers: auth.headers },
+        messages: [{ role: "user", content: reflectionMessage.content, timestamp: Date.now() }],
+        timeoutMs: 14_000,
+      });
+
+      execFileAsync("bun", ["run", workerScript, "task-reflection", inputWithAuth], { cwd, timeout: 20_000, maxBuffer: 100_000 })
+        .then(({ stdout }) => {
+          try {
+            const result = JSON.parse(stdout.trim());
+            processBackgroundTaskReflectionResult(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText, result, recentMessages);
+          } catch {
+            deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+          }
+        })
+        .catch(() => {
+          deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+        });
+    }).catch(() => {
+      deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+    });
+  };
+
+  /**
+   * Fallback: apply deterministic-only evaluation without model feedback.
+   */
+  const deterministicOnlyReflection = (
+    stateObj: State,
+    ctx: ExtensionContext,
+    cwd: string,
+    bundle: ContextBundleRecord,
+    deterministicEval: ContextEvaluation,
+    outcome: ReturnType<typeof classifyTaskOutcome>,
+    evidence: ReturnType<typeof collectRecentTaskFileEvidence>,
+    referencedFiles: string[],
+    changedFiles: string[],
+    recentText: string,
+  ) => {
+    const reflected = { evalRecord: deterministicEval, modelUsed: false, reason: "background worker unavailable" } as const;
+    finishEvaluation(stateObj, ctx, cwd, bundle, reflected, outcome, evidence, referencedFiles, changedFiles);
+  };
+
+  /**
+   * Process background worker result and apply reflection.
+   */
+  const processBackgroundTaskReflectionResult = (
+    stateObj: State,
+    ctx: ExtensionContext,
+    cwd: string,
+    bundle: ContextBundleRecord,
+    deterministicEval: ContextEvaluation,
+    outcome: ReturnType<typeof classifyTaskOutcome>,
+    evidence: ReturnType<typeof collectRecentTaskFileEvidence>,
+    referencedFiles: string[],
+    changedFiles: string[],
+    recentText: string,
+    result: { aborted: boolean; text: string; error?: string | null },
+    _recentMessages: unknown[],
+  ) => {
+    if (result.aborted || result.error || !result.text) {
+      deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+      return;
+    }
+
+    // Parse the model output as JSON.
+    // Both extractJsonObject and applyReflectionModelOutput are already imported at module top.
+    const parsed = extractJsonObject(result.text);
+    if (!parsed) {
+      deterministicOnlyReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText);
+      return;
+    }
+
+    const reflected = applyReflectionModelOutput(deterministicEval, parsed);
+    finishEvaluation(stateObj, ctx, cwd, bundle, reflected, outcome, evidence, referencedFiles, changedFiles);
+  };
+
+  /**
+   * Shared evaluation finalization (write results, track state, maybe trigger DSPy compile).
+   */
+  const finishEvaluation = (
+    stateObj: State,
+    ctx: ExtensionContext,
+    cwd: string,
+    bundle: ContextBundleRecord,
+    reflected: ReturnType<typeof applyReflectionModelOutput> & { modelUsed: boolean; reason: string },
+    outcome: ReturnType<typeof classifyTaskOutcome>,
+    evidence: ReturnType<typeof collectRecentTaskFileEvidence>,
+    referencedFiles: string[],
+    changedFiles: string[],
+  ) => {
+    const evalRecord = reflected.evalRecord;
+    stateObj.feedback = [...stateObj.feedback.slice(-49), {
+      used: [...new Set([...evidence.readFiles, ...evidence.writtenFiles, ...referencedFiles])].filter((file) => !evalRecord.missed.includes(file)),
+      unused: evalRecord.noise,
+      missing: evalRecord.missed,
+      at: Date.now(),
+    }];
+    const memoryRoot = obsidianMemoryPath(stateObj);
+    const target = writeEvaluation(memoryRoot, evalRecord);
+    writeQualitySummary(memoryRoot, readRecentEvaluations(memoryRoot, 200));
+    appendScratchpadSection(stateObj, cwd, "observation", [
+      `Bundle: ${evalRecord.bundleId}`,
+      `Scores: relevance=${evalRecord.scores.relevance} precision=${evalRecord.scores.precision} recall=${evalRecord.scores.recall}`,
+      `Usefulness: ${reflected.modelUsed ? "model-evaluated" : `deterministic-only (${reflected.reason})`}`,
+      evalRecord.noise.length ? `Noise: ${evalRecord.noise.slice(0, 8).join(", ")}` : "Noise: none detected",
+      evalRecord.missed.length ? `Missed: ${evalRecord.missed.slice(0, 8).join(", ")}` : "Missed: none detected",
+      `Hint: ${evalRecord.improvementHint}`,
+      `Stored: ${path.relative(memoryRoot, target)}`,
+    ].join("\n"), "Sherpa retrieval evaluation");
+    if ((reflected as any).shouldPreserve && (reflected as any).lesson) {
+      appendScratchpadSection(stateObj, cwd, "distill_candidate", (reflected as any).lesson, "Sherpa reflection lesson");
+    }
+    stateObj.evaluationHashes = [...stateObj.evaluationHashes.slice(-49), bundle.bundleId];
+    stateObj.lastBundleId = undefined;
+    persist();
+    void maybeAutoCompileDspy(ctx, "evaluate");
+  };
+
   const runPostTaskWork = async (ctx: ExtensionContext, cwd: string, recentMessages: unknown[]) => {
     if (!state?.config.enabled) return;
     const stateObj = state;
     try {
+      // Fast path: deterministic work runs inline (file I/O only, no model calls).
       const { recentText, outcome, changedFiles } = await recordLifecycleObservation(stateObj, cwd, recentMessages);
-      await evaluateRecentBundle(stateObj, ctx, cwd, recentMessages, recentText, outcome, changedFiles);
       compactScratchpadAndNotify(stateObj, ctx, cwd);
+
+      // Slow path: model-dependent evaluation runs in a background child process
+      // so Pi's TUI event loop stays responsive.
+      const bundle = stateObj.lastBundleId ? getBundle(stateObj, stateObj.lastBundleId) : undefined;
+      if (bundle && Date.now() - bundle.timestamp < 2 * 60 * 60 * 1000 && !stateObj.evaluationHashes.includes(bundle.bundleId)) {
+        const evidence = collectRecentTaskFileEvidence(recentMessages, cwd);
+        const referencedFiles = extractMentionedRepoFiles(recentText, cwd);
+        const hasTaskSignal = evidence.readFiles.length || evidence.writtenFiles.length || referencedFiles.length || outcome.outcome !== "unknown";
+        if (hasTaskSignal) {
+          const deterministicEval = evaluatePostTaskContext({
+            bundle,
+            outcome: outcome.outcome,
+            files: { ...evidence, referencedFiles, changedFiles },
+            finalText: recentText.slice(-2000),
+          });
+
+          // Defer model reflection to background worker.
+          runBackgroundTaskReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText, recentMessages);
+        }
+      }
     } catch (error) {
       try { ctx.ui.notify(`Sherpa post-task work failed: ${String(error)}`, "warning"); } catch {}
     } finally {
@@ -1056,7 +1248,9 @@ export default function (pi: ExtensionAPI) {
     if ((event as { willRetry?: boolean }).willRetry === true) return;
     const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
     const cwd = ctx.cwd;
-    setTimeout(() => { void runPostTaskWork(ctx, cwd, recentMessages).catch(() => {}); }, 0);
+    // Run post-task work asynchronously without blocking the TUI event loop.
+    // The work splits into fast deterministic (inline) and slow model calls (child process).
+    setTimeout(() => { void runPostTaskWork(ctx, cwd, recentMessages).catch(() => {}); }, 100);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
