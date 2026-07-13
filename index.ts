@@ -46,7 +46,7 @@ import { configDiff, isPlainObject, mergeConfig, todayIsoDate, type DeepPartial 
 import { createContextAdder, type AddContextItem } from "./lib/context-adder";
 import { heuristicCurateResult, pickFinalContextItems, shouldAbstain } from "./lib/context-selection";
 
-import { compactScratchpad, compactScratchpadLifecycle, classifyTaskOutcome, suggestVerificationCommands } from "./lib/lifecycle";
+import { compactScratchpad, compactScratchpadLifecycle, classifyTaskOutcome, detectKnowledgeGaps, formatKnowledgeGapsForCompiler, suggestVerificationCommands, type KnowledgeGap } from "./lib/lifecycle";
 import { applyParameterChangeIfSignificant, applyReflectionModelOutput, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, type ScoringParams } from "./lib/post-task-evaluation";
 import { isGloballyNoisySource } from "./lib/noise-filter";
 import { allowsRepeatedMetaDebugContext, isCodePrompt, isPiSherpaMetaDebugPrompt, isSourceLookupPrompt, isTraceLogMetricsPrompt } from "./lib/query-classifier";
@@ -77,6 +77,7 @@ import { addSembleCandidates } from "./lib/semble-candidates";
 import { parseRgOutput, rg } from "./lib/rg";
 import { addProjectMemoryCandidates } from "./lib/project-memory-readers";
 import { parseGitStatusFiles } from "./lib/common";
+import { readProjectCatalog } from "./lib/catalog";
 import { focusAllowsGenericSource, genericSourceClass } from "./lib/generic-source";
 import type { RoutePlan } from "./lib/route-map";
 import { matchRoutePlan } from "./lib/route-match";
@@ -157,6 +158,7 @@ type SherpaConfig = {
     compiledPromptPath: string;
     autoCompile: { enabled: boolean; minTraces: number; bundleInterval: number; onEvaluate: boolean; onSessionShutdown: boolean; maxOncePerDay: boolean };
   };
+  curiosity: { enabled: boolean; gapThreshold: number };
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
 };
 
@@ -266,6 +268,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
   dspy: { enabled: false, compiledPromptPath: ".pi/sherpa/compiled", autoCompile: { enabled: true, minTraces: 10, bundleInterval: 25, onEvaluate: true, onSessionShutdown: true, maxOncePerDay: true } },
+  curiosity: { enabled: true, gapThreshold: 2 },
   prompts: {
     retrieval: { projectPath: ".pi/sherpa/prompts/RETRIEVAL.md", globalPath: "prompts/RETRIEVAL.md" },
     distillation: { projectPath: ".pi/sherpa/prompts/DISTILLATION.md", globalPath: "prompts/DISTILLATION.md" },
@@ -657,6 +660,29 @@ async function addFileCandidates(ctx: ExtensionContext, focus: string, mode: str
   await addIndicatorFileCandidates(ctx, mode, sourcePlan, indicators, add);
 }
 
+function recentSessionMessages(ctx: ExtensionContext, limit = 20): string[] {
+  return ctx.sessionManager.getEntries().slice(-limit).map((entry: any) => JSON.stringify(entry).slice(0, 1000));
+}
+
+async function addKnowledgeGapCandidates(state: State, ctx: ExtensionContext, focus: string, mode: string, add: AddContextItem, enabled: (s: Source) => boolean): Promise<KnowledgeGap[]> {
+  if (!state.config.curiosity?.enabled || mode !== "front-door") return [];
+  const gaps = detectKnowledgeGaps(focus, recentSessionMessages(ctx), readProjectCatalog(ctx.cwd))
+    .filter((gap) => gap.mentionCount >= (state.config.curiosity.gapThreshold ?? 2));
+  if (!gaps.length) return [];
+  const summary = formatKnowledgeGapsForCompiler(gaps);
+  if (summary) add("knowledge_gap", "curiosity://knowledge-gaps", summary, 0.28);
+  if (enabled("web")) {
+    for (const gap of gaps.slice(0, 3)) {
+      try {
+        for (const r of await searchWebForState(ctx.cwd, state, gap.entity, DEFAULT_CONFIG.web.cacheTtlMs)) {
+          add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.2);
+        }
+      } catch { /* curiosity search is opportunistic */ }
+    }
+  }
+  return gaps;
+}
+
 function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {
   const tasks: Promise<void>[] = [];
   if (enabled("files")) tasks.push(addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
@@ -694,6 +720,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   addUrlReferences(state, focus, add);
   await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled));
   await retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled, state.config.semble);
+  await addKnowledgeGapCandidates(state, ctx, focus, mode, add, enabled);
 
   const traceFeedback = applyRetrievalFeedback(state, focus, candidates, obsidianMemoryPath(state));
   let compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);

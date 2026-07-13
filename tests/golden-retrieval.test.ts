@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { conciseSummary, extractQueryTarget, heuristicSourcePlan, isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt, parseCompiledContextItems, postProcessCandidates, resolveModelFilterPool } from "../index";
 import { addInquirerCandidates } from "../lib/basic-candidate-sources";
+import { contextCompilerMessage } from "../lib/context-compiler";
 import { readSnippetAround } from "../lib/file-snippet";
 import { MemoryApiStore } from "../../archivist/lib/memory-api";
 import { signalMarkdown } from "../lib/signal-render";
@@ -201,6 +202,15 @@ test("golden: sherpa-context renders diagnostic planner metadata", () => {
     diagnostics: { sourcesSearched: ["files"], candidateCount: 17, selectedCount: 1, sourcePlanner: "llm", curationPlanner: "llm", curationConfidence: 0.7 },
   }, "front-door", 0, undefined, "bundle-test");
   assert.ok(rendered.includes("Diagnostics: planner=llm; curator=llm; curatorConfidence=0.70; candidates=17; selected=1"), rendered);
+});
+
+test("golden: knowledge gap candidate is visible in context compiler message", () => {
+  const message = contextCompilerMessage({ sessionManager: { getEntries: () => [] } } as any, { handles: new Map() }, "Investigate GraphNexus", "front-door", [
+    candidate({ type: "knowledge_gap", source: "curiosity://knowledge-gaps", relevance: 0.28, summary: "Knowledge gaps detected:\n- GraphNexus (3 mentions; missing catalog entry)" }),
+  ]);
+  const text = (message.content[0] as any).text as string;
+  assert.ok(text.includes("Knowledge gaps detected"), "expected compiler manifest to include knowledge gaps");
+  assert.ok(text.includes("GraphNexus"), "expected gap entity in compiler message");
 });
 
 test("golden: inquirer graph traversal adds related artifacts with reduced relevance", async () => {

@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import type { CatalogRow } from "./catalog";
 
 export type TaskOutcome = "completed" | "partial" | "blocked" | "failed" | "reverted" | "unknown";
 export type LifecycleStage = "active" | "fading" | "archived";
+export type KnowledgeGap = { entity: string; mentionCount: number; firstSeenAt: number; lastSeenAt: number; hasCatalogEntry: boolean };
 
 export type VerificationAdvice = {
   commands: Array<{ command: string; reason: string }>;
@@ -20,6 +22,49 @@ export function computeLifecycleStage(lastAccessedAt: number | undefined, confid
   if (daysSinceAccess > 60) return "archived";
   if (daysSinceAccess > 30) return "fading";
   return "active";
+}
+
+const COMMON_CAPITALIZED_TERMS = new Set(["The", "This", "That", "These", "Those", "When", "Where", "What", "Why", "How", "Please", "Sherpa", "Pi"]);
+
+function catalogContainsEntity(entity: string, catalog: CatalogRow[]): boolean {
+  const normalized = entity.toLowerCase();
+  return catalog.some((row) => Object.values(row).some((value) => {
+    const text = String(value ?? "").toLowerCase();
+    return text === normalized || text.includes(normalized);
+  }));
+}
+
+export function detectKnowledgeGaps(focus: string, recentMessages: string[], catalog: CatalogRow[]): KnowledgeGap[] {
+  const counts = new Map<string, { entity: string; mentionCount: number; firstSeenAt: number; lastSeenAt: number }>();
+  const messages = [focus, ...recentMessages];
+  messages.forEach((message, index) => {
+    const seenInMessage = new Set<string>();
+    for (const match of message.matchAll(/\b(?:[A-Z][A-Za-z0-9]+|[A-Z]{2,})(?:[\s-]+(?:[A-Z][A-Za-z0-9]+|[A-Z]{2,}))*\b/g)) {
+      const entity = match[0].replace(/\s+/g, " ").trim();
+      if (entity.length < 4 || COMMON_CAPITALIZED_TERMS.has(entity)) continue;
+      const key = entity.toLowerCase();
+      if (seenInMessage.has(key)) continue;
+      seenInMessage.add(key);
+      const at = index + 1;
+      const existing = counts.get(key) ?? { entity, mentionCount: 0, firstSeenAt: at, lastSeenAt: at };
+      existing.mentionCount++;
+      existing.lastSeenAt = at;
+      counts.set(key, existing);
+    }
+  });
+  return [...counts.values()]
+    .map((gap) => ({ ...gap, hasCatalogEntry: catalogContainsEntity(gap.entity, catalog) }))
+    .filter((gap) => gap.mentionCount >= 2 && !gap.hasCatalogEntry)
+    .sort((a, b) => b.mentionCount - a.mentionCount || a.entity.localeCompare(b.entity));
+}
+
+export function formatKnowledgeGapsForCompiler(gaps: KnowledgeGap[]): string {
+  if (!gaps.length) return "";
+  return [
+    "Knowledge gaps detected:",
+    ...gaps.map((gap) => `- ${gap.entity} (${gap.mentionCount} mentions; missing catalog entry)`),
+    "Consider whether docs, web, or project memory retrieval should cover these entities.",
+  ].join("\n");
 }
 
 export function classifyTaskOutcome(text: string): { outcome: TaskOutcome; reason: string } {

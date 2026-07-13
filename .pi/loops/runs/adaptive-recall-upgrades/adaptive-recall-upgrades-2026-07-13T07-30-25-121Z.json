@@ -77,19 +77,20 @@
     "specVersion": 1,
     "finalVerifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/candidate-ranking.test.ts && tsx tests/lifecycle.test.ts && tsx tests/post-task-evaluation.test.ts && tsx tests/source-plan.test.ts && tsx tests/golden-retrieval.test.ts && tsx tests/dspy-trace-report.test.ts && tsx tests/semble.test.ts"
   },
-  "iteration": 6,
+  "iteration": 7,
   "stepIteration": 1,
   "currentStepIndex": 0,
-  "currentTaskId": "evidence-gating",
+  "currentTaskId": "curiosity-gaps",
   "completedTaskIds": [
     "recency-scoring",
     "vector-similarity",
     "graph-traversal",
-    "memory-lifecycle"
+    "memory-lifecycle",
+    "evidence-gating"
   ],
   "status": "running",
   "startedAt": "2026-07-13T07:30:25.121Z",
-  "updatedAt": "2026-07-13T07:42:35.291Z",
+  "updatedAt": "2026-07-13T07:44:52.109Z",
   "history": [
     {
       "taskId": "recency-scoring",
@@ -231,6 +232,29 @@
       "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/post-task-evaluation.test.ts && tsx tests/dspy-trace-report.test.ts",
       "verifyExitCode": 0,
       "verifyStdout": "✅ scores high recall when bundle covers edited file\n✅ marks missed files and noisy generic snippets\n✅ does not treat pre-existing dirty git files as missed recall ground truth\n✅ meta-analysis evaluates intent-matching memory without file ground truth\n✅ feedback penalizes noise and boosts missed filename candidates\n✅ feedback penalizes generic source classes even without exact prior noise\n✅ project quality summary penalties apply even without recent eval objects\n✅ generic source penalties are skipped when focus explicitly asks for that source class\n✅ quality summary can be written and read back\n✅ sidecar reflection output overrides usefulness, missed/noisy context, and lesson\n✅ feedback does not boost unrelated generic page.tsx candidates\n✅ summarizeEvaluations computes averageConfidenceError from planner confidence vs recall\n✅ simulateParameterChange computes replay overlap and sign-test significance\n✅ applyParameterChangeIfSignificant rejects too few or mixed evaluations\n✅ applyParameterChangeIfSignificant applies and logs significant improvements\n✅ summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence\nResults: 16 passed, 0 failed\n✅ proposeDspyScoringParams proposes tuning from gated evaluation data\n✅ summarizeDspyTraces aggregates decisions and reasons\nResults: 2 passed, 0 failed\n",
+      "verifyStderr": ""
+    },
+    {
+      "taskId": "curiosity-gaps",
+      "summary": "Implemented curiosity-driven knowledge gap detection. Added `KnowledgeGap`, `detectKnowledgeGaps`, and compiler-formatting helpers in lifecycle; added `curiosity` config defaults; front-door bundle construction now detects repeated capitalized domain entities missing from `catalog.csv`, adds a `knowledge_gap` candidate with a “Knowledge gaps detected” section for the context compiler, and opportunistically triggers web searches for gap entities when the planned web source is enabled. Tests cover repeated uncataloged entity detection, catalog filtering, below-threshold suppression, compiler-message visibility, and existing lifecycle/golden retrieval regressions. Red-phase rationale: old behavior had no gap detector, curiosity config, knowledge-gap candidate, or compiler-visible gap section, so the new tests would fail. Deferred edge cases: richer entity extraction beyond capitalized terms and broader proactive docs/web triggering policies.",
+      "blocked": false,
+      "artifacts": [
+        "lib/lifecycle.ts",
+        "index.ts",
+        "tests/lifecycle.test.ts",
+        "tests/golden-retrieval.test.ts",
+        "tsx tests/lifecycle.test.ts && tsx tests/golden-retrieval.test.ts"
+      ],
+      "iteration": 7,
+      "stepIteration": 1,
+      "stepId": "curiosity-gaps",
+      "stepName": "Curiosity-driven knowledge gap detection",
+      "timestamp": "2026-07-13T07:44:52.109Z",
+      "status": "done",
+      "verification": "`cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts && tsx tests/golden-retrieval.test.ts` exited 0",
+      "verifyCommand": "cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts && tsx tests/golden-retrieval.test.ts",
+      "verifyExitCode": 0,
+      "verifyStdout": "✅ classifyTaskOutcome detects core outcomes\n✅ suggestVerificationCommands maps changed files to checks\n✅ suggestVerificationCommands recommends focused frontend checks\n✅ detectKnowledgeGaps finds repeated capitalized entities missing from catalog\n✅ detectKnowledgeGaps filters catalog entries and below-threshold mentions\n✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity\n✅ postProcessCandidates filters archived items and downranks fading items\n✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries\n✅ compactScratchpad archives large sections\nResults: 9 passed, 0 failed\n✅ golden: code prompt keeps exact implementation file and strips generic noise\n✅ golden: git status is only returned when the prompt asks for changed files\n✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not\n✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory\n✅ golden: compressed summaries preserve expand pointers\n✅ golden: source planner includes files for Sherpa quality review\n✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation\n✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool\n✅ golden: query target extraction identifies action, targets, and evidence type\n✅ golden: old journal memory is stripped unless history/session is requested\n✅ golden: research memory is stripped unless research is requested\n✅ golden: target term matches boost exact source over adjacent context\n✅ golden: debug snippet extraction prefers declarations over imports\n✅ golden: sherpa-context renders diagnostic planner metadata\n✅ golden: knowledge gap candidate is visible in context compiler message\n✅ golden: inquirer graph traversal adds related artifacts with reduced relevance\n✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds\n✅ golden: unified context compiler parser keeps valid unique indexes capped at 3\nResults: 18 passed, 0 failed\n",
       "verifyStderr": ""
     }
   ],

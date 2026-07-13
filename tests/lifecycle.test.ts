@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { postProcessCandidates } from "../index";
-import { classifyTaskOutcome, compactScratchpad, compactScratchpadLifecycle, computeLifecycleStage, suggestVerificationCommands } from "../lib/lifecycle";
+import { classifyTaskOutcome, compactScratchpad, compactScratchpadLifecycle, computeLifecycleStage, detectKnowledgeGaps, formatKnowledgeGapsForCompiler, suggestVerificationCommands } from "../lib/lifecycle";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
 let passed = 0;
@@ -44,6 +44,28 @@ test("suggestVerificationCommands maps changed files to checks", () => {
 test("suggestVerificationCommands recommends focused frontend checks", () => {
   const advice = suggestVerificationCommands(["src/server/public/client.js"]);
   assert(advice.commands.some((item) => item.command === "bun test src/server/frontend.test.ts"), "missing HyperPod frontend test");
+});
+
+test("detectKnowledgeGaps finds repeated capitalized entities missing from catalog", () => {
+  const gaps = detectKnowledgeGaps("Investigate VectorVault", [
+    "VectorVault errors mention GraphNexus integration.",
+    "GraphNexus needs docs.",
+    "GraphNexus routing is unclear.",
+  ], []);
+  const gap = gaps.find((item) => item.entity === "GraphNexus");
+  assert(Boolean(gap), `expected GraphNexus gap, got ${gaps.map((item) => item.entity).join(", ")}`);
+  assert(gap!.mentionCount === 3, `expected 3 mentions, got ${gap!.mentionCount}`);
+  assert(formatKnowledgeGapsForCompiler(gaps).includes("Knowledge gaps detected"), "expected compiler gap section");
+});
+
+test("detectKnowledgeGaps filters catalog entries and below-threshold mentions", () => {
+  const catalog = [{ id: "graphnexus", title: "GraphNexus", summary: "Known routing system", path: "docs/graphnexus.md" }];
+  const gaps = detectKnowledgeGaps("Review GraphNexus", [
+    "GraphNexus is cataloged.",
+    "VectorVault appears once only.",
+  ], catalog);
+  assert(!gaps.some((item) => item.entity === "GraphNexus"), "cataloged entity should not be a gap");
+  assert(!gaps.some((item) => item.entity === "VectorVault"), "single-mention entity should not be a gap");
 });
 
 test("computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity", () => {

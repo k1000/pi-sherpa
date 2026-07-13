@@ -186,3 +186,49 @@ Results: 16 passed, 0 failed
 Results: 2 passed, 0 failed
 
 ```
+
+## Iteration 7.1 — Curiosity-driven knowledge gap detection — done — 2026-07-13T07:44:52.109Z
+
+Implemented curiosity-driven knowledge gap detection. Added `KnowledgeGap`, `detectKnowledgeGaps`, and compiler-formatting helpers in lifecycle; added `curiosity` config defaults; front-door bundle construction now detects repeated capitalized domain entities missing from `catalog.csv`, adds a `knowledge_gap` candidate with a “Knowledge gaps detected” section for the context compiler, and opportunistically triggers web searches for gap entities when the planned web source is enabled. Tests cover repeated uncataloged entity detection, catalog filtering, below-threshold suppression, compiler-message visibility, and existing lifecycle/golden retrieval regressions. Red-phase rationale: old behavior had no gap detector, curiosity config, knowledge-gap candidate, or compiler-visible gap section, so the new tests would fail. Deferred edge cases: richer entity extraction beyond capitalized terms and broader proactive docs/web triggering policies.
+
+Verification: `cd /Users/kamil/.pi/agent/extensions/pi-sherpa && tsx tests/lifecycle.test.ts && tsx tests/golden-retrieval.test.ts` exited 0
+Artifacts:
+- lib/lifecycle.ts
+- index.ts
+- tests/lifecycle.test.ts
+- tests/golden-retrieval.test.ts
+- tsx tests/lifecycle.test.ts && tsx tests/golden-retrieval.test.ts
+
+Stdout:
+```
+✅ classifyTaskOutcome detects core outcomes
+✅ suggestVerificationCommands maps changed files to checks
+✅ suggestVerificationCommands recommends focused frontend checks
+✅ detectKnowledgeGaps finds repeated capitalized entities missing from catalog
+✅ detectKnowledgeGaps filters catalog entries and below-threshold mentions
+✅ computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity
+✅ postProcessCandidates filters archived items and downranks fading items
+✅ compactScratchpadLifecycle moves archived entries and protects high-confidence entries
+✅ compactScratchpad archives large sections
+Results: 9 passed, 0 failed
+✅ golden: code prompt keeps exact implementation file and strips generic noise
+✅ golden: git status is only returned when the prompt asks for changed files
+✅ golden: explicit skill prompts may include skill docs, ordinary code prompts may not
+✅ golden: pi-sherpa prompt routes to extension code instead of unrelated research memory
+✅ golden: compressed summaries preserve expand pointers
+✅ golden: source planner includes files for Sherpa quality review
+✅ golden: Sherpa trace/log prompts route to runtime traces and dspy implementation
+✅ golden: sidecar model filters candidates even when the deterministic prefilter empties the pool
+✅ golden: query target extraction identifies action, targets, and evidence type
+✅ golden: old journal memory is stripped unless history/session is requested
+✅ golden: research memory is stripped unless research is requested
+✅ golden: target term matches boost exact source over adjacent context
+✅ golden: debug snippet extraction prefers declarations over imports
+✅ golden: sherpa-context renders diagnostic planner metadata
+✅ golden: knowledge gap candidate is visible in context compiler message
+✅ golden: inquirer graph traversal adds related artifacts with reduced relevance
+✅ golden: inquirer graph traversal tolerates missing relation endpoint and empty seeds
+✅ golden: unified context compiler parser keeps valid unique indexes capped at 3
+Results: 18 passed, 0 failed
+
+```
