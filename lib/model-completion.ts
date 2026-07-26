@@ -28,6 +28,7 @@ async function completeWithAbortableTimeout(
   signal: AbortSignal | undefined,
   timeoutMs: number,
   timeoutMessage: string,
+  onPayload?: (payload: unknown, model: any) => unknown | undefined | Promise<unknown | undefined>,
 ) {
   const controller = new AbortController();
   let timedOut = false;
@@ -38,7 +39,7 @@ async function completeWithAbortableTimeout(
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      complete(model, { systemPrompt, messages }, { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal }),
+      complete(model, { systemPrompt, messages }, { apiKey: auth.apiKey, headers: auth.headers, signal: controller.signal, onPayload }),
       new Promise<any>((_, reject) => {
         timer = setTimeout(() => {
           timedOut = true;
@@ -54,6 +55,33 @@ async function completeWithAbortableTimeout(
   }
 }
 
+function sherpaStructuredJsonPayload(payload: unknown): unknown | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  return {
+    ...(payload as Record<string, unknown>),
+    // Qwen/OpenAI-compatible providers reject forced tool calls while reasoning
+    // is enabled. Disable provider thinking for Sherpa's tiny routing/JSON tasks.
+    enable_thinking: false,
+    tools: [{
+      type: "function",
+      function: {
+        name: "emit_sherpa_json",
+        description: "Return the requested Sherpa planner result as structured JSON.",
+        parameters: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+    }],
+    tool_choice: { type: "function", function: { name: "emit_sherpa_json" } },
+  };
+}
+
+function extractToolJsonObject(response: any): unknown {
+  const toolCall = response.content?.find?.((c: any) => c?.type === "toolCall" && c?.name === "emit_sherpa_json");
+  return toolCall?.arguments && typeof toolCall.arguments === "object" ? toolCall.arguments : null;
+}
+
 export async function completeJsonObjectWithTimeout(
   state: RetrievalPromptStateLike,
   ctx: ExtensionContext,
@@ -63,8 +91,12 @@ export async function completeJsonObjectWithTimeout(
   timeoutMs: number,
   timeoutMessage: string,
 ) {
-  const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage);
+  const structuredOutput = (state as any).config?.model?.structuredOutput;
+  const onPayload = structuredOutput === "tool_json_schema" ? sherpaStructuredJsonPayload : undefined;
+  const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage, onPayload);
   if (response.stopReason === "aborted") return { aborted: true, parsed: null };
+  const toolJson = structuredOutput === "tool_json_schema" ? extractToolJsonObject(response) : null;
+  if (toolJson) return { aborted: false, parsed: toolJson };
   const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
   return { aborted: false, parsed: extractJsonObject(text) };
 }
