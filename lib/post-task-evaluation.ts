@@ -120,6 +120,17 @@ function normalizeScoringParams(params: ScoringParams): ScoringParams {
   return { relevanceWeight: relevanceWeight / total, recencyWeight: recencyWeight / total, frequencyWeight: frequencyWeight / total };
 }
 
+function evaluationTimeMs(evaluation: ContextEvaluation): number {
+  const parsed = Date.parse(evaluation.evaluatedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function recentEvaluations(evaluations: ContextEvaluation[], limit: number): ContextEvaluation[] {
+  return [...evaluations]
+    .sort((a, b) => evaluationTimeMs(b) - evaluationTimeMs(a))
+    .slice(0, limit);
+}
+
 function scoreEvaluationWithParams(evaluation: ContextEvaluation, params: ScoringParams): number {
   const p = normalizeScoringParams(params);
   return clamp01(
@@ -164,7 +175,7 @@ export async function replayPastQueries(
   const regressions: OverlapReport["regressions"] = [];
   let total = 0;
   let checked = 0;
-  for (const evaluation of evaluations.slice(0, 20)) {
+  for (const evaluation of recentEvaluations(evaluations, 20)) {
     const bundle = state.bundleRecords?.get(evaluation.bundleId);
     if (!bundle) continue;
     const replayed = state.replayQuery ? await state.replayQuery(bundle, ctx) : { items: bundle.items };
@@ -198,7 +209,7 @@ export async function checkRetrievalRegression(
 }
 
 export function simulateParameterChange(evaluations: ContextEvaluation[], currentParams: ScoringParams, proposedParams: ScoringParams): SimulationResult {
-  const window = evaluations.slice(0, 50);
+  const window = recentEvaluations(evaluations, 50);
   let improved = 0;
   let worsened = 0;
   let unchanged = 0;
@@ -241,7 +252,7 @@ export function applyParameterChangeIfSignificant<TState extends { config: { sco
 }
 
 export function proposeScoringParamsFromEvaluations(evaluations: ContextEvaluation[], current: ScoringParams = DEFAULT_SCORING_PARAMS): ScoringParams {
-  const recent = evaluations.slice(0, 50);
+  const recent = recentEvaluations(evaluations, 50);
   if (!recent.length) return current;
   const avg = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
   const relevance = avg(recent.map((e) => e.scores.relevance));

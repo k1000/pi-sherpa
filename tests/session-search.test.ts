@@ -3,7 +3,7 @@
  * Run with: bun tests/session-search.test.ts
  */
 
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionSearchDb, closeSessionDb, indexSessionLog, searchSessions } from "../lib/session-search";
@@ -178,6 +178,25 @@ test("index resets when session log is truncated", () => withTemp((dir) => {
   writeFileSync(logPath, JSON.stringify({ sessionId: "new", ts: "2026-06-05T10:00:00.000Z", kind: "prompt", prompt: "after rotation" }) + "\n");
   assertEqual(db.indexNewEntries(), 1, "truncated log reindexed new entry");
   assertEqual(db.getIndexedEntryCount(), 9, "old entries preserved after truncation + 1 new");
+  db.close();
+}));
+
+test("directory cap skips current newest files and indexes older unindexed files", () => withTemp((dir) => {
+  const sessionsDir = path.join(dir, "sessions");
+  const dbDir = path.join(dir, "db");
+  const oldLog = path.join(sessionsDir, "old.jsonl");
+  const newLog = path.join(sessionsDir, "new.jsonl");
+  rmSync(sessionsDir, { recursive: true, force: true });
+  mkdirSync(sessionsDir, { recursive: true });
+  writeFileSync(oldLog, "", { flag: "a" });
+  writeFileSync(newLog, "", { flag: "a" });
+  writeFileSync(oldLog, JSON.stringify({ sessionId: "old", ts: "2026-06-01T00:00:00.000Z", kind: "prompt", prompt: "older backlog" }) + "\n");
+  writeFileSync(newLog, JSON.stringify({ sessionId: "new", ts: "2026-06-02T00:00:00.000Z", kind: "prompt", prompt: "newest current" }) + "\n");
+
+  const db = new SessionSearchDb(dbDir, { sessionLogPath: sessionsDir, maxFilesPerRun: 1 });
+  assertEqual(db.indexNewEntries(), 1, "first capped run indexes newest file");
+  assertEqual(db.indexNewEntries(), 1, "second capped run skips current newest and indexes older file");
+  assert(db.search("backlog").some((r) => r.sessionId === "old"), "older unindexed file is searchable");
   db.close();
 }));
 

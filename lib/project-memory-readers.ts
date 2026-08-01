@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 
 import { catalogMatches, readGlobalTaxonomy } from "./catalog";
 import { fileIsMaterialized } from "./common";
+import { focusAllowsResearchMemory } from "./source-guards";
 import { score } from "./text-utils";
 
 /**
@@ -113,7 +114,7 @@ export function addProjectMemoryCandidates(
   add: AddMemoryItem,
 ) {
   const currentProjectMatches = addCurrentProjectMemory(root, indicatorText, add);
-  addResearchMemory(vault, indicatorText, add);
+  if (focusAllowsResearchMemory(focus)) addResearchMemory(vault, indicatorText, add);
   if (options.searchOtherProjects) addOtherProjectMemory(vault, path.resolve(root), indicatorText, add);
   if (options.includeTaxonomy || /\b(taxonomy|tag|tags|label|labels|category|relationship|nomenclature)\b/i.test(focus)) addTaxonomyMemory(focus, add);
   // If current project catalog is absent or did not match, fall back to current

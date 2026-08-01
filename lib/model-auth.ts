@@ -20,7 +20,7 @@ export type SherpaAuthState = {
 
 export function notifySherpaModelFallback(ctx: ExtensionContext, reason: string): void {
   // notification must not break retrieval
-  safeNotify(ctx, `Sherpa sidecar model unavailable; using heuristic fallback: ${reason}`, "warning");
+  safeNotify(ctx, `Sherpa using heuristic fallback: ${reason}`, "warning");
 }
 
 export async function getSherpaModelAuthWithReason(

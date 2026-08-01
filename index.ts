@@ -64,7 +64,7 @@ export { isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt }; // re-export so t
 import { runModelSearchLoop, modelStepMessage, type SearchTool, type ModelStep, type ModelSearchCandidate } from "./lib/model-search";
 import { makeFileFinderTool, makeMemorySearchTool } from "./lib/model-search-tools";
 
-import { indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
+import { getSherpaMemoryIndex, indexSherpaMemory, searchSherpaMemory, closeSherpaMemoryIndexes } from "./lib/memory-index";
 import { addMemoryIndexCandidates } from "./lib/memory-index-candidates";
 import { addPiExtensionCandidates } from "./lib/pi-extension-candidates";
 import { applyPersistedState, serializeState } from "./lib/state-persistence";
@@ -149,7 +149,7 @@ type SherpaConfig = {
   web: { enabled: boolean; provider: "brave" | "tavily" | "serpapi"; apiKeyEnv: string; maxResults: number; timeoutMs: number; cacheTtlMs: number };
   semble: { enabled: boolean; command: string; topK: number; timeoutMs: number };
   graphify: { enabled: boolean; command: string; graphPath: string; timeoutMs: number; budgetTokens: number; maxLines: number; };
-  inquirer: { enabled: boolean; url: string; token?: string; tokenEnv: string; searchLimit: number };
+  inquirer: { enabled: boolean; url: string; token?: string; tokenEnv: string; searchLimit: number; timeoutMs: number };
   scoring: ScoringParams;
   routeMap: { enabled: boolean; path: string; applyTo: "all" | "front-door" | "explicit" };
   dedupe: { urls: { enabled: boolean; normalize: boolean; scope: "bundle" } };
@@ -161,6 +161,7 @@ type SherpaConfig = {
   curiosity: { enabled: boolean; gapThreshold: number };
   selfVerification: { enabled: boolean; overlapThreshold: number };
   prompts: Record<PromptKind, { projectPath?: string; globalPath?: string }>;
+  debug: { timing: { enabled: boolean; logPath: string; thresholdMs: number; notifyThresholdMs: number } };
 };
 
 type ContextItem = { handle: string; type: string; source: string; relevance: number; summary: string; raw?: string; inline?: boolean; lastAccessedAt?: number; accessCount?: number; lifecycle_stage?: "active" | "fading" | "archived"; confidence?: number };
@@ -264,7 +265,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
   web: { enabled: false, provider: "brave", apiKeyEnv: "BRAVE_SEARCH_API_KEY", maxResults: 5, timeoutMs: 5000, cacheTtlMs: 6 * 60 * 60 * 1000 },
   semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
   graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
-  inquirer: { enabled: true, url: "https://api.enquirer.app", tokenEnv: "SHERPA_MEMORY_API_TOKEN", searchLimit: 8 },
+  inquirer: { enabled: true, url: "https://api.enquirer.app", tokenEnv: "SHERPA_MEMORY_API_TOKEN", searchLimit: 8, timeoutMs: 3000 },
   scoring: DEFAULT_SCORING_PARAMS,
   routeMap: { enabled: true, path: "catalog.csv", applyTo: "all" },
   dedupe: { urls: { enabled: true, normalize: true, scope: "bundle" } },
@@ -277,6 +278,7 @@ const DEFAULT_CONFIG: SherpaConfig = {
     documentation: { projectPath: ".pi/sherpa/prompts/DOCUMENTATION.md", globalPath: "prompts/DOCUMENTATION.md" },
     automation: { projectPath: ".pi/sherpa/prompts/AUTOMATION.md", globalPath: "prompts/AUTOMATION.md" },
   },
+  debug: { timing: { enabled: false, logPath: ".pi/sherpa/timing.jsonl", thresholdMs: 100, notifyThresholdMs: 2000 } },
 };
 
 function configPath(cwd: string) { return path.join(cwd, ".pi", "sherpa.config.json"); }
@@ -384,12 +386,40 @@ function scratchpadRootRelative(state: State, cwd: string, target: string) {
 const SHERPA_UI_KEY = "ai-sherpa";
 const SHERPA_LEGACY_UI_KEY = "ai-sherpa-progress";
 const SHERPA_CONTEXT_TYPE = "sherpa-context";
-const CURATION_TIMEOUT_MS = 12_000;
+const CURATION_TIMEOUT_MS = 20_000;
 const FINAL_QUALITY_TIMEOUT_MS = 20_000;
+const FRONT_DOOR_QUALITY_TIMEOUT_MS = 8_000;
 const SOURCE_PLANNER_TIMEOUT_MS = 12_000;
+const FRONT_DOOR_SOURCE_TIMEOUT_MS = 6_000;
+const EXPLICIT_SOURCE_TIMEOUT_MS = 12_000;
 const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
+
+function logSherpaTiming(state: State | undefined, ctx: ExtensionContext, action: string, startedAt: number, details: Record<string, unknown> = {}) {
+  try {
+    const timing = state?.config.debug?.timing;
+    if (!timing?.enabled) return;
+    const durationMs = Date.now() - startedAt;
+    if (durationMs < Math.max(0, timing.thresholdMs ?? 0)) return;
+    const configured = timing.logPath || ".pi/sherpa/timing.jsonl";
+    const target = path.isAbsolute(configured) ? configured : path.join(ctx.cwd, configured);
+    mkdirSync(path.dirname(target), { recursive: true });
+    appendFileSync(target, JSON.stringify({ at: new Date().toISOString(), action, durationMs, ...details }) + "\n");
+    if (ctx.hasUI && durationMs >= Math.max(0, timing.notifyThresholdMs ?? 2000)) {
+      ctx.ui.notify(`Sherpa timing: ${action} took ${durationMs}ms`, "warning");
+    }
+  } catch { /* timing must never block Sherpa */ }
+}
+
+async function timedSherpa<T>(state: State | undefined, ctx: ExtensionContext, action: string, fn: () => Promise<T>, details: Record<string, unknown> = {}): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    return await fn();
+  } finally {
+    logSherpaTiming(state, ctx, action, startedAt, details);
+  }
+}
 
 function heuristicOrderCandidates(candidates: ContextItem[], focus: string, mode: string) {
   return postProcessCandidates(candidates, focus, mode);
@@ -488,7 +518,7 @@ async function planSources(state: State, ctx: ExtensionContext, focus: string, m
     const parsed = result.parsed as any;
     const indicators = parsePlannedIndicators(parsed, heuristicInds);
     const sourcePlan = parsePlannedSourcePlan(state, focus, mode, parsed, routePlan);
-    if (!sourcePlan) notifySherpaModelFallback(ctx, "source planner returned unusable source plan");
+    if (!sourcePlan) console.warn("[sherpa] source planner returned unusable source plan; using heuristic fallback");
     return { sourcePlan: sourcePlan ?? { ...fallbackPlan, planner: "fallback", reason: `planner returned invalid source plan; ${fallbackPlan.reason}` }, indicators };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -539,7 +569,8 @@ async function compileContextWithModel(state: State, ctx: ExtensionContext, focu
 
   try {
     const { model, auth } = modelAuth.value;
-    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, contextCompilerMessage(ctx, state, focus, mode, pool), FINAL_QUALITY_TIMEOUT_MS, "context compiler timed out");
+    const compilerTimeoutMs = mode === "front-door" ? FRONT_DOOR_QUALITY_TIMEOUT_MS : FINAL_QUALITY_TIMEOUT_MS;
+    const result = await completeJsonObjectWithTimeout(state, ctx, model, auth, contextCompilerMessage(ctx, state, focus, mode, pool), compilerTimeoutMs, "context compiler timed out");
     if (result.aborted) {
       notifySherpaModelFallback(ctx, "context compiler aborted");
       return fallback();
@@ -685,57 +716,100 @@ async function addKnowledgeGapCandidates(state: State, ctx: ExtensionContext, fo
   return gaps;
 }
 
-function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean): Promise<void>[] {
+export function retrievalTimeoutMs(mode: string) {
+  return mode === "front-door" ? FRONT_DOOR_SOURCE_TIMEOUT_MS : EXPLICIT_SOURCE_TIMEOUT_MS;
+}
+
+export async function withRetrievalTimeout<T>(label: string, task: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  try {
+    return await Promise.race([
+      task,
+      timeoutAfter<T>(timeoutMs, `${label} timed out after ${timeoutMs}ms`),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[sherpa] retrieval source skipped: ${message}`);
+    return undefined;
+  }
+}
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean, onSource?: (label: string) => void): Promise<void>[] {
   const tasks: Promise<void>[] = [];
-  if (enabled("files")) tasks.push(addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
-  if (enabled("semble") && state.config.semble?.enabled) tasks.push(addSembleCandidates(state, ctx, focus, mode, sourcePlan, indicators, add));
-  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) tasks.push((async () => {
+  const timeoutMs = retrievalTimeoutMs(mode);
+  const push = (label: string, task: () => Promise<unknown> | unknown) => {
+    tasks.push(withRetrievalTimeout(label, (async () => {
+      onSource?.(label);
+      // Many candidate sources do synchronous file/index scanning before their first
+      // await. Defer source start so Sherpa's status widget can paint between phases
+      // instead of making Pi look frozen during long retrieval bursts.
+      await yieldToUi();
+      return task();
+    })(), timeoutMs).then(() => undefined));
+  };
+  if (enabled("files")) push("files", () => addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("semble") && state.config.semble?.enabled) push("semble", () => addSembleCandidates(state, ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) push("graphify", async () => {
     const raw = await searchGraphify(ctx.cwd, focus, state.config.graphify);
     if (raw) add("graphify_code_graph", `graphify://${path.relative(ctx.cwd, graphifyGraphPath(ctx.cwd, state.config.graphify)) || state.config.graphify.graphPath}`, raw, 0.32);
-  })());
-  if (enabled("docs")) tasks.push(Promise.resolve().then(() => addDocCandidates(ctx, mode, sourcePlan, indicators, add)));
-  if (enabled("git") && focusAllowsGitStatus(focus)) tasks.push((async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05))());
-  if (enabled("web")) tasks.push((async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); })());
-  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addProjectMemoryCandidates(
+  });
+  if (enabled("docs")) push("docs", () => addDocCandidates(ctx, mode, sourcePlan, indicators, add));
+  if (enabled("git") && focusAllowsGitStatus(focus)) push("git", async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05));
+  if (enabled("web")) push("web", async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); });
+  if (enabled("project_memory")) push("project_memory", () => addProjectMemoryCandidates(
     obsidianMemoryPath(state),
     obsidianVaultPath(state),
     focus,
     indicators.indicators.join(" "),
     options,
     add,
-  )));
-  if (enabled("session")) tasks.push(Promise.resolve().then(() => addSessionCandidates(ctx, add)));
-  if (enabled("project_memory")) tasks.push(Promise.resolve().then(() => addMemoryIndexCandidates(ctx, focus, indicators, {
+  ));
+  if (enabled("session")) push("session", () => addSessionCandidates(ctx, add));
+  if (enabled("project_memory")) push("memory_index", () => addMemoryIndexCandidates(ctx, focus, indicators, {
     scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
     catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
     evaluationRoot: obsidianMemoryPath(state),
-  }, add)));
-  if (enabled("inquirer") && focusAllowsInquirerMemory(focus)) tasks.push(addInquirerCandidates(state.config.inquirer, focus, add));
+  }, add));
+  if (enabled("inquirer") && focusAllowsInquirerMemory(focus)) push("inquirer", () => addInquirerCandidates(state.config.inquirer, focus, add));
   return tasks;
 }
 
-async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean } = {}): Promise<ContextBundle> {
+async function buildBundle(state: State, ctx: ExtensionContext, focus: string, mode: string, tokenBudget: number, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean; onProgress?: (phase: string, detail?: string) => void } = {}): Promise<ContextBundle> {
   const enabled = retrievalEnabled(state, sourcePlan);
   const candidates: ContextItem[] = [];
   const add = createContextAdder(state, focus, candidates);
 
   addUrlReferences(state, focus, add);
-  await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled));
-  await retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled, state.config.semble);
-  await addKnowledgeGapCandidates(state, ctx, focus, mode, add, enabled);
+  await timedSherpa(state, ctx, `buildBundle.collectRetrievalTasks.${mode}`, async () => {
+    await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled, (label) => {
+      options.onProgress?.(`searching ${label}`, `Candidates so far: ${candidates.length}`);
+    }));
+  }, { focus: focus.slice(0, 160), sources: sourcePlan.sources });
+  options.onProgress?.("retrying file search", `Candidates so far: ${candidates.length}`);
+  await timedSherpa(state, ctx, `buildBundle.retryFrontDoorFileCandidates.${mode}`, async () => {
+    await withRetrievalTimeout("retry_front_door_files", retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled, state.config.semble), retrievalTimeoutMs(mode));
+  }, { focus: focus.slice(0, 160), candidates: candidates.length });
+  options.onProgress?.("checking knowledge gaps", `Candidates so far: ${candidates.length}`);
+  await timedSherpa(state, ctx, `buildBundle.addKnowledgeGapCandidates.${mode}`, async () => {
+    await withRetrievalTimeout("knowledge_gaps", addKnowledgeGapCandidates(state, ctx, focus, mode, add, enabled), retrievalTimeoutMs(mode));
+  }, { focus: focus.slice(0, 160), candidates: candidates.length });
 
   const traceFeedback = applyRetrievalFeedback(state, focus, candidates, obsidianMemoryPath(state));
-  let compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+  options.onProgress?.("curating results", `Candidates: ${candidates.length}`);
+  let compileResult = await timedSherpa(state, ctx, `buildBundle.compileContextWithModel.${mode}`, () => compileContextWithModel(state, ctx, focus, mode, candidates), { focus: focus.slice(0, 160), candidates: candidates.length });
 
   // Escalation tier: when the deterministic fast path + model filter abstained due to
   // an empty/thin search (not a deliberate model rejection), hand control to the sidecar
   // model with search tools so it can BROADEN the research — e.g. find config files under
   // ~/.pi that rg is guardrailed away from. Then re-compile so the model still gates delivery.
   if (compileResult.abstain && candidates.length === 0 && !state.config.model.heuristicOnly) {
-    const searched = await escalateToModelSearch(state, ctx, focus, indicators);
+    const searched = await timedSherpa(state, ctx, `buildBundle.escalateToModelSearch.${mode}`, () => escalateToModelSearch(state, ctx, focus, indicators), { focus: focus.slice(0, 160), candidates: candidates.length });
     if (searched.length) {
       for (const item of searched) { state.handles.set(item.handle, item); candidates.push(item); }
-      compileResult = await compileContextWithModel(state, ctx, focus, mode, candidates);
+      compileResult = await timedSherpa(state, ctx, `buildBundle.compileContextWithModelAfterEscalation.${mode}`, () => compileContextWithModel(state, ctx, focus, mode, candidates), { focus: focus.slice(0, 160), candidates: candidates.length });
     }
   }
 
@@ -914,7 +988,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const maybeAutoCompileDspy = async (ctx: ExtensionContext, event: "bundle" | "evaluate" | "session_shutdown") => {
-    if (!state?.config.dspy.autoCompile.enabled) return;
+    if (!state?.config.dspy.enabled || !state.config.dspy.autoCompile.enabled) return;
     const cfg = state.config.dspy.autoCompile;
     if (event === "evaluate" && !cfg.onEvaluate) return;
     if (event === "session_shutdown" && !cfg.onSessionShutdown) return;
@@ -1295,24 +1369,34 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    const sessionStartTiming = Date.now();
     state = restoreState(ctx, loadConfig(ctx.cwd));
-    getProjectKBBasedir(ctx.cwd);
-    ensureRouteMap(state.config.routeMap, ctx.cwd);
-    ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
-    ctx.ui.setWidget(SHERPA_LEGACY_UI_KEY, undefined);
-    setSherpaStatus(ctx);
-    // Index new session log entries for FTS5 search
     try {
-      const indexed = indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd);
-      if (indexed > 0) {
-        const total = getIndexedEntryCount(undefined, ctx.cwd);
-        try { ctx.ui.notify(`Sherpa indexed ${indexed} new session entries (${total} total)`, "info"); } catch {}
+      if (!state.config.enabled) return;
+      getProjectKBBasedir(ctx.cwd);
+      ensureRouteMap(state.config.routeMap, ctx.cwd);
+      ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
+      ctx.ui.setWidget(SHERPA_LEGACY_UI_KEY, undefined);
+      setSherpaStatus(ctx);
+      // Index new session log entries for FTS5 search only when session recall is enabled.
+      // Some projects accumulate multi-GB session-search indexes; opening them on startup can
+      // make Pi appear frozen even when the user did not request historical session recall.
+      if (state.config.enabled && state.config.sources.session) {
+        try {
+          const indexed = await timedSherpa(state, ctx, "session_start.indexSessionLog", async () => indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd));
+          if (indexed > 0) {
+            const total = getIndexedEntryCount(undefined, ctx.cwd);
+            try { ctx.ui.notify(`Sherpa indexed ${indexed} new session entries (${total} total)`, "info"); } catch {}
+          }
+        } catch { /* session search is best-effort at startup */ }
       }
-    } catch { /* session search is best-effort at startup */ }
+    } finally {
+      logSherpaTiming(state, ctx, "session_start.total", sessionStartTiming);
+    }
   });
 
   pi.on("agent_end", (event, ctx) => {
-    if (!state?.config.enabled) return;
+    if (!state?.config.enabled || state.config.mode === "explicit" || state.config.mode === "off") return;
     if ((event as { willRetry?: boolean }).willRetry === true) return;
     const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
     const cwd = ctx.cwd;
@@ -1322,7 +1406,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
-    if (state?.config.enabled) void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {});
+    if (state?.config.enabled) {
+      void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {});
+      // Keep retrieval read-only during a session; refresh the local FTS index only
+      // after work is complete so it cannot delay a prompt or tool result.
+      try {
+        indexSherpaMemory(ctx.cwd, {
+          scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
+          catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
+          evaluationRoot: obsidianMemoryPath(state),
+        });
+      } catch { /* memory indexing is best-effort during shutdown */ }
+    }
     closeSessionDb();
     closeSherpaMemoryIndexes();
     ctx.ui.setWidget(SHERPA_UI_KEY, undefined);
@@ -1467,7 +1562,9 @@ export default function (pi: ExtensionAPI) {
           catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
           evaluationRoot: obsidianMemoryPath(state),
         };
-        const stats = (params.reindex || params.statusOnly || params.query) ? indexSherpaMemory(ctx.cwd, config) : indexSherpaMemory(ctx.cwd, config);
+        const stats = params.reindex
+          ? indexSherpaMemory(ctx.cwd, config)
+          : getSherpaMemoryIndex(ctx.cwd, config).stats();
         if (params.statusOnly || !params.query?.trim()) {
           const kindLines = stats.kindCounts.map((k) => `- ${k.kind}: ${k.count}`).join("\n");
           return { content: [{ type: "text" as const, text: `## Sherpa Memory Index\nDocuments: ${stats.documents}\nSource paths: ${stats.sourcePaths}\nScratchpad entries: ${stats.scratchpadEntries}\nCatalog entries: ${stats.catalogEntries}\nEvaluations: ${stats.evaluations}\nDedup hashes: ${stats.dedupHashes}\nLast indexed: ${stats.lastIndexedAt ?? "unknown"}\nDB: ${stats.dbPath}\n\n### Kinds\n${kindLines || "(none)"}` }], details: stats };
@@ -1539,39 +1636,47 @@ export default function (pi: ExtensionAPI) {
   }});
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (!state?.config?.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
-    if (isTrivial(event.prompt)) { state.lastSkip = "trivial prompt"; return; }
-
-    const sherpaUi = startSherpaWorkUi(ctx, event.prompt, "front-door");
-
+    const startedAt = Date.now();
+    let outcome = "skipped";
     try {
-      sherpaUi.update("planning sources", "Choosing files/docs/git/memory sources.");
-      const { sourcePlan, indicators } = await planSources(state, ctx, event.prompt, "front-door");
-      sherpaUi.update(
-        `searching ${sourcePlan.sources.join(", ")}`,
-        `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
-      );
+      if (!state?.config?.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
+      if (isTrivial(event.prompt)) { state.lastSkip = "trivial prompt"; outcome = "trivial"; return; }
 
-      // Front-door context must stay high-signal. Avoid session_recent by default because it often
-      // echoes tool-result noise back into the next prompt. Explicit Sherpa requests can still use it.
-      const bundle = await Promise.race([
-        buildBundle(state, ctx, event.prompt, "front-door", state.config.frontDoor.tokenBudget, sourcePlan, indicators),
-        timeoutAfter<ContextBundle>(CURATION_TIMEOUT_MS, "front-door curation timed out"),
-      ]);
-      sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
-      bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
-      bundle.signal = buildContextSignal(bundle);
-      void maybeAutoCompileDspy(ctx, "bundle");
-      const abstainReason = shouldAbstain(bundle.items, "front-door");
-      if (abstainReason) { state.lastSkip = abstainReason; return; }
-      sherpaUi.done(`injecting ${bundle.items.length} item(s)`);
-      return { message: { customType: SHERPA_CONTEXT_TYPE, content: bundleMarkdown(bundle), display: true, details: bundle } };
-    } catch (err: any) {
-      state.lastSkip = `front-door error: ${err?.message ?? err}`;
-      ctx.ui.notify(`Sherpa context skipped: ${err?.message ?? err}; continuing without extra context`, "warning");
-      return;
+      const sherpaUi = startSherpaWorkUi(ctx, event.prompt, "front-door");
+
+      try {
+        sherpaUi.update("planning sources", "Choosing files/docs/git/memory sources.");
+        const { sourcePlan, indicators } = await timedSherpa(state, ctx, "frontDoor.planSources", () => planSources(state!, ctx, event.prompt, "front-door"), { focus: event.prompt.slice(0, 160) });
+        sherpaUi.update(
+          `searching ${sourcePlan.sources.join(", ")}`,
+          `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+        );
+
+        // Front-door context must stay high-signal. Avoid session_recent by default because it often
+        // echoes tool-result noise back into the next prompt. Explicit Sherpa requests can still use it.
+        const bundle = await timedSherpa(state, ctx, "frontDoor.buildBundle", () => Promise.race([
+          buildBundle(state!, ctx, event.prompt, "front-door", state!.config.frontDoor.tokenBudget, sourcePlan, indicators, { onProgress: (phase, detail) => sherpaUi.update(phase, detail) }),
+          timeoutAfter<ContextBundle>(CURATION_TIMEOUT_MS, "front-door curation timed out"),
+        ]), { focus: event.prompt.slice(0, 160), sources: sourcePlan.sources });
+        sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
+        bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
+        bundle.signal = buildContextSignal(bundle);
+        void maybeAutoCompileDspy(ctx, "bundle");
+        const abstainReason = shouldAbstain(bundle.items, "front-door");
+        if (abstainReason) { state.lastSkip = abstainReason; outcome = `abstain:${abstainReason}`; return; }
+        sherpaUi.done(`injecting ${bundle.items.length} item(s)`);
+        outcome = `inject:${bundle.items.length}`;
+        return { message: { customType: SHERPA_CONTEXT_TYPE, content: bundleMarkdown(bundle), display: true, details: bundle } };
+      } catch (err: any) {
+        state.lastSkip = `front-door error: ${err?.message ?? err}`;
+        outcome = `error:${err?.message ?? err}`;
+        ctx.ui.notify(`Sherpa context skipped: ${err?.message ?? err}; continuing without extra context`, "warning");
+        return;
+      } finally {
+        sherpaUi.done();
+      }
     } finally {
-      sherpaUi.done();
+      logSherpaTiming(state, ctx, "before_agent_start.frontDoor.total", startedAt, { outcome, focus: event.prompt.slice(0, 160) });
     }
   });
 
@@ -1612,6 +1717,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: ["Use sherpa_request_context when you need focused repo, docs, git, or session context before editing."],
     parameters: requestSchema,
     async execute(_toolCallId, params: RequestParams, _signal, _onUpdate, ctx) {
+      const requestTiming = Date.now();
       // Defensive: ensure state is always initialized before any access
       if (typeof state === "undefined" || state === null) {
         try {
@@ -1625,12 +1731,12 @@ export default function (pi: ExtensionAPI) {
         const _state = state; // capture at function scope to avoid TDZ issues
         const expanded = (params.expandHandles ?? []).map(h => _state.handles.get(h)).filter(Boolean) as ContextItem[];
         sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
-        const { sourcePlan, indicators } = await planSources(_state, ctx, params.focus, "explicit", params.sources);
+        const { sourcePlan, indicators } = await timedSherpa(_state, ctx, "tool.sherpa_request_context.planSources", () => planSources(_state, ctx, params.focus, "explicit", params.sources), { focus: params.focus.slice(0, 160), sources: params.sources });
         sherpaUi.update(
           `searching ${sourcePlan.sources.join(", ")}`,
           `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
         );
-        const bundle = await buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy });
+        const bundle = await timedSherpa(_state, ctx, "tool.sherpa_request_context.buildBundle", () => buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy, onProgress: (phase, detail) => sherpaUi.update(phase, detail) }), { focus: params.focus.slice(0, 160), sources: sourcePlan.sources });
         sherpaUi.update("formatting context", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
         void maybeAutoCompileDspy(ctx, "bundle");
         const extra = expanded.map(i => `\n\n## Expanded ${i.handle}\nSource: ${i.source}\n\n${(i.raw ?? i.summary).slice(0, (params.tokenBudget ?? 3000) * 4)}`).join("");
@@ -1640,6 +1746,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `Sherpa error: ${e?.message ?? String(e)}\n${(e?.stack ?? "").split("\n").slice(0, 5).join("\n")}` }], details: { error: e?.message ?? String(e) } };
       } finally {
         sherpaUi.done();
+        logSherpaTiming(state, ctx, "tool.sherpa_request_context.total", requestTiming, { focus: params.focus.slice(0, 160) });
       }
     },
   });
@@ -1744,6 +1851,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("sherpa", { description: "Ask Sherpa for focused context", handler: async (args, ctx) => {
+    const commandTiming = Date.now();
     if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
     const focus = args?.trim() || await ctx.ui.input("Sherpa", "Focus?"); if (!focus) return;
     const sherpaUi = startSherpaWorkUi(ctx, focus, "slash command");
@@ -1751,12 +1859,12 @@ export default function (pi: ExtensionAPI) {
       // User-invoked /sherpa should behave like an intervention: inject the context and wake the
       // main agent. Source planning chooses the likely stores before expensive retrieval.
       sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
-      const { sourcePlan, indicators } = await planSources(state, ctx, focus, "explicit");
+      const { sourcePlan, indicators } = await timedSherpa(state, ctx, "command.sherpa.planSources", () => planSources(state!, ctx, focus, "explicit"), { focus: focus.slice(0, 160) });
       sherpaUi.update(
         `searching ${sourcePlan.sources.join(", ")}`,
         `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
       );
-      const bundle = await buildBundle(state, ctx, focus, "explicit", state.config.explicit.tokenBudget, sourcePlan, indicators);
+      const bundle = await timedSherpa(state, ctx, "command.sherpa.buildBundle", () => buildBundle(state!, ctx, focus, "explicit", state!.config.explicit.tokenBudget, sourcePlan, indicators), { focus: focus.slice(0, 160), sources: sourcePlan.sources });
       sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
       bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
       void maybeAutoCompileDspy(ctx, "bundle");
@@ -1774,6 +1882,7 @@ export default function (pi: ExtensionAPI) {
       persist();
     } finally {
       sherpaUi.done();
+      logSherpaTiming(state, ctx, "command.sherpa.total", commandTiming, { focus: focus.slice(0, 160) });
     }
   }});
 

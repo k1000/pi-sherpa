@@ -8,7 +8,7 @@
  * See: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
  */
 
-import { existsSync, readFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
@@ -46,6 +46,14 @@ export type SessionSearchConfig = {
   maxResults?: number;
   /** Max new files to scan per indexNewEntries call (0 = unlimited). Default: 50 */
   maxFilesPerRun?: number;
+  /** Rotate the cache when db+WAL+SHM exceed this size. Default: 2 GiB. */
+  maxDbBytes?: number;
+  /** Keep at most this many indexed entries. Default: 100k. */
+  maxEntries?: number;
+  /** Extra entries allowed before pruning, to avoid pruning after every indexed file. Default: 10k. */
+  pruneSlackEntries?: number;
+  /** Number of rotated cache files to keep per db/wal/shm file. Default: 2. */
+  maxRotatedCaches?: number;
 };
 
 // ── Defaults ────────────────────────────────────────────────────────
@@ -62,6 +70,10 @@ export class SessionSearchDb {
   private sessionLogPath: string;
   private maxResults: number;
   private maxFilesPerRun: number;
+  private maxDbBytes: number;
+  private maxEntries: number;
+  private pruneSlackEntries: number;
+  private maxRotatedCaches: number;
 
   constructor(baseDir: string, config?: SessionSearchConfig) {
     this.dbPath = path.resolve(baseDir, config?.dbPath ?? DEFAULT_DB_PATH);
@@ -70,10 +82,15 @@ export class SessionSearchDb {
     );
     this.maxResults = config?.maxResults ?? 10;
     this.maxFilesPerRun = config?.maxFilesPerRun ?? 50;
+    this.maxDbBytes = config?.maxDbBytes ?? 2 * 1024 * 1024 * 1024;
+    this.maxEntries = config?.maxEntries ?? 100_000;
+    this.pruneSlackEntries = config?.pruneSlackEntries ?? 10_000;
+    this.maxRotatedCaches = config?.maxRotatedCaches ?? 2;
 
     // Ensure parent directory exists
     const dir = path.dirname(this.dbPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    this.rotateOversizedCache();
 
     this.db = openSqliteDatabase(this.dbPath, "Sherpa session search");
 
@@ -81,6 +98,36 @@ export class SessionSearchDb {
     this.db.exec("PRAGMA journal_mode=WAL");
 
     this.ensureSchema();
+  }
+
+  private rotateOversizedCache(): void {
+    if (this.maxDbBytes <= 0) return;
+    const files = [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`];
+    const totalBytes = files.reduce((sum, file) => sum + (existsSync(file) ? statSync(file).size : 0), 0);
+    if (totalBytes <= this.maxDbBytes) return;
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    for (const file of files) {
+      if (!existsSync(file)) continue;
+      try { renameSync(file, `${file}.rotated-${stamp}`); }
+      catch { /* cache rotation is best-effort; startup should continue */ }
+    }
+    this.cleanupRotatedCaches(files);
+  }
+
+  private cleanupRotatedCaches(files: string[]): void {
+    if (this.maxRotatedCaches < 0) return;
+    for (const file of files) {
+      try {
+        const dir = path.dirname(file);
+        const prefix = `${path.basename(file)}.rotated-`;
+        const rotated = readdirSync(dir)
+          .filter((name) => name.startsWith(prefix))
+          .map((name) => path.join(dir, name))
+          .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+        for (const oldFile of rotated.slice(this.maxRotatedCaches)) unlinkSync(oldFile);
+      } catch { /* rotated cache cleanup is best-effort */ }
+    }
   }
 
   private ensureSchema(): void {
@@ -190,9 +237,27 @@ export class SessionSearchDb {
       }
     };
     walk(this.sessionLogPath);
-    // Sort newest-first so the first N files are the most recent sessions
+    // Sort newest-first, but cap after filtering to changed/unindexed files.
+    // Capping before filtering starves older unindexed files forever once the
+    // newest N files are already current.
     all.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-    return maxFiles > 0 ? all.slice(0, maxFiles) : all;
+    if (maxFiles <= 0) return all;
+    return all.filter((file) => !this.isFileIndexCurrent(file)).slice(0, maxFiles);
+  }
+
+  private isFileIndexCurrent(filePath: string): boolean {
+    try {
+      const fileStat = statSync(filePath);
+      const storedMtime = this.getMeta(`last_indexed_mtime:${filePath}`, "0");
+      const storedSize = this.getMeta(`last_indexed_size:${filePath}`, "0");
+      const lastOffset = Number(this.getMeta(`last_offset:${filePath}`, "0"));
+      return storedMtime !== "0"
+        && fileStat.mtimeMs === Number(storedMtime)
+        && fileStat.size === Number(storedSize)
+        && fileStat.size === lastOffset;
+    } catch {
+      return true;
+    }
   }
 
   indexNewEntries(): number {
@@ -252,7 +317,22 @@ export class SessionSearchDb {
     this.setMeta(sizeKey, String(fileSize));
     this.setMeta(mtimeKey, String(fileStat.mtimeMs));
     this.setMeta("last_indexed_at", new Date().toISOString());
+    this.pruneOldEntries();
     return indexed;
+  }
+
+  private pruneOldEntries(): void {
+    if (this.maxEntries <= 0) return;
+    const count = this.getIndexedEntryCount();
+    const pruneAt = this.maxEntries + Math.max(0, this.pruneSlackEntries);
+    if (count <= pruneAt) return;
+    const deleteBeforeRow = this.db.query(
+      "SELECT rowid FROM session_entries ORDER BY rowid DESC LIMIT 1 OFFSET ?",
+    ).get(this.maxEntries - 1) as { rowid: number } | null;
+    if (!deleteBeforeRow) return;
+    this.db.query("DELETE FROM session_entries WHERE rowid < ?").run(deleteBeforeRow.rowid);
+    this.setMeta("last_pruned_at", new Date().toISOString());
+    this.setMeta("last_pruned_to_entries", this.maxEntries);
   }
 
   /**

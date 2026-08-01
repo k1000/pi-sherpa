@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import type { AddContextItem } from "./context-adder";
-import { indexSherpaMemory, searchSherpaMemory, type MemoryIndexConfig } from "./memory-index";
+import { searchSherpaMemory, type MemoryIndexConfig } from "./memory-index";
 import type { SearchIndicators } from "./source-planning";
 
 /** Candidate injection from Sherpa's local SQLite/FTS memory index. */
@@ -14,7 +14,6 @@ export function addMemoryIndexCandidates(
   add: AddContextItem,
 ) {
   try {
-    indexSherpaMemory(ctx.cwd, memoryConfig);
     const memoryHits = searchSherpaMemory(ctx.cwd, [focus, ...indicators.indicators].join(" "), 8, memoryConfig);
     for (const hit of memoryHits) {
       add("memory_index", `memory-index://${hit.kind}/${path.relative(ctx.cwd, hit.sourcePath)}`, [

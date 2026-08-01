@@ -149,10 +149,42 @@ export function routedFallbackPlan(state: SourceStateLike, focus: string, mode: 
   return fallbackPlan;
 }
 
+function plannedSourceArray(payload: any): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  const candidate = payload.sources
+    ?? payload.sourcePlan
+    ?? payload.source_plan
+    ?? payload.selectedSources
+    ?? payload.selected_sources
+    ?? payload.selected
+    ?? payload.selection
+    ?? payload.enabledSources
+    ?? payload.enabled_sources
+    ?? payload.searchSources
+    ?? payload.search_sources
+    ?? [];
+  return Array.isArray(candidate) ? candidate : [];
+}
+
 export function parsePlannedSourcePlan(state: SourceStateLike, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
-  if (!parsed?.sources) return null;
-  const sourcePlan = parseSourcePlan(JSON.stringify(parsed.sources), mode);
+  const sourcePayload = parsed?.sources
+    ?? parsed?.sourcePlan
+    ?? parsed?.source_plan
+    ?? parsed?.sourceSelection
+    ?? parsed?.source_selection
+    ?? null;
+  if (!sourcePayload) return null;
+  const sourcePlan = Array.isArray(sourcePayload)
+    ? { sources: normalizeSources(sourcePayload, mode), reason: "llm source plan", confidence: 0.5, planner: "llm" as const }
+    : parseSourcePlan(JSON.stringify({
+      sources: plannedSourceArray(sourcePayload),
+      reason: sourcePayload.reason ?? sourcePayload.rationale ?? sourcePayload.why,
+      confidence: sourcePayload.confidence,
+    }), mode);
   if (!sourcePlan?.sources.length) return null;
   const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
-  return { ...sourcePlan, sources: applyConditionalSourceActivation(state, focus, mode, mergedSources), routePlan };
+  const activeSources = applyConditionalSourceActivation(state, focus, mode, mergedSources);
+  if (!activeSources.length) return null;
+  return { ...sourcePlan, sources: activeSources, routePlan };
 }
