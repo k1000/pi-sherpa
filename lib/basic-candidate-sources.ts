@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import { getDocFilesForFocus } from "./doc-discovery";
 import { extractUrls } from "./url-utils";
+import { suppressCandidate } from "./candidate-suppression";
 import { MemoryApiStore, memoryApiGet, type ArchivistMemoryApiConfig, type MemoryArtifact, type MemoryRelation } from "../../archivist/lib/memory-api";
 
 /** Basic low-coupling candidate source readers. */
@@ -26,6 +27,7 @@ export type InquirerCandidateConfig = Partial<ArchivistMemoryApiConfig> & {
   token?: string;
   tokenEnv?: string;
   searchLimit?: number;
+  timeoutMs?: number;
 };
 
 export function addDocCandidates(ctx: ExtensionContext, mode: string, sourcePlan: SourcePlanLike, indicators: SearchIndicatorsLike, add: AddCandidateItem) {
@@ -95,8 +97,16 @@ async function addGraphCandidates(config: InquirerCandidateConfig, store: Memory
         const raw = artifactText(embedded);
         if (raw) {
           seenArtifacts.add(embedded.id);
-          add("inquirer_graph", `inquirer_graph://${embedded.id}`, raw, graphScore);
-          added++;
+          const { suppressed, adjustedRelevance } = suppressCandidate({
+            type: embedded.type ?? "inquirer_graph",
+            source: `inquirer_graph://${embedded.id}`,
+            relevance: graphScore,
+            createdAt: (embedded as any).createdAt ?? (embedded as any).updatedAt,
+          });
+          if (!suppressed) {
+            add("inquirer_graph", `inquirer_graph://${embedded.id}`, raw, adjustedRelevance);
+            added++;
+          }
         }
       } else if (!seenArtifacts.has(target)) {
         try {
@@ -106,8 +116,15 @@ async function addGraphCandidates(config: InquirerCandidateConfig, store: Memory
             if (!artifact?.id || seenArtifacts.has(artifact.id)) continue;
             const raw = artifactText(artifact);
             if (!raw) continue;
+            const { suppressed, adjustedRelevance } = suppressCandidate({
+              type: artifact.type ?? "inquirer_graph",
+              source: `inquirer_graph://${artifact.id}`,
+              relevance: graphScore * normalizedScore(result.score, 1),
+              createdAt: (artifact as any).createdAt ?? (artifact as any).updatedAt,
+            });
+            if (suppressed) continue;
             seenArtifacts.add(artifact.id);
-            add("inquirer_graph", `inquirer_graph://${artifact.id}`, raw, graphScore * normalizedScore(result.score, 1));
+            add("inquirer_graph", `inquirer_graph://${artifact.id}`, raw, adjustedRelevance);
             added++;
           }
         } catch {
@@ -133,9 +150,17 @@ export async function addInquirerCandidates(config: InquirerCandidateConfig | un
       const raw = artifactText(artifact);
       if (!raw) continue;
       const score = normalizedScore(result.score);
+      // Suppression rules: drop self-evaluation/status artifacts, boost newer ones.
+      const { suppressed, adjustedRelevance } = suppressCandidate({
+        type: artifact.type ?? "inquirer_memory",
+        source: `inquirer_memory://${artifact.id}`,
+        relevance: score,
+        createdAt: (artifact as any).createdAt ?? (artifact as any).updatedAt,
+      });
+      if (suppressed) continue;
       seenArtifacts.add(artifact.id);
       seeds.push({ id: artifact.id, score });
-      add("inquirer_memory", `inquirer_memory://${artifact.id}`, raw, score);
+      add("inquirer_memory", `inquirer_memory://${artifact.id}`, raw, adjustedRelevance);
     }
     if (seeds.length) await addGraphCandidates(config, store, seeds, seenArtifacts, add);
   } catch {
