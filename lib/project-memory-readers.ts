@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 
 import { catalogMatches, readGlobalTaxonomy } from "./catalog";
+import { fileIsMaterialized } from "./common";
 import { score } from "./text-utils";
 
 /**
@@ -22,7 +23,7 @@ export function addCurrentProjectMemory(root: string, indicatorText: string, add
   const matches = catalogMatches(root, indicatorText, { limit: 8 });
   for (const { row, relevance } of matches) {
     const target = path.join(root, row.path);
-    if (!existsSync(target)) continue;
+    if (!fileIsMaterialized(target)) continue;
     const raw = readFileSync(target, "utf8").slice(0, 3000);
     add("project_memory", `kb://current-project/${row.path}`, [`Scope: current project`, `Catalog: ${path.join(root, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.25, relevance));
   }
@@ -38,7 +39,7 @@ export function addResearchMemory(vault: string, indicatorText: string, add: Add
       if (!statSync(areaRoot).isDirectory()) continue;
       for (const { row, relevance } of catalogMatches(areaRoot, indicatorText, { limit: 5 })) {
         const target = path.join(areaRoot, row.path);
-        if (!existsSync(target)) continue;
+        if (!fileIsMaterialized(target)) continue;
         const raw = readFileSync(target, "utf8").slice(0, 2600);
         add("research_memory", `kb://research/${area}/${row.path}`, [`Scope: research`, `Area: ${area}`, `Catalog: ${path.join(areaRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.22, relevance));
       }
@@ -55,7 +56,7 @@ export function addOtherProjectMemory(vault: string, currentRoot: string, indica
       if (!statSync(projectRoot).isDirectory() || path.resolve(projectRoot) === currentRoot) continue;
       for (const { row, relevance } of catalogMatches(projectRoot, indicatorText, { limit: 4 })) {
         const target = path.join(projectRoot, row.path);
-        if (!existsSync(target)) continue;
+        if (!fileIsMaterialized(target)) continue;
         const raw = readFileSync(target, "utf8").slice(0, 2200);
         add("other_project_memory", `kb://project/${project}/${row.path}`, [`Scope: other project`, `Project: ${project}`, `Catalog: ${path.join(projectRoot, "catalog.csv")}`, "", raw].join("\n"), Math.max(0.18, relevance));
       }
@@ -94,7 +95,9 @@ export function addOntologyFallbackMemory(root: string, focus: string, add: AddM
     if (!existsSync(dir)) continue;
     try {
       for (const f of readdirSync(dir).filter((n: string) => n.endsWith(".md")).slice(0, 8)) {
-        const raw = readFileSync(path.join(dir, f), "utf8").slice(0, 2000);
+        const target = path.join(dir, f);
+        if (!fileIsMaterialized(target)) continue;
+        const raw = readFileSync(target, "utf8").slice(0, 2000);
         if (score(raw, focus) > 0.1) add("project_memory", `kb://${path.relative(root, path.join(dir, f))}`, raw, 0.2);
       }
     } catch { /* ignore */ }

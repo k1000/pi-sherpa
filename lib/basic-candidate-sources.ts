@@ -5,6 +5,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getDocFilesForFocus } from "./doc-discovery";
 import { extractUrls } from "./url-utils";
 import { suppressCandidate } from "./candidate-suppression";
+import { fileIsMaterialized } from "./common";
 import { MemoryApiStore, memoryApiGet, type ArchivistMemoryApiConfig, type MemoryArtifact, type MemoryRelation } from "../../archivist/lib/memory-api";
 
 /** Basic low-coupling candidate source readers. */
@@ -34,7 +35,7 @@ export function addDocCandidates(ctx: ExtensionContext, mode: string, sourcePlan
   const docFiles = getDocFilesForFocus(ctx.cwd, indicators.indicators.join(" "), mode, sourcePlan?.routePlan as any);
   for (const f of docFiles) {
     const p = path.join(ctx.cwd, f);
-    if (existsSync(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
+    if (fileIsMaterialized(p)) add("doc_snippet", `repo://${f}`, readFileSync(p, "utf8").slice(0, 4000), 0.1);
   }
 }
 

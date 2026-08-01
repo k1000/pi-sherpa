@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { parseCsvRows } from "./catalog";
+import { fileIsMaterialized } from "./common";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
 export type MemoryIndexConfig = {
@@ -165,7 +166,7 @@ export class SherpaMemoryIndex {
     if (existsSync(sectionsDir)) {
       for (const section of SCRATCHPAD_SECTIONS) {
         const filePath = path.join(sectionsDir, `${section}.md`);
-        if (!existsSync(filePath)) continue;
+        if (!fileIsMaterialized(filePath)) continue;
         this.clearSourcePath(filePath);
         this.db.query("DELETE FROM scratchpad_entries WHERE source_path = ?").run(filePath);
         const raw = readFileSync(filePath, "utf8");
@@ -182,7 +183,7 @@ export class SherpaMemoryIndex {
     if (!existsSync(archiveDir)) return;
     for (const file of readdirSync(archiveDir).filter((name) => name.endsWith(".md"))) {
       const sourcePath = path.join(archiveDir, file);
-      if (!statSync(sourcePath).isFile()) continue;
+      if (!fileIsMaterialized(sourcePath)) continue;
       this.clearSourcePath(sourcePath);
       const raw = readFileSync(sourcePath, "utf8");
       const id = stableId("scratchpad-archive", sourcePath, raw);
@@ -193,7 +194,7 @@ export class SherpaMemoryIndex {
 
   indexCatalog(root: string): void {
     const catalogPath = path.join(root, "catalog.csv");
-    if (!existsSync(catalogPath)) return;
+    if (!fileIsMaterialized(catalogPath)) return;
     this.clearSourcePath(catalogPath);
     this.db.query("DELETE FROM catalog_entries WHERE catalog_path = ?").run(catalogPath);
     const rows = parseCsvRows(readFileSync(catalogPath, "utf8"));
@@ -208,7 +209,7 @@ export class SherpaMemoryIndex {
 
   indexReflect(reflectRoot: string): void {
     const indexPath = path.join(reflectRoot, "index.jsonl");
-    if (!existsSync(indexPath)) return;
+    if (!fileIsMaterialized(indexPath)) return;
     this.clearSourcePath(indexPath);
     const reflectionDir = path.join(reflectRoot, "reflections");
     for (const line of readFileSync(indexPath, "utf8").split(/\r?\n/).filter(Boolean)) {
@@ -217,7 +218,7 @@ export class SherpaMemoryIndex {
         if (!entry.id) continue;
         const mdPath = entry.file ? path.join(reflectionDir, entry.file) : "";
         const embedded = [entry.body, entry.context, entry.evidence, entry.application, entry.verification].filter(Boolean).join("\n\n");
-        const body = embedded || (mdPath && existsSync(mdPath) ? readFileSync(mdPath, "utf8") : [entry.title, entry.summary, entry.tags?.join(" ")].filter(Boolean).join("\n"));
+        const body = embedded || (mdPath && fileIsMaterialized(mdPath) ? readFileSync(mdPath, "utf8") : [entry.title, entry.summary, entry.tags?.join(" ")].filter(Boolean).join("\n"));
         const id = stableId("reflect", indexPath, entry.id, body);
         const hash = sha256(body);
         this.upsertDocument({
@@ -239,6 +240,7 @@ export class SherpaMemoryIndex {
     if (!existsSync(dir)) return;
     for (const file of readdirSync(dir).filter((name) => name.endsWith(".md"))) {
       const sourcePath = path.join(dir, file);
+      if (!fileIsMaterialized(sourcePath)) continue;
       this.clearSourcePath(sourcePath);
       this.db.query("DELETE FROM evaluations WHERE source_path = ?").run(sourcePath);
       const raw = readFileSync(sourcePath, "utf8");
@@ -253,7 +255,7 @@ export class SherpaMemoryIndex {
   }
 
   indexDedupHashes(digestPath: string): void {
-    if (!existsSync(digestPath)) return;
+    if (!fileIsMaterialized(digestPath)) return;
     const stmt = this.db.query("INSERT OR REPLACE INTO dedup_hashes (hash, kind, created_at) VALUES (?, ?, ?)");
     for (const line of readFileSync(digestPath, "utf8").split(/\r?\n/).filter(Boolean)) {
       try {
