@@ -143,7 +143,7 @@ type SherpaConfig = {
   proactive: { enabled: boolean; tokenBudget: number; cooldownTurns: number };
   sources: Record<Source, boolean>;
   privacy: { allowNetwork: boolean; allowRemoteModel: boolean };
-  model: { provider: string; id: string; useMainPiModel: boolean; heuristicOnly: boolean; fallbackToHeuristics: boolean };
+  model: { provider: string; id: string; useMainPiModel: boolean; heuristicOnly: boolean; fallbackToHeuristics: boolean; structuredOutput?: "tool_json_schema" };
   summarization: { maxToolResultChars: number; replacementBudget: number };
   memory: { obsidianVault: string; obsidianMemoryPath: string; scratchpadPath: string };
   web: { enabled: boolean; provider: "brave" | "tavily" | "serpapi"; apiKeyEnv: string; maxResults: number; timeoutMs: number; cacheTtlMs: number };
@@ -263,7 +263,8 @@ const DEFAULT_CONFIG: SherpaConfig = {
   summarization: { maxToolResultChars: 12000, replacementBudget: 1500 },
   memory: { obsidianVault: "/Users/kamil/Documents/articles", obsidianMemoryPath: "projects/project", scratchpadPath: ".pi-memory/scratchpad" },
   web: { enabled: false, provider: "brave", apiKeyEnv: "BRAVE_SEARCH_API_KEY", maxResults: 5, timeoutMs: 5000, cacheTtlMs: 6 * 60 * 60 * 1000 },
-  semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 3000 },
+  // Keep front-door retrieval responsive when Semble needs to rebuild its index.
+  semble: { enabled: true, command: "semble", topK: 8, timeoutMs: 1200 },
   graphify: { enabled: true, command: "graphify", graphPath: "graphify-out/graph.json", timeoutMs: 1200, budgetTokens: 1200, maxLines: 24 },
   inquirer: { enabled: true, url: "https://api.enquirer.app", tokenEnv: "SHERPA_MEMORY_API_TOKEN", searchLimit: 8, timeoutMs: 3000 },
   scoring: DEFAULT_SCORING_PARAMS,
@@ -790,7 +791,7 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
   }, { focus: focus.slice(0, 160), sources: sourcePlan.sources });
   options.onProgress?.("retrying file search", `Candidates so far: ${candidates.length}`);
   await timedSherpa(state, ctx, `buildBundle.retryFrontDoorFileCandidates.${mode}`, async () => {
-    await withRetrievalTimeout("retry_front_door_files", retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled, state.config.semble), retrievalTimeoutMs(mode));
+    await withRetrievalTimeout("retry_front_door_files", retryFrontDoorFileCandidates(ctx, focus, mode, sourcePlan, candidates, add, enabled), retrievalTimeoutMs(mode));
   }, { focus: focus.slice(0, 160), candidates: candidates.length });
   options.onProgress?.("checking knowledge gaps", `Candidates so far: ${candidates.length}`);
   await timedSherpa(state, ctx, `buildBundle.addKnowledgeGapCandidates.${mode}`, async () => {

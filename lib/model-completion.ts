@@ -12,7 +12,7 @@ type SummarizeStateLike = {
   distillPrompt: string;
   config: {
     privacy: { allowRemoteModel: boolean };
-    model: { provider: string; id: string; useMainPiModel: boolean; heuristicOnly: boolean; fallbackToHeuristics: boolean };
+    model: { provider: string; id: string; useMainPiModel: boolean; heuristicOnly: boolean; fallbackToHeuristics: boolean; structuredOutput?: "tool_json_schema" };
   };
 };
 
@@ -55,13 +55,24 @@ async function completeWithAbortableTimeout(
   }
 }
 
-function sherpaStructuredJsonPayload(payload: unknown): unknown | undefined {
+function sherpaModelName(model: any): string {
+  return `${model?.provider ?? ""}/${model?.id ?? model?.name ?? ""}`.toLowerCase();
+}
+
+export function usesSherpaToolJsonSchema(model: any): boolean {
+  // GLM satisfies forced tool calls with an empty arguments object; its reliable
+  // JSON contract is the text response requested by the prompt.
+  return !sherpaModelName(model).includes("glm");
+}
+
+export function sherpaStructuredJsonPayload(payload: unknown, model: any): unknown | undefined {
   if (!payload || typeof payload !== "object") return undefined;
+  const disableThinking = !sherpaModelName(model).includes("glm");
   return {
     ...(payload as Record<string, unknown>),
-    // Qwen/OpenAI-compatible providers reject forced tool calls while reasoning
-    // is enabled. Disable provider thinking for Sherpa's tiny routing/JSON tasks.
-    enable_thinking: false,
+    // GLM models reject enable_thinking=false because thinking is mandatory.
+    // Other OpenAI-compatible/Qwen sidecars need it disabled for forced tool calls.
+    ...(disableThinking ? { enable_thinking: false } : {}),
     tools: [{
       type: "function",
       function: {
@@ -77,9 +88,11 @@ function sherpaStructuredJsonPayload(payload: unknown): unknown | undefined {
   };
 }
 
-function extractToolJsonObject(response: any): unknown {
+export function extractToolJsonObject(response: any): unknown {
   const toolCall = response.content?.find?.((c: any) => c?.type === "toolCall" && c?.name === "emit_sherpa_json");
-  return toolCall?.arguments && typeof toolCall.arguments === "object" ? toolCall.arguments : null;
+  const argumentsValue = toolCall?.arguments;
+  if (argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)) return argumentsValue;
+  return typeof argumentsValue === "string" ? extractJsonObject(argumentsValue) : null;
 }
 
 export async function completeJsonObjectWithTimeout(
@@ -92,7 +105,9 @@ export async function completeJsonObjectWithTimeout(
   timeoutMessage: string,
 ) {
   const structuredOutput = (state as any).config?.model?.structuredOutput;
-  const onPayload = structuredOutput === "tool_json_schema" ? sherpaStructuredJsonPayload : undefined;
+  const onPayload = structuredOutput === "tool_json_schema" && usesSherpaToolJsonSchema(model)
+    ? (payload: unknown, completionModel: any) => sherpaStructuredJsonPayload(payload, completionModel)
+    : undefined;
   const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage, onPayload);
   if (response.stopReason === "aborted") return { aborted: true, parsed: null };
   const toolJson = structuredOutput === "tool_json_schema" ? extractToolJsonObject(response) : null;

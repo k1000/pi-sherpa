@@ -18,9 +18,22 @@ export type SherpaAuthState = {
   };
 };
 
+const SHERPA_MODEL_STATUS_KEY = "ai-sherpa-model";
+
 export function notifySherpaModelFallback(ctx: ExtensionContext, reason: string): void {
-  // notification must not break retrieval
-  safeNotify(ctx, `Sherpa using heuristic fallback: ${reason}`, "warning");
+  // Sidecar-model failure degrades retrieval quality, so make the fallback
+  // visible both transiently and persistently without blocking retrieval.
+  const message = `Sherpa MODEL FAILURE — heuristic fallback active: ${reason}`;
+  safeNotify(ctx, message, "error");
+  try {
+    if (ctx.hasUI) ctx.ui.setStatus(SHERPA_MODEL_STATUS_KEY, "Sherpa model OFFLINE — heuristic fallback active");
+  } catch { /* stale extension contexts must not break background work */ }
+}
+
+export function clearSherpaModelFallback(ctx: ExtensionContext): void {
+  try {
+    if (ctx.hasUI) ctx.ui.setStatus(SHERPA_MODEL_STATUS_KEY, undefined);
+  } catch { /* stale extension contexts must not break background work */ }
 }
 
 export async function getSherpaModelAuthWithReason(
@@ -38,6 +51,7 @@ export async function getSherpaModelAuthWithReason(
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) return { ok: false, reason: `auth failed: ${(auth as any).error ?? model.provider}` };
   if (!auth.apiKey) return { ok: false, reason: `missing API key for ${model.provider}` };
+  clearSherpaModelFallback(ctx);
   return { ok: true, value: { model, auth } };
 }
 

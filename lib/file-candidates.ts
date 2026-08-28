@@ -4,7 +4,6 @@ import path from "node:path";
 import { postProcessCandidates } from "./candidate-postprocess";
 import type { AddContextItem } from "./context-adder";
 import { routeSkipsPath } from "./doc-discovery";
-import { searchSemble, type SembleConfig } from "./semble";
 import { fileSnippetAllowed } from "./source-guards";
 import { parseRgOutput, rg } from "./rg";
 import type { SearchIndicators, SourcePlan } from "./source-planning";
@@ -57,17 +56,11 @@ export async function retryFrontDoorFileCandidates<T extends { source: string; r
   candidates: T[],
   add: AddContextItem,
   enabled: (s: string) => boolean,
-  sembleConfig: SembleConfig,
 ) {
   if (mode !== "front-door" || !enabled("files") || postProcessCandidates(candidates, focus, mode).length !== 0) return;
-  if (enabled("semble") && sembleConfig?.enabled) {
-    const retrySemble = await searchSemble(ctx.cwd, focus, sembleConfig);
-    for (const result of retrySemble.slice(0, 8)) {
-      if (routeSkipsPath(sourcePlan?.routePlan, result.filePath) || !fileSnippetAllowed(result.filePath, focus, mode)) continue;
-      add("file", `repo://${result.filePath}:${result.startLine}`, result.content, 0.35);
-    }
-  }
-  const retryOut = postProcessCandidates(candidates, focus, mode).length ? "" : await rg(ctx.cwd, focus);
+  // Semble has already searched in the parallel retrieval phase. Retry only the
+  // literal file search so an empty semantic result does not double front-door latency.
+  const retryOut = await rg(ctx.cwd, focus);
   for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
     if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
     add("file", `repo://${fileAndLine}`, content, 0.08);
