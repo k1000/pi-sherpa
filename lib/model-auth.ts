@@ -20,13 +20,23 @@ export type SherpaAuthState = {
 
 const SHERPA_MODEL_STATUS_KEY = "ai-sherpa-model";
 
+export function isTransientSherpaModelFailure(reason: string): boolean {
+  return /\b(aborted|network|request timed out|timed out|timeout)\b/i.test(reason);
+}
+
 export function notifySherpaModelFallback(ctx: ExtensionContext, reason: string): void {
-  // Sidecar-model failure degrades retrieval quality, so make the fallback
-  // visible both transiently and persistently without blocking retrieval.
-  const message = `Sherpa MODEL FAILURE — heuristic fallback active: ${reason}`;
-  safeNotify(ctx, message, "error");
+  // A planner timeout is an expected degradation path, not proof that the model
+  // is offline. Keep its diagnostic in the bundle but do not interrupt every
+  // prompt with a false MODEL FAILURE alert; the next stage/request retries it.
+  const transient = isTransientSherpaModelFailure(reason);
+  if (!transient) safeNotify(ctx, `Sherpa MODEL FAILURE — heuristic fallback active: ${reason}`, "error");
   try {
-    if (ctx.hasUI) ctx.ui.setStatus(SHERPA_MODEL_STATUS_KEY, "Sherpa model OFFLINE — heuristic fallback active");
+    if (ctx.hasUI) ctx.ui.setStatus(
+      SHERPA_MODEL_STATUS_KEY,
+      transient
+        ? "Sherpa model temporarily unavailable — heuristic fallback active"
+        : "Sherpa model OFFLINE — heuristic fallback active",
+    );
   } catch { /* stale extension contexts must not break background work */ }
 }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { heuristicSourcePlan } from "../index";
-import { parsePlannedSourcePlan } from "../lib/source-planning";
+import { parsePlannedIndicators, parsePlannedSourcePlan, sourcePlanningMessage } from "../lib/source-planning";
 import { retrievalEnabled } from "../lib/source-activation";
 import { focusAllowsInquirerMemory } from "../lib/source-guards";
 
@@ -25,6 +25,20 @@ assert.ok(!focusAllowsInquirerMemory("fix failing parser test"), "code-only prom
 assert.equal(retrievalEnabled({ config: { sources: { inquirer: false } } }, { sources: ["inquirer"] })("inquirer"), false, "disabled inquirer config should not retrieve");
 assert.equal(retrievalEnabled({ config: { sources: { inquirer: true } } }, { sources: ["inquirer"] })("inquirer"), true, "enabled inquirer config should retrieve");
 
+const plannerPrompt = sourcePlanningMessage("fix source planner").content
+  .filter((part): part is { type: "text"; text: string } => part.type === "text")
+  .map((part) => part.text)
+  .join("\n");
+assert.match(plannerPrompt, /Return ONLY valid JSON matching this exact shape/, "requires one unambiguous JSON response");
+assert.equal((plannerPrompt.match(/Return as JSON|Also return as JSON/g) ?? []).length, 0, "does not ask the model for competing JSON objects");
+
+const plannerFallback = { indicators: ["fallback"], reason: "fallback", confidence: 0.3, planner: "heuristic" as const };
+assert.deepEqual(
+  parsePlannedIndicators({ indicators: '{"indicators":["sourcePlanningMessage"],"reason":"tool JSON","confidence":0.9}' }, plannerFallback),
+  { indicators: ["sourcePlanningMessage"], reason: "tool JSON", confidence: 0.9, planner: "llm" },
+  "accepts Qwen JSON-string tool arguments for indicators",
+);
+
 const sourceState = { config: { sources: { files: true, semble: true, docs: true, project_memory: true, inquirer: true } } };
 assert.deepEqual(
   parsePlannedSourcePlan(sourceState, "fix source planner", "explicit", { sourcePlan: { sources: ["files"], reason: "code fix", confidence: 0.8 } })?.sources,
@@ -46,5 +60,10 @@ assert.deepEqual(
   ["docs"],
   "accepts enabled_sources alias in sources payloads",
 );
+assert.deepEqual(
+  parsePlannedSourcePlan(sourceState, "fix source planner", "explicit", { sources: '{"sources":["files"],"reason":"tool JSON","confidence":0.9}' })?.sources,
+  ["files", "semble"],
+  "accepts Qwen JSON-string tool arguments for sources",
+);
 
-console.log("source-plan tests passed=13");
+console.log("source-plan tests passed=17");

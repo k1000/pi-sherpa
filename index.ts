@@ -90,7 +90,7 @@ export { postProcessCandidates }; // re-export so tests/golden-retrieval.test.ts
 export { extractQueryTarget }; // re-export so tests/golden-retrieval.test.ts keep working
 export { parseCompiledContextItems }; // re-export so tests/golden-retrieval.test.ts keep working
 export { heuristicSourcePlan }; // re-export so tests/source-plan.test.ts and golden tests keep working
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync, copyFileSync, openSync, closeSync, readSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1379,18 +1379,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
       ctx.ui.setWidget(SHERPA_LEGACY_UI_KEY, undefined);
       setSherpaStatus(ctx);
-      // Index new session log entries for FTS5 search only when session recall is enabled.
-      // Some projects accumulate multi-GB session-search indexes; opening them on startup can
-      // make Pi appear frozen even when the user did not request historical session recall.
-      if (state.config.enabled && state.config.sources.session) {
-        try {
-          const indexed = await timedSherpa(state, ctx, "session_start.indexSessionLog", async () => indexSessionLog({ sessionLogPath: path.join(homedir(), ".pi", "agent", "sessions") }, ctx.cwd));
-          if (indexed > 0) {
-            const total = getIndexedEntryCount(undefined, ctx.cwd);
-            try { ctx.ui.notify(`Sherpa indexed ${indexed} new session entries (${total} total)`, "info"); } catch {}
-          }
-        } catch { /* session search is best-effort at startup */ }
-      }
+      // Session-log indexing can scan a multi-GB history and block Pi's event loop.
+      // Index lazily in the session-search tool, where the caller explicitly requested recall.
     } finally {
       logSherpaTiming(state, ctx, "session_start.total", sessionStartTiming);
     }
@@ -1406,8 +1396,22 @@ export default function (pi: ExtensionAPI) {
     setTimeout(() => { void runPostTaskWork(ctx, cwd, recentMessages).catch(() => {}); }, 100);
   });
 
+  const indexSessionsAfterShutdown = (cwd: string) => {
+    const workerScript = path.join(path.dirname(__filename), "scripts", "background-session-indexer.ts");
+    try {
+      const worker = spawn("bun", ["run", workerScript, path.join(homedir(), ".pi", "agent", "sessions"), cwd], {
+        cwd,
+        detached: true,
+        stdio: "ignore",
+      });
+      worker.on("error", () => {});
+      worker.unref();
+    } catch { /* session indexing is best-effort */ }
+  };
+
   pi.on("session_shutdown", (_event, ctx) => {
     if (state?.config.enabled) {
+      if (state.config.sources.session) indexSessionsAfterShutdown(ctx.cwd);
       void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {});
       // Keep retrieval read-only during a session; refresh the local FTS index only
       // after work is complete so it cannot delay a prompt or tool result.
@@ -1803,6 +1807,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       if (!state) state = restoreState(ctx, loadConfig(ctx.cwd));
       const result = await runSidecarSmoke(ctx);
+      ctx.ui.notify(result.lines.join("\n"), result.ok ? "info" : "error");
       pi.sendMessage({
         customType: "sherpa-sidecar-smoke",
         content: [`# Sherpa sidecar smoke`, "", ...result.lines].join("\n"),

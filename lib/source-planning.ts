@@ -92,8 +92,7 @@ export function sourcePlanningMessage(focus: string): UserMessage {
       "",
       "TASK A — Search indicators: List 8-12 SPECIFIC technical identifiers",
       "(function names, file patterns, module paths, domain terms) that would appear in",
-      'RELEVANT code — not just any code containing the raw keywords.',
-      'Return as JSON: {"indicators":{"indicators":["..."],"reason":"...","confidence":0.0}}',
+      "RELEVANT code — not just any code containing the raw keywords.",
       "",
       "TASK B — Source selection: Which sources should Sherpa search?",
       "Available: files, semble, graphify, docs, git, project_memory, inquirer, web.",
@@ -103,19 +102,25 @@ export function sourcePlanningMessage(focus: string): UserMessage {
       "- If the prompt spans conceptual setup, flows, lifecycles, boundaries, or how code fits into a system, choose graphify + files + semble + project_memory + inquirer, and docs when durable docs likely help.",
       "Prefer the fewest sources likely to contain the answer.",
       "Choose web only for current/latest/online facts not in the repo.",
-      'Also return as JSON: {"sources":{"sources":["..."],"reason":"...","confidence":0.0}}',
       "",
-      `Return ONLY a single JSON object with both "indicators" and "sources" keys.`,
+      "Return ONLY valid JSON matching this exact shape; no Markdown, prose, or a second JSON object:",
+      '{"indicators":{"indicators":["..."],"reason":"...","confidence":0.0},"sources":{"sources":["files","semble"],"reason":"...","confidence":0.0}}',
     ].join("\n") }],
   };
 }
 
+function parsePlannerPayload(value: unknown): any {
+  if (typeof value === "string") return extractJsonObject(value);
+  return value;
+}
+
 export function parsePlannedIndicators(parsed: any, fallback: SearchIndicators): SearchIndicators {
-  if (!parsed?.indicators || !Array.isArray(parsed.indicators.indicators) || parsed.indicators.indicators.length === 0) return fallback;
+  const indicatorsPayload = parsePlannerPayload(parsed?.indicators);
+  if (!indicatorsPayload || !Array.isArray(indicatorsPayload.indicators) || indicatorsPayload.indicators.length === 0) return fallback;
   return {
-    indicators: parsed.indicators.indicators.filter((s: unknown): s is string => typeof s === "string" && s.length >= 2).slice(0, 12),
-    reason: String(parsed.indicators.reason ?? "").slice(0, 240) || "model inference",
-    confidence: Math.max(0.1, Math.min(1, Number(parsed.indicators.confidence ?? 0.5))),
+    indicators: indicatorsPayload.indicators.filter((s: unknown): s is string => typeof s === "string" && s.length >= 2).slice(0, 12),
+    reason: String(indicatorsPayload.reason ?? "").slice(0, 240) || "model inference",
+    confidence: Math.max(0.1, Math.min(1, Number(indicatorsPayload.confidence ?? 0.5))),
     planner: "llm",
   };
 }
@@ -168,12 +173,12 @@ function plannedSourceArray(payload: any): unknown[] {
 }
 
 export function parsePlannedSourcePlan(state: SourceStateLike, focus: string, mode: string, parsed: any, routePlan?: RoutePlan): SourcePlan | null {
-  const sourcePayload = parsed?.sources
+  const sourcePayload = parsePlannerPayload(parsed?.sources
     ?? parsed?.sourcePlan
     ?? parsed?.source_plan
     ?? parsed?.sourceSelection
     ?? parsed?.source_selection
-    ?? null;
+    ?? null);
   if (!sourcePayload) return null;
   const sourcePlan = Array.isArray(sourcePayload)
     ? { sources: normalizeSources(sourcePayload, mode), reason: "llm source plan", confidence: 0.5, planner: "llm" as const }

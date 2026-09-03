@@ -60,19 +60,24 @@ function sherpaModelName(model: any): string {
 }
 
 export function usesSherpaToolJsonSchema(model: any): boolean {
-  // GLM satisfies forced tool calls with an empty arguments object; its reliable
-  // JSON contract is the text response requested by the prompt.
-  return !sherpaModelName(model).includes("glm");
+  // Responses models do not accept the Chat-Completions tool payload below.
+  // GLM, oMLX, and Qwen return unusable payloads for Sherpa's generic forced tool.
+  return model?.api === "openai-completions"
+    && !sherpaModelName(model).includes("glm")
+    && model?.provider !== "olmx"
+    && model?.provider !== "qwen";
 }
 
 export function sherpaStructuredJsonPayload(payload: unknown, model: any): unknown | undefined {
   if (!payload || typeof payload !== "object") return undefined;
-  const disableThinking = !sherpaModelName(model).includes("glm");
+  if (model?.provider === "qwen") {
+    return { ...(payload as Record<string, unknown>), enable_thinking: false };
+  }
+  if (!usesSherpaToolJsonSchema(model)) return payload;
   return {
     ...(payload as Record<string, unknown>),
-    // GLM models reject enable_thinking=false because thinking is mandatory.
-    // Other OpenAI-compatible/Qwen sidecars need it disabled for forced tool calls.
-    ...(disableThinking ? { enable_thinking: false } : {}),
+    // GLM is excluded above because it rejects enable_thinking=false.
+    enable_thinking: false,
     tools: [{
       type: "function",
       function: {
@@ -89,10 +94,35 @@ export function sherpaStructuredJsonPayload(payload: unknown, model: any): unkno
 }
 
 export function extractToolJsonObject(response: any): unknown {
-  const toolCall = response.content?.find?.((c: any) => c?.type === "toolCall" && c?.name === "emit_sherpa_json");
+  const toolCall = response.content?.find?.((content: any) => content?.type === "toolCall" && content?.name === "emit_sherpa_json");
   const argumentsValue = toolCall?.arguments;
-  if (argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)) return argumentsValue;
+  if (argumentsValue && typeof argumentsValue === "object" && !Array.isArray(argumentsValue)) {
+    return Object.keys(argumentsValue).length ? argumentsValue : null;
+  }
   return typeof argumentsValue === "string" ? extractJsonObject(argumentsValue) : null;
+}
+
+export function completionErrorMessage(response: any): string | null {
+  if (response?.stopReason !== "error") return null;
+  const message = response?.errorMessage;
+  return typeof message === "string" && message.trim()
+    ? message
+    : "Sherpa model returned an error response";
+}
+
+export function parseJsonCompletionResponse(response: any, structuredOutput: unknown): unknown {
+  if (structuredOutput === "tool_json_schema") {
+    const toolJson = extractToolJsonObject(response);
+    if (toolJson) return toolJson;
+  }
+  const textParts = (Array.isArray(response?.content) ? response.content : [])
+    .filter((c: any): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
+    .map((c: { text: string }) => c.text);
+  for (const text of [textParts.join(""), textParts.join("\n"), ...textParts]) {
+    const parsed = extractJsonObject(text);
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 export async function completeJsonObjectWithTimeout(
@@ -105,15 +135,14 @@ export async function completeJsonObjectWithTimeout(
   timeoutMessage: string,
 ) {
   const structuredOutput = (state as any).config?.model?.structuredOutput;
-  const onPayload = structuredOutput === "tool_json_schema" && usesSherpaToolJsonSchema(model)
+  const onPayload = structuredOutput === "tool_json_schema"
     ? (payload: unknown, completionModel: any) => sherpaStructuredJsonPayload(payload, completionModel)
     : undefined;
   const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage, onPayload);
   if (response.stopReason === "aborted") return { aborted: true, parsed: null };
-  const toolJson = structuredOutput === "tool_json_schema" ? extractToolJsonObject(response) : null;
-  if (toolJson) return { aborted: false, parsed: toolJson };
-  const text = response.content.filter((c: any): c is { type: "text"; text: string } => c.type === "text").map((c: any) => c.text).join("\\n");
-  return { aborted: false, parsed: extractJsonObject(text) };
+  const errorMessage = completionErrorMessage(response);
+  if (errorMessage) throw new Error(errorMessage);
+  return { aborted: false, parsed: parseJsonCompletionResponse(response, structuredOutput) };
 }
 
 export async function llmSummarize(ctx: ExtensionContext, state: SummarizeStateLike, raw: string, budgetChars = 1200): Promise<string> {

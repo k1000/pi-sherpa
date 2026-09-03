@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { clearSherpaModelFallback, notifySherpaModelFallback } from "../lib/model-auth";
+import { clearSherpaModelFallback, isTransientSherpaModelFailure, notifySherpaModelFallback } from "../lib/model-auth";
 
 const notifications: Array<{ message: string; level: string }> = [];
 const statuses: Array<{ key: string; value: string | undefined }> = [];
@@ -25,4 +25,13 @@ assert.deepEqual(statuses, [{
 clearSherpaModelFallback(ctx);
 assert.deepEqual(statuses.at(-1), { key: "ai-sherpa-model", value: undefined });
 
-console.log("model-auth tests passed=3");
+assert.equal(isTransientSherpaModelFailure("source planner error: Request timed out."), true);
+assert.equal(isTransientSherpaModelFailure("model not found: local/sherpa"), false);
+notifySherpaModelFallback(ctx, "source planner error: Request timed out.");
+assert.equal(notifications.length, 1, "a transient planner timeout must not show a MODEL FAILURE alert");
+assert.deepEqual(statuses.at(-1), {
+  key: "ai-sherpa-model",
+  value: "Sherpa model temporarily unavailable — heuristic fallback active",
+});
+
+console.log("model-auth tests passed=6");
