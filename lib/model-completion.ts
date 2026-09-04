@@ -71,7 +71,11 @@ export function usesSherpaToolJsonSchema(model: any): boolean {
 export function sherpaStructuredJsonPayload(payload: unknown, model: any): unknown | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   if (model?.provider === "qwen") {
-    return { ...(payload as Record<string, unknown>), enable_thinking: false };
+    return {
+      ...(payload as Record<string, unknown>),
+      enable_thinking: false,
+      response_format: { type: "json_object" },
+    };
   }
   if (!usesSherpaToolJsonSchema(model)) return payload;
   return {
@@ -115,7 +119,10 @@ export function parseJsonCompletionResponse(response: any, structuredOutput: unk
     const toolJson = extractToolJsonObject(response);
     if (toolJson) return toolJson;
   }
-  const textParts = (Array.isArray(response?.content) ? response.content : [])
+  const contentParts = typeof response?.content === "string"
+    ? [{ type: "text", text: response.content }]
+    : Array.isArray(response?.content) ? response.content : [];
+  const textParts = contentParts
     .filter((c: any): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
     .map((c: { text: string }) => c.text);
   for (const text of [textParts.join(""), textParts.join("\n"), ...textParts]) {
@@ -135,7 +142,10 @@ export async function completeJsonObjectWithTimeout(
   timeoutMessage: string,
 ) {
   const structuredOutput = (state as any).config?.model?.structuredOutput;
-  const onPayload = structuredOutput === "tool_json_schema"
+  // Qwen's compatible endpoint supports JSON mode but returns unreliable
+  // plain-text JSON without it. Apply that contract even if a legacy config
+  // omitted `structuredOutput`.
+  const onPayload = structuredOutput === "tool_json_schema" || model?.provider === "qwen"
     ? (payload: unknown, completionModel: any) => sherpaStructuredJsonPayload(payload, completionModel)
     : undefined;
   const response = await completeWithAbortableTimeout(model, state.retrievalPrompt, [message], auth, ctx.signal, timeoutMs, timeoutMessage, onPayload);

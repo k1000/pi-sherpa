@@ -39,6 +39,11 @@ assert.deepEqual(
   "uses the JSON-only text contract when structured output is disabled",
 );
 assert.deepEqual(
+  parseJsonCompletionResponse({ content: '{"sources":{"sources":["files"]}}' }, undefined),
+  { sources: { sources: ["files"] } },
+  "accepts OpenAI-compatible string content",
+);
+assert.deepEqual(
   parseJsonCompletionResponse({ content: [{ type: "text", text: '{"items":[{"index":0}]}' }] }, "tool_json_schema"),
   { items: [{ index: 0 }] },
   "falls through to JSON text when a structured-output model does not return a tool call",
@@ -100,8 +105,8 @@ assert.equal(
 );
 assert.deepEqual(
   sherpaStructuredJsonPayload({ model: "test" }, { provider: "qwen", id: "qwen3.8-flash", api: "openai-completions" }),
-  { model: "test", enable_thinking: false },
-  "uses Qwen text JSON without forced tools or thinking",
+  { model: "test", enable_thinking: false, response_format: { type: "json_object" } },
+  "uses Qwen JSON mode without forced tools or thinking",
 );
 assert.deepEqual(
   sherpaStructuredJsonPayload({ model: "test" }, { provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses" }),
@@ -115,4 +120,4 @@ const chatCompletionsPayload = sherpaStructuredJsonPayload(
 assert.equal(chatCompletionsPayload.enable_thinking, false, "disables thinking for supported Chat-Completions tool calls");
 assert.equal(chatCompletionsPayload.tool_choice.function.name, "emit_sherpa_json", "forces the JSON tool only for supported Chat-Completions models");
 
-console.log("model-completion tests passed=21");
+console.log("model-completion tests passed=22");
