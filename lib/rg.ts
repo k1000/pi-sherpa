@@ -90,8 +90,10 @@ export async function rg(cwd: string, query: string | string[], searchPath = cwd
       "!*.db",
       "!*.sqlite",
     ];
-    const args = ["-n", "--hidden", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), effectiveSearchPath];
-    const { stdout } = await execFileAsync(rgBin, args, { timeout: 3000, maxBuffer: 500_000 });
+    // Deterministic output order: ripgrep parallelizes traversal, so without
+    // --sort the first-N match cap picks a different subset on every run.
+    const args = ["-n", "--hidden", "--sort", "path", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), effectiveSearchPath];
+    const { stdout } = await execFileAsync(rgBin, args, { timeout: 3000, maxBuffer: 2_000_000 });
     return stdout;
   } catch (e: any) { return e.stdout ?? ""; }
 }

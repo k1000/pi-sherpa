@@ -37,3 +37,22 @@ Action for next iteration:
 4. Optimize recall@12, not raw recall; volume and noise guards stay as secondary.
 
 Baseline for recall@12 with the scoped Pi-agent search + cap: **0.0389** (37/950).
+
+## Stage 2: rg output order is nondeterministic (run #466, discarded)
+
+Root cause of the benchmark's run-to-run spread (identical code scored recall@12
+0.0695 / 0.0716 / 0.0926): ripgrep parallelizes traversal, so with a fixed
+first-N match cap (`parseRgOutput(out, 30)`) a different subset of matches is kept
+on every run.
+
+Adding `--sort path` makes results **bit-identical between runs** (verified: two
+consecutive runs both 0.0337), but it biases the first-30 selection toward early
+alphabetical paths and dropped recall@12 0.0716 → 0.0337.
+
+Next iteration plan (determinism without truncation bias):
+1. Keep `--sort path` for reproducible output.
+2. Raise the parse cap for indicator matches well above 30 (e.g. 200) so the
+   fixed cap stops truncating, then rank by indicator-hit quality (the
+   `topMatchesByQuality` helper exists) before adding candidates.
+3. Re-measure: target recall@12 ≥ 0.0716 with deterministic, repeatable numbers.
+4. Do not compare results across runs that differ in rg ordering behaviour.

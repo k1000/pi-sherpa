@@ -39,11 +39,29 @@ export async function addRoutedFileCandidates(ctx: { cwd: string }, focus: strin
   }
 }
 
+/** One match per distinct file, in deterministic order, up to cap files. */
+function distinctFileMatches(matches: Array<{ fileAndLine: string; content: string }>, cap: number) {
+  const seen = new Set<string>();
+  const out: Array<{ fileAndLine: string; content: string }> = [];
+  for (const m of matches) {
+    const file = m.fileAndLine.replace(/:\d+$/, "");
+    if (seen.has(file)) continue;
+    seen.add(file);
+    out.push(m);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
 export async function addIndicatorFileCandidates(ctx: { cwd: string }, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, add: AddContextItem) {
   const indicatorText = indicators.indicators.join(" ");
   const out = await rg(ctx.cwd, indicators.indicators);
-  for (const { fileAndLine, content } of parseRgOutput(out, 30)) {
-    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, indicatorText, mode)) continue;
+  // Coverage beats depth: many lines from the same file are redundant, so take
+  // one match per distinct file (deterministic thanks to rg --sort path) and let
+  // the downstream ranking pick the top 12.
+  const matches = parseRgOutput(out, 400).filter(({ fileAndLine, content }) =>
+    content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine) && fileSnippetAllowed(fileAndLine, indicatorText, mode));
+  for (const { fileAndLine, content } of distinctFileMatches(matches, 40)) {
     add("file", `repo://${fileAndLine}`, content, 0.15);
   }
 }
@@ -61,8 +79,9 @@ export async function retryFrontDoorFileCandidates<T extends { source: string; r
   // Semble has already searched in the parallel retrieval phase. Retry only the
   // literal file search so an empty semantic result does not double front-door latency.
   const retryOut = await rg(ctx.cwd, focus);
-  for (const { fileAndLine, content } of parseRgOutput(retryOut, 16)) {
-    if (!content || routeSkipsPath(sourcePlan?.routePlan, fileAndLine) || !fileSnippetAllowed(fileAndLine, focus, mode)) continue;
+  const retryMatches = parseRgOutput(retryOut, 200).filter(({ fileAndLine, content }) =>
+    content && !routeSkipsPath(sourcePlan?.routePlan, fileAndLine) && fileSnippetAllowed(fileAndLine, focus, mode));
+  for (const { fileAndLine, content } of distinctFileMatches(retryMatches, 16)) {
     add("file", `repo://${fileAndLine}`, content, 0.08);
   }
 }
