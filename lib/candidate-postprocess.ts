@@ -111,6 +111,25 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
 }
 
 /**
+ * True when a `file_exact` source points at a bare directory or filesystem root
+ * with no filename. A directory listing is not usable context on its own.
+ */
+function isBareDirectorySource(source: string) {
+  const p = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "").replace(/\/+$/, "");
+  const last = p.split("/").filter(Boolean).pop() ?? "";
+  return last.length > 0 && !last.includes(".");
+}
+
+/** Sherpa's own config file is only relevant to Sherpa-specific prompts. */
+function isSherpaOwnConfigSource(source: string) {
+  return /(?:^|\/)sherpa\.config\.json(?::\d+)?$/i.test(source.replace(/^repo:\/\//, "").replace(/^file:\/\//, ""));
+}
+
+function focusAllowsSherpaConfig(focus: string) {
+  return /\b(sherpa|sidecar)\b/i.test(focus);
+}
+
+/**
  * kb:// durable memory is a precision risk: a note with no lexical connection to
  * the prompt is almost never the context the agent needs. Requires at least one
  * query-target term (>=3 chars) to appear in the candidate text.
@@ -141,6 +160,8 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) continue;
+    if (item.type === "file_exact" && isBareDirectorySource(item.source)) continue;
+    if (isSherpaOwnConfigSource(item.source) && !focusAllowsSherpaConfig(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
     if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;

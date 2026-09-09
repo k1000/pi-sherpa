@@ -63,6 +63,13 @@ test("filters tool-state dot-directories", () => {
   assert(!isGloballyNoisySource("repo://.pi/agent/extensions/pi-sherpa/index.ts"), "pi extension source kept");
 });
 
+test("filters binary/image assets", () => {
+  assert(isGloballyNoisySource("repo://assets/logo.svg:12"), ".svg noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/pelican-riding-horse-final.svg:187"), "absolute .svg noisy");
+  assert(isGloballyNoisySource("repo://docs/diagram.PNG"), "case-insensitive image noisy");
+  assert(!isGloballyNoisySource("repo://src/svg-renderer.ts:1"), "source file mentioning svg kept");
+});
+
 // ─── Legitimate sources that MUST survive ──────────────────────────────────
 
 test("keeps legitimate source files", () => {

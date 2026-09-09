@@ -21,6 +21,8 @@ export const GLOBAL_NOISY_SOURCE_PATTERNS = [
   /(?:^|\/)\.mtplx\//i,
   /(?:^|\/)\.41d\//i,
   /(?:^|\/)\.pi\/understand-anything\//i,
+  // Binary/image assets are never useful text context.
+  /\.(?:svg|png|jpe?g|gif|webp|ico|bmp|tiff?)(?::\d+)?$/i,
   /(?:^|\/)\.cache\//i,
   /(?:^|\/)\.android\/cache\//i,
   /(?:^|\/)go\/pkg\/mod\//i,
