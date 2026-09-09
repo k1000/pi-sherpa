@@ -70,6 +70,10 @@ export async function rg(cwd: string, query: string | string[], searchPath = cwd
       "!extensions.disabled",
       "!**/extensions.disabled/**",
       "!**/.pi/revolver/**",
+      // Loop run logs/specs and Sherpa's own caches are diagnostic artifacts,
+      // not project context; they match indicator terms and crowd top-12 slots.
+      "!**/.pi/loops/**",
+      "!**/.pi/sherpa/**",
       "!.zcompdump*",
       "!**/.zcompdump*",
       "!.zsh_history",
