@@ -54,7 +54,9 @@ export function focusAllowsRuntimeLogs(focus: string) {
 }
 
 export function focusAllowsInquirerMemory(focus: string) {
-  return /\b(memory|remember|convention|pattern|known\s+issue|lesson|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|context|retrieval|previous|earlier|history)\b/i.test(focus);
+  // 'context', 'tag'/'tags' are too generic (most coding prompts mention them) and
+  // are not memory-retrieval intent; they let vector memory into error-blob prompts.
+  return /\b(memory|remember|convention|pattern|known\s+issue|lesson|kb|knowledge|policy|catalog|taxonomy|ontology|retrieval|previous|earlier|history)\b/i.test(focus);
 }
 
 export function isHistoricalMemorySource(item: SourceLike) {

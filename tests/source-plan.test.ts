@@ -22,6 +22,7 @@ assertSources("review recent sherpa performance, does it provide usefull data, a
 
 assert.ok(focusAllowsInquirerMemory("remember the source routing convention"), "memory prompts should allow inquirer source");
 assert.ok(!focusAllowsInquirerMemory("fix failing parser test"), "code-only prompts should not allow inquirer source");
+assert.ok(!focusAllowsInquirerMemory("review pi-sherpa context curation quality"), "bare 'context' is not memory intent and must not allow inquirer source");
 assert.equal(retrievalEnabled({ config: { sources: { inquirer: false } } }, { sources: ["inquirer"] })("inquirer"), false, "disabled inquirer config should not retrieve");
 assert.equal(retrievalEnabled({ config: { sources: { inquirer: true } } }, { sources: ["inquirer"] })("inquirer"), true, "enabled inquirer config should retrieve");
 
