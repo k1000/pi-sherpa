@@ -23,7 +23,9 @@ export function focusAllowsResearchMemory(focus: string) {
 }
 
 export function focusAllowsHistoricalMemory(focus: string) {
-  return /\b(previous|earlier|history|historical|journal|timeline|session|last time|recent session|past session|what happened|we discussed)\b/i.test(focus);
+  // Bare "session" is too broad: most prompts mention the current session, which
+  // is not a request for past journal entries. Require explicit historical intent.
+  return /\b(previous|earlier|history|historical|journal|timeline|last time|we discussed|what happened|past session|previous session|last session|recent session|session history)\b/i.test(focus);
 }
 
 /**
