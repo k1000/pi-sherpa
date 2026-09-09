@@ -241,6 +241,20 @@ const thirdDirKey = diversified[2] ? parentDirKey(diversified[2].source) : "";
 assert("diversity: third slot comes from another directory", thirdDirKey.includes("db"));
 assert("diversity: overflow items are retained", diversified.length === 4);
 
+// ─── 25. Sherpa traces require a Sherpa-specific prompt ───
+const traceCand: ContextItem[] = [
+  { type: "sherpa_trace_location", source: "repo://.pi-memory/sherpa-traces", summary: "2 traces", relevance: 0.9 },
+  { type: "file", source: "repo://src/app.ts", summary: "app", relevance: 0.5 },
+];
+assert(
+  "sherpa traces excluded for generic log prompts",
+  !postProcessCandidates(traceCand, "diagnose slow requests, need relevant logs", "explicit", fixedNow).some((c) => c.type === "sherpa_trace_location"),
+);
+assert(
+  "sherpa traces kept for sherpa trace/metrics prompts",
+  postProcessCandidates(traceCand, "review sherpa traces and metrics", "explicit", fixedNow).some((c) => c.type === "sherpa_trace_location"),
+);
+
 // ─── Report ───
 if (failed === 0) {
   console.log(`✅ All ${passed} ranking tests passed`);

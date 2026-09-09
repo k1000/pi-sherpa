@@ -53,6 +53,15 @@ export function focusAllowsRuntimeLogs(focus: string) {
   return /\b(logs?|trace|traces|tracing|metrics?|perf(?:ormance)?|dspy|bundle|bundles|persist(?:ed|ence)?|stored|storage|loops?|evaloop|eval_loop|specs?)\b/i.test(focus);
 }
 
+/**
+ * Sherpa's own retrieval traces. Unlike loop logs, these are only meaningful for
+ * Sherpa-specific diagnostics: generic "logs"/"trace provenance" prompts are
+ * about other systems and should not pull in Sherpa runtime state.
+ */
+export function isSherpaTraceSource(source: string) {
+  return source.replace(/\\/g, "/").toLowerCase().includes("/.pi-memory/sherpa-traces");
+}
+
 export function focusAllowsInquirerMemory(focus: string) {
   // 'context', 'tag'/'tags' are too generic (most coding prompts mention them) and
   // are not memory-retrieval intent; they let vector memory into error-blob prompts.
