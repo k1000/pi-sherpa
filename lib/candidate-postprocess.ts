@@ -139,6 +139,19 @@ function focusAllowsSherpaConfig(focus: string) {
 }
 
 /**
+ * Agent-managed index/route tables (memory catalog, extension route map). They
+ * describe the agent's own wiring, not the user's project, so they only belong in
+ * context when the prompt is actually about catalogs or routing.
+ */
+function isAgentMetadataIndex(source: string) {
+  return /(?:^|\/)(?:catalog\.csv|routes\.csv|routes\.md)(?::\d+)?$/i.test(source.replace(/^repo:\/\//, "").replace(/^file:\/\//, ""));
+}
+
+function focusAllowsAgentMetadata(focus: string) {
+  return /\b(catalog|route|routes|routing|index|taxonomy|table)\b/i.test(focus);
+}
+
+/**
  * kb:// durable memory is a precision risk: a note with no lexical connection to
  * the prompt is almost never the context the agent needs. Requires at least one
  * query-target term (>=3 chars) to appear in the candidate text.
@@ -171,6 +184,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) continue;
     if ((item.type === "file_exact" || item.type === "file" || item.type === "file_snippet") && isBareDirectorySource(item.source)) continue;
     if (isSherpaOwnConfigSource(item.source) && !focusAllowsSherpaConfig(focus)) continue;
+    if (isAgentMetadataIndex(item.source) && !focusAllowsAgentMetadata(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
     if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;

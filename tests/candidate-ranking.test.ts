@@ -255,6 +255,20 @@ assert(
   postProcessCandidates(traceCand, "review sherpa traces and metrics", "explicit", fixedNow).some((c) => c.type === "sherpa_trace_location"),
 );
 
+// ─── 26. Agent metadata indexes are focus-gated ───
+const metadataCand: ContextItem[] = [
+  { type: "file_snippet", source: "repo:///Users/kamil/routes.md:8", summary: "route table", relevance: 0.9 },
+  { type: "file", source: "repo://src/app.ts", summary: "app", relevance: 0.4 },
+];
+assert(
+  "agent metadata index excluded for unrelated prompts",
+  !postProcessCandidates(metadataCand, "fix the login bug", "front-door", fixedNow).some((c) => c.source.includes("routes.md")),
+);
+assert(
+  "agent metadata index kept for routing prompts",
+  postProcessCandidates(metadataCand, "fix the route table in routes.md", "front-door", fixedNow).some((c) => c.source.includes("routes.md")),
+);
+
 // ─── Report ───
 if (failed === 0) {
   console.log(`✅ All ${passed} ranking tests passed`);
