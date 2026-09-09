@@ -1,0 +1,21 @@
+
+## Deferred: out-of-sample holdout harness (built 2026-09-09, not yet viable)
+
+Built and evaluated a holdout fixture from bundles absent from `bench/fixture.json`:
+- `bench/build-holdout.py` — builds `bench/fixture-holdout.json` from traces+evaluations, excluding all main-fixture bundles.
+- `bench/ranking-bench-holdout.ts` — imports `evaluate()` from `ranking-bench.ts`, prints `holdout_*` METRIC lines.
+- Result: 23 cases, 73 missed labels, 0 noise labels; 70 of 73 labels were upstream misses; the 3 in-pool pairs scored 0/3 hit (holdout_label_loss = 1.0).
+
+Why it is NOT a valid verification yet:
+- Every one of the 23 holdout bundles was evaluated on 2026-09-09 (the same session that produced all 28 experiments) — labels are contaminated by this session.
+- All 3 in-pool missed pairs are the same `.pi-memory/sherpa-traces` label on the repeated autoresearch instruction prompt, which `focusAllowsSherpaTraces` (run #456) deliberately filters. Tuning to it would be session-fitting.
+
+Action when fresh data exists (any bundle evaluated after this session ends):
+1. Re-create the two scripts above (they were reverted with the discard).
+2. Run `python3 bench/build-holdout.py && bun bench/ranking-bench-holdout.ts`.
+3. Require holdout_label_loss to stay near the main-fixture value before trusting the 80% gain.
+4. Never select or tune a rule using holdout cases.
+
+## Deferred: candidate-generation benchmark (the real bottleneck)
+
+`upstream_miss_rate` is 0.93 on the main fixture and 0.96 on holdout: human-labeled missed paths almost never enter the candidate pool. Ranking cannot fix this. A retrieval-stage benchmark needs `init_experiment` with a new metric (baseline ≈ 0.07 recall) and a harness that replays candidate generation (file search, exact-path extraction, semble) against the same `missed` labels.
