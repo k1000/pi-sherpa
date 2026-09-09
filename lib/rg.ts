@@ -46,7 +46,7 @@ export function parseRgOutput(output: string, limit = 30): RgMatch[] {
 
 export async function rg(cwd: string, query: string | string[], searchPath = cwd): Promise<string> {
   const queryText = Array.isArray(query) ? query.join(" ") : query;
-  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
+  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 12) ?? [];
   const effectiveSearchPath = scopedBroadSearchRoot(searchPath);
   if (!terms.length || isUnsafeBroadSearchRoot(effectiveSearchPath)) return "";
   const bundledRg = path.join(cwd, "bin", "rg");
