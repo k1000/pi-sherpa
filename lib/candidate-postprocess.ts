@@ -53,6 +53,18 @@ export function focusMentionsUrl(focus: string, source: string) {
   return url.length > 8 && (focus.includes(url) || focus.includes(`${url}/`));
 }
 
+/**
+ * True when a manifest's own package directory is named in the prompt, e.g. the
+ * focus mentions `tdd_loop` and the candidate is `.../tdd_loop/package.json`.
+ * In that case the manifest is on-topic even without generic dependency words.
+ */
+export function focusMentionsPackageDir(focus: string, source: string) {
+  const path = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "");
+  const parts = path.split("/").filter(Boolean);
+  const dir = parts.length >= 2 ? parts[parts.length - 2] : "";
+  return dir.length >= 3 && focus.toLowerCase().includes(dir.toLowerCase());
+}
+
 export function candidateSortKey(item: ContextItemLike, focus: string, mode: string, now?: number) {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const target = extractQueryTarget(focus);
@@ -78,7 +90,7 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) value -= 1.5;
   if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) value -= 1.0;
   if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) value -= 1.2;
-  if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus)) value -= wantsSource ? 0.65 : 0.25;
+  if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && !focusMentionsPackageDir(focus, item.source)) value -= wantsSource ? 0.65 : 0.25;
   if (isRootReadmeSource(item.source) && !permitsRootReadme(focus)) value -= 1.0;
   if (item.source === "repo://README.md") value -= wantsSource ? 0.35 : 0.15;
   if (isGenericNoiseSource(item.source)) value -= wantsSource ? 0.3 : 0.12;
@@ -114,7 +126,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) continue;
     if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
-    if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
+    if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
     if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;
     if (item.type === "url_reference" && focusMentionsUrl(focus, item.source)) continue;
