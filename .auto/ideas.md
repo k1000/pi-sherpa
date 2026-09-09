@@ -19,3 +19,21 @@ Action when fresh data exists (any bundle evaluated after this session ends):
 ## Deferred: candidate-generation benchmark (the real bottleneck)
 
 `upstream_miss_rate` is 0.93 on the main fixture and 0.96 on holdout: human-labeled missed paths almost never enter the candidate pool. Ranking cannot fix this. A retrieval-stage benchmark needs `init_experiment` with a new metric (baseline ≈ 0.07 recall) and a harness that replays candidate generation (file search, exact-path extraction, semble) against the same `missed` labels.
+
+## Stage 2: recall@12 is the metric that matters (run #463, discarded)
+
+Raw `retrieval_recall` over-counts: run #462 surfaced 101/950 labels (0.1063) with
+19.15 candidates/case, but after `postProcessCandidates(...).slice(0,12)` only
+37/950 (0.0389) survived into the pool the model actually sees. Most flooding is
+filtered downstream, so raw recall rewards candidates that never reach the LLM.
+
+Action for next iteration:
+1. Re-run `init_experiment` with primary metric `retrieval_recall_at_12` (higher better).
+2. Add to `bench/retrieval-bench.ts`: rank retrieved candidates through
+   `postProcessCandidates(found.map(s => ({type:"file", source:s, summary:"", relevance:0.2})), focus, mode).slice(0,12)`
+   and count labels present in that top-12 as `retrieval_recall_at_12`.
+3. Keep the candidate cap (`topMatchesByQuality` in `lib/file-candidates.ts`, 8 indicator / 6 retry
+   by indicator-hit count) — it cut candidates/case 19.15 → 5.69 and noise 0.135 → 0.124.
+4. Optimize recall@12, not raw recall; volume and noise guards stay as secondary.
+
+Baseline for recall@12 with the scoped Pi-agent search + cap: **0.0389** (37/950).

@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { addExplicitPathCandidates } from "../lib/exact-source";
 import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "../lib/file-candidates";
+import { postProcessCandidates } from "../lib/candidate-postprocess";
 
 type RetrievalCase = {
   bundleId: string;
@@ -78,6 +79,7 @@ async function main() {
   const fixture = JSON.parse(readFileSync(FIXTURE, "utf8")) as { cases: RetrievalCase[] };
   let existing = 0;
   let surfaced = 0;
+  let surfacedAt12 = 0;
   let fallbackExisting = 0;
   let fallbackSurfaced = 0;
   let noiseExisting = 0;
@@ -86,6 +88,12 @@ async function main() {
   for (const testCase of fixture.cases) {
     const found = await retrieve(testCase);
     totalCandidates += found.length;
+    // What the model actually sees: deterministic ranking, capped at 12.
+    const ranked = postProcessCandidates(
+      found.map((source) => ({ type: "file", source, summary: "", relevance: 0.2 })),
+      testCase.focus,
+      testCase.mode,
+    ).slice(0, 12).map((c) => c.source);
     for (const label of testCase.missed) {
       if (!labelExists(label)) continue;
       existing++;
@@ -95,6 +103,7 @@ async function main() {
         surfaced++;
         if (isFallback) fallbackSurfaced++;
       }
+      if (ranked.some((s) => matchesLabel(label, s))) surfacedAt12++;
     }
     for (const label of testCase.noise) {
       if (!labelExists(label)) continue;
@@ -104,17 +113,19 @@ async function main() {
   }
   const recall = existing ? surfaced / existing : 0;
   console.log([
+    `METRIC retrieval_recall_at_12=${(existing ? surfacedAt12 / existing : 0).toFixed(4)}`,
     `METRIC retrieval_recall=${recall.toFixed(4)}`,
     `METRIC retrieval_noise_rate=${(noiseExisting ? noiseSurfaced / noiseExisting : 0).toFixed(4)}`,
     `METRIC retrieval_fallback_recall=${(fallbackExisting ? fallbackSurfaced / fallbackExisting : 0).toFixed(4)}`,
     `METRIC retrieval_candidates_per_case=${(fixture.cases.length ? totalCandidates / fixture.cases.length : 0).toFixed(2)}`,
     `METRIC retrieval_existing_labels=${existing}`,
     `METRIC retrieval_surfaced=${surfaced}`,
+    `METRIC retrieval_surfaced_at_12=${surfacedAt12}`,
     `METRIC retrieval_noise_labels=${noiseExisting}`,
     `METRIC retrieval_fallback_labels=${fallbackExisting}`,
     `METRIC retrieval_cases=${fixture.cases.length}`,
   ].join("\n"));
-  console.log(`\nretrieval_recall=${recall.toFixed(4)} surfaced=${surfaced}/${existing} noise=${noiseSurfaced}/${noiseExisting} candidates/case=${(totalCandidates / (fixture.cases.length || 1)).toFixed(2)}`);
+  console.log(`\nrecall_at_12=${(existing ? surfacedAt12 / existing : 0).toFixed(4)} raw_recall=${recall.toFixed(4)} surfaced=${surfaced}/${existing} at12=${surfacedAt12} noise=${noiseSurfaced}/${noiseExisting} candidates/case=${(totalCandidates / (fixture.cases.length || 1)).toFixed(2)}`);
 }
 
 if (import.meta.main) await main();
