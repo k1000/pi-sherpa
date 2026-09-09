@@ -13,6 +13,14 @@ export const GLOBAL_NOISY_SOURCE_PATTERNS = [
   /(?:^|\/)\.zsh_history(?::\d+)?$/i,
   /(?:^|\/)\.(?:zshrc|bashrc|bash_profile|zprofile|profile|zshenv)(?::\d+)?$/i,
   /(?:^|\/)\.bun\//i,
+  // Tool-state dot-directories: version managers, editor/AI tool state, and
+  // their vendored extension trees. Never project context.
+  /(?:^|\/)\.nvm\//i,
+  /(?:^|\/)\.roo\//i,
+  /(?:^|\/)\.antigravity\//i,
+  /(?:^|\/)\.mtplx\//i,
+  /(?:^|\/)\.41d\//i,
+  /(?:^|\/)\.pi\/understand-anything\//i,
   /(?:^|\/)\.cache\//i,
   /(?:^|\/)\.android\/cache\//i,
   /(?:^|\/)go\/pkg\/mod\//i,

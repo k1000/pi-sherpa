@@ -51,6 +51,18 @@ test("strips repo:// and file:// schemes and lowercases", () => {
   assert(isGloballyNoisySource("repo:///Users/KAMIL/.PI/SHERPA/dev.jsonl"), "case-insensitive match");
 });
 
+test("filters tool-state dot-directories", () => {
+  assert(isGloballyNoisySource("repo:///Users/kamil/.nvm/bash_completion:88"), ".nvm noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/.roo/commands/rdio.md:97"), ".roo noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/.antigravity/extensions/ms-python/SECURITY.md:31"), ".antigravity noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/.mtplx/tuning.json:50"), ".mtplx noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/.41d/41d.js:3"), ".41d noisy");
+  assert(isGloballyNoisySource("repo:///Users/kamil/.pi/understand-anything/READMEs/README.md:64"), "understand-anything state noisy");
+  // Sibling project files under .pi/agent must survive.
+  assert(!isGloballyNoisySource("repo://.pi/agent/skills/use-sherpa/SKILL.md"), "pi skills kept");
+  assert(!isGloballyNoisySource("repo://.pi/agent/extensions/pi-sherpa/index.ts"), "pi extension source kept");
+});
+
 // ─── Legitimate sources that MUST survive ──────────────────────────────────
 
 test("keeps legitimate source files", () => {
