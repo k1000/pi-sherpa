@@ -19,6 +19,7 @@ import {
   isRuntimeLogSource,
   isSherpaTraceSource,
   focusAllowsRuntimeLogs,
+  focusAllowsSherpaTraces,
 } from "./source-guards";
 
 type ContextItemLike = {
@@ -190,9 +191,9 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
     if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;
-    // Sherpa's own traces additionally require a Sherpa-specific prompt: generic
-    // "logs" or "trace provenance" questions are about other systems.
-    if (isSherpaTraceSource(item.source) && !/\bsherpa\b/i.test(focus)) continue;
+    // Sherpa's own traces additionally require a Sherpa-specific trace/log/metrics
+    // question: generic "logs" or "trace provenance" prompts are about other systems.
+    if (isSherpaTraceSource(item.source) && !focusAllowsSherpaTraces(focus)) continue;
     if (item.type === "url_reference" && focusMentionsUrl(focus, item.source)) continue;
     const key = sourceDedupeKey(item.source);
     if (seen.has(key)) continue;

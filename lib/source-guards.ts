@@ -64,6 +64,16 @@ export function isSherpaTraceSource(source: string) {
   return source.replace(/\\/g, "/").toLowerCase().includes("/.pi-memory/sherpa-traces");
 }
 
+/**
+ * Retrieval traces are diagnostics about retrieval. They need both a Sherpa
+ * mention and trace/log/metrics intent — a generic bundle/loop prompt is not a
+ * trace question, and loop logs are gated separately by focusAllowsRuntimeLogs.
+ */
+export function focusAllowsSherpaTraces(focus: string) {
+  return /\bsherpa\b/i.test(focus)
+    && /\b(logs?|trace|traces|tracing|metrics?|dspy|retrieval|persist(?:ed|ence)?|stored|storage)\b/i.test(focus);
+}
+
 export function focusAllowsInquirerMemory(focus: string) {
   // 'context', 'tag'/'tags' are too generic (most coding prompts mention them) and
   // are not memory-retrieval intent; they let vector memory into error-blob prompts.

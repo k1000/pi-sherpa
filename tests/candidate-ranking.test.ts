@@ -254,6 +254,10 @@ assert(
   "sherpa traces kept for sherpa trace/metrics prompts",
   postProcessCandidates(traceCand, "review sherpa traces and metrics", "explicit", fixedNow).some((c) => c.type === "sherpa_trace_location"),
 );
+assert(
+  "sherpa traces excluded for sherpa prompts without trace/log intent",
+  !postProcessCandidates(traceCand, "sherpa bundle loop debug", "explicit", fixedNow).some((c) => c.type === "sherpa_trace_location"),
+);
 
 // ─── 26. Agent metadata indexes are focus-gated ───
 const metadataCand: ContextItem[] = [
