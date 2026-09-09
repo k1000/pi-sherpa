@@ -110,6 +110,20 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   return value;
 }
 
+/**
+ * kb:// durable memory is a precision risk: a note with no lexical connection to
+ * the prompt is almost never the context the agent needs. Requires at least one
+ * query-target term (>=3 chars) to appear in the candidate text.
+ */
+function projectMemoryMatchesFocus(item: ContextItemLike, focus: string) {
+  const terms = extractQueryTarget(focus).targetTerms
+    .map((term) => term.toLowerCase().replace(/[-_]/g, ""))
+    .filter((term) => term.length >= 3);
+  if (!terms.length) return true;
+  const haystack = `${item.source}\n${item.summary}\n${item.raw ?? ""}`.toLowerCase().replace(/[-_]/g, "");
+  return terms.some((term) => haystack.includes(term));
+}
+
 export function postProcessCandidates<T extends ContextItemLike>(candidates: T[], focus: string, mode: string, now?: number): T[] {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const _now = now ?? Date.now();
@@ -126,6 +140,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) continue;
     if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
+    if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
     if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;
