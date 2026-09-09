@@ -6,7 +6,7 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { postProcessCandidates } from "../index";
+import { isSlashCommandPrompt, postProcessCandidates } from "../index";
 import { classifyTaskOutcome, compactScratchpad, compactScratchpadLifecycle, computeLifecycleStage, detectKnowledgeGaps, formatKnowledgeGapsForCompiler, suggestVerificationCommands } from "../lib/lifecycle";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
@@ -19,6 +19,13 @@ function withTemp(fn: (dir: string) => void) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "sherpa-lifecycle-"));
   try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
+
+test("slash command prompts bypass automatic processing", () => {
+  assert(isSlashCommandPrompt("/compact") === true, "slash commands should be skipped");
+  assert(isSlashCommandPrompt("  /skill:tdd") === true, "indented slash commands should be skipped");
+  assert(isSlashCommandPrompt("implement /compact handling") === false, "inline slashes are not commands");
+  assert(isSlashCommandPrompt(undefined) === false, "non-string prompts are not commands");
+});
 
 test("classifyTaskOutcome detects core outcomes", () => {
   assert(classifyTaskOutcome("implemented and verified, tests passed").outcome === "completed", "expected completed");

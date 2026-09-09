@@ -4,6 +4,11 @@ export function approxTokens(s: string) { return Math.ceil(s.length / 4); }
 
 export function isTrivial(text: string) { return text.trim().length < 24 && !/[/.]|error|fail|test|bug|fix|refactor|implement/i.test(text); }
 
+/** Pi slash commands and prompt-template invocations should bypass automatic retrieval. */
+export function isSlashCommandPrompt(text: unknown): boolean {
+  return typeof text === "string" && text.trimStart().startsWith("/");
+}
+
 export function score(text: string, focus: string) {
   const words = new Set(focus.toLowerCase().split(/\W+/).filter(w => w.length > 2));
   let hits = 0; for (const w of words) if (text.toLowerCase().includes(w)) hits++;

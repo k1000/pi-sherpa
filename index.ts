@@ -55,7 +55,7 @@ import { retrievalEnabled } from "./lib/source-activation";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsInquirerMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
-import { conciseSummary, isTrivial } from "./lib/text-utils";
+import { conciseSummary, isSlashCommandPrompt, isTrivial } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
 import { searchWebForState } from "./lib/web-search";
@@ -85,7 +85,7 @@ import { applyRetrievalFeedback } from "./lib/retrieval-feedback";
 import { filterAlreadySeenSources, itemAlreadySeen, previouslyShownSourceSet, sessionText } from "./lib/session-novelty";
 import { bundleMarkdown } from "./lib/signal-render";
 import { extractSearchTerms, heuristicIndicators, heuristicSearchIndicators, heuristicSourcePlan, normalizeSources, parsePlannedIndicators, parsePlannedSourcePlan, sourcePlanningMessage, routedFallbackPlan } from "./lib/source-planning";
-export { conciseSummary }; // re-export so tests/golden-retrieval.test.ts keep working
+export { conciseSummary, isSlashCommandPrompt }; // re-export helpers used by tests
 export { postProcessCandidates }; // re-export so tests/golden-retrieval.test.ts keep working
 export { extractQueryTarget }; // re-export so tests/golden-retrieval.test.ts keep working
 export { parseCompiledContextItems }; // re-export so tests/golden-retrieval.test.ts keep working
@@ -1372,6 +1372,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const sessionStartTiming = Date.now();
     state = restoreState(ctx, loadConfig(ctx.cwd));
+    pendingSlashCommandAt = undefined;
+    currentTurnIsSlashCommand = false;
     try {
       if (!state.config.enabled) return;
       getProjectKBBasedir(ctx.cwd);
@@ -1386,9 +1388,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  const SLASH_COMMAND_PENDING_TTL_MS = 60_000;
+  let pendingSlashCommandAt: number | undefined;
+  let currentTurnIsSlashCommand = false;
+
+  pi.on("input", (event) => {
+    if (isSlashCommandPrompt(event.text)) pendingSlashCommandAt = Date.now();
+  });
+
   pi.on("agent_end", (event, ctx) => {
-    if (!state?.config.enabled || state.config.mode === "explicit" || state.config.mode === "off") return;
     if ((event as { willRetry?: boolean }).willRetry === true) return;
+    if (currentTurnIsSlashCommand) {
+      currentTurnIsSlashCommand = false;
+      return;
+    }
+    if (!state?.config.enabled || state.config.mode === "explicit" || state.config.mode === "off") return;
     const recentMessages = event.messages ?? ctx.sessionManager.getEntries().slice(-12);
     const cwd = ctx.cwd;
     // Run post-task work asynchronously without blocking the TUI event loop.
@@ -1644,6 +1658,15 @@ export default function (pi: ExtensionAPI) {
     const startedAt = Date.now();
     let outcome = "skipped";
     try {
+      const hasPendingSlashCommand = pendingSlashCommandAt !== undefined
+        && Date.now() - pendingSlashCommandAt <= SLASH_COMMAND_PENDING_TTL_MS;
+      pendingSlashCommandAt = undefined;
+      currentTurnIsSlashCommand = hasPendingSlashCommand || isSlashCommandPrompt(event.prompt);
+      if (currentTurnIsSlashCommand) {
+        if (state) state.lastSkip = "slash command";
+        outcome = "slash-command";
+        return;
+      }
       if (!state?.config?.enabled || !state.config.frontDoor.enabled || state.config.mode === "off" || state.config.mode === "explicit") return;
       if (isTrivial(event.prompt)) { state.lastSkip = "trivial prompt"; outcome = "trivial"; return; }
 
