@@ -47,7 +47,7 @@ export function docMatchesFocus(rel: string, focus: string, mode: string) {
 export function routeSkipsPath(routePlan: RoutePlanLike | undefined, p: string) {
   if (!routePlan) return false;
   const normalized = p.replace(/\\/g, "/").toLowerCase();
-  return routePlan.skip.some(s => s && normalized.includes(s.replace(/\\/g, "/").toLowerCase()));
+  return (routePlan.skip ?? []).some(s => s && normalized.includes(s.replace(/\\/g, "/").toLowerCase()));
 }
 
 export function getDocFilesForFocus(cwd: string, focus: string, mode: string, routePlan?: RoutePlanLike) {

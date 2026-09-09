@@ -14,6 +14,18 @@ export function isUnsafeBroadSearchRoot(searchPath: string): boolean {
 }
 
 /**
+ * A broad home root cannot be searched as-is (too slow, too noisy), but the Pi
+ * agent's own config/extension tree is bounded (~2.5k files, <0.1s) and is what
+ * users ask about when they work from the home directory. Scope home-root
+ * searches to that subtree instead of bailing out entirely.
+ */
+export function scopedBroadSearchRoot(searchPath: string): string {
+  if (path.resolve(searchPath) !== os.homedir()) return searchPath;
+  const piAgentRoot = path.join(os.homedir(), ".pi", "agent");
+  return existsSync(piAgentRoot) ? piAgentRoot : searchPath;
+}
+
+/**
  * Parse ripgrep `-n` output in `file:line:content` form.
  * Splits only on the first two colons so URLs, JSON, and other colon-rich
  * content remain intact.
@@ -35,7 +47,8 @@ export function parseRgOutput(output: string, limit = 30): RgMatch[] {
 export async function rg(cwd: string, query: string | string[], searchPath = cwd): Promise<string> {
   const queryText = Array.isArray(query) ? query.join(" ") : query;
   const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-  if (!terms.length || isUnsafeBroadSearchRoot(searchPath)) return "";
+  const effectiveSearchPath = scopedBroadSearchRoot(searchPath);
+  if (!terms.length || isUnsafeBroadSearchRoot(effectiveSearchPath)) return "";
   const bundledRg = path.join(cwd, "bin", "rg");
   const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
   try {
@@ -77,7 +90,7 @@ export async function rg(cwd: string, query: string | string[], searchPath = cwd
       "!*.db",
       "!*.sqlite",
     ];
-    const args = ["-n", "--hidden", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), searchPath];
+    const args = ["-n", "--hidden", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), effectiveSearchPath];
     const { stdout } = await execFileAsync(rgBin, args, { timeout: 3000, maxBuffer: 500_000 });
     return stdout;
   } catch (e: any) { return e.stdout ?? ""; }
