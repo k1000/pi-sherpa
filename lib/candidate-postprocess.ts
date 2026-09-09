@@ -110,6 +110,14 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   return value;
 }
 
+/** Directory key for context diversity (last 4 path components). */
+export function parentDirKey(source: string): string {
+  const p = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "");
+  const parts = p.split("/").filter(Boolean);
+  parts.pop();
+  return parts.slice(-4).join("/");
+}
+
 /**
  * True when a `file_exact` source points at a bare directory or filesystem root
  * with no filename. A directory listing is not usable context on its own.
@@ -179,7 +187,19 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     seen.add(key);
     out.push(item);
   }
-  return out;
+  // Context diversity: don't spend the whole top slots on one directory. Extras
+  // are kept but pushed behind candidates from other directories.
+  const primary: T[] = [];
+  const overflow: T[] = [];
+  const dirCounts = new Map<string, number>();
+  for (const item of out) {
+    const dirKey = parentDirKey(item.source);
+    const count = dirCounts.get(dirKey) ?? 0;
+    if (count >= 2) { overflow.push(item); continue; }
+    dirCounts.set(dirKey, count + 1);
+    primary.push(item);
+  }
+  return [...primary, ...overflow];
 }
 
 /**

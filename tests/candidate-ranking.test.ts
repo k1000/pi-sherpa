@@ -6,7 +6,7 @@
  * @sherpa-safe true
  */
 
-import { candidateSortKey, postProcessCandidates, decayScore, frequencyScore, applyRecencyBoost } from "../lib/candidate-postprocess";
+import { candidateSortKey, postProcessCandidates, parentDirKey, decayScore, frequencyScore, applyRecencyBoost } from "../lib/candidate-postprocess";
 
 type ContextItem = { type: string; source: string; summary: string; raw?: string; relevance: number; lastAccessedAt?: number; accessCount?: number };
 
@@ -228,6 +228,18 @@ assert("postProcess removes eval for non-eval query", !filtered.some((c) => c.so
 // ─── 23. postProcessCandidates keeps eval for eval queries ───
 const filteredEval = postProcessCandidates(candidates, "check sherpa evaluation metrics", "front-door", fixedNow);
 assert("postProcess keeps eval for eval query", filteredEval.some((c) => c.source.includes("sherpa-evaluations")));
+
+// ─── 24. postProcessCandidates caps same-directory items for context diversity ───
+const sameDir: ContextItem[] = [
+  { type: "file", source: "repo://src/auth/a.ts", summary: "auth a", relevance: 0.9 },
+  { type: "file", source: "repo://src/auth/b.ts", summary: "auth b", relevance: 0.88 },
+  { type: "file", source: "repo://src/auth/c.ts", summary: "auth c", relevance: 0.86 },
+  { type: "file", source: "repo://src/db/pool.ts", summary: "db pool", relevance: 0.5 },
+];
+const diversified = postProcessCandidates(sameDir, "review auth login implementation", "explicit", fixedNow);
+const thirdDirKey = diversified[2] ? parentDirKey(diversified[2].source) : "";
+assert("diversity: third slot comes from another directory", thirdDirKey.includes("db"));
+assert("diversity: overflow items are retained", diversified.length === 4);
 
 // ─── Report ───
 if (failed === 0) {
