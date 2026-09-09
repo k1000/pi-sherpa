@@ -16,6 +16,8 @@ import {
   isStickyGenericSnippet,
   permitsRootReadme,
   focusAllowsSurrealMemory,
+  isRuntimeLogSource,
+  focusAllowsRuntimeLogs,
 } from "./source-guards";
 
 type ContextItemLike = {
@@ -114,6 +116,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
+    if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) continue;
     if (item.type === "url_reference" && focusMentionsUrl(focus, item.source)) continue;
     const key = sourceDedupeKey(item.source);
     if (seen.has(key)) continue;

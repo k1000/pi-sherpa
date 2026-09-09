@@ -37,6 +37,22 @@ export function focusAllowsSurrealMemory(focus: string) {
   return /\b(memory|remember|archivist|note|notes|lesson|lessons|convention|conventions|pattern|patterns|knowledge|kb|graph|surrealdb)\b/i.test(focus);
 }
 
+/**
+ * Sherpa/Pi runtime logs: loop run logs, loop specs, and retrieval traces.
+ * They are diagnostic artifacts, not project context, and should only be
+ * injected when the prompt actually asks about logs/traces/metrics/loops.
+ */
+export function isRuntimeLogSource(source: string): boolean {
+  const s = source.replace(/\\/g, "/").toLowerCase();
+  return s.includes("/.pi/loops/")
+    || s.startsWith("repo://.pi/loops/")
+    || s.includes("/.pi-memory/sherpa-traces");
+}
+
+export function focusAllowsRuntimeLogs(focus: string) {
+  return /\b(logs?|trace|traces|tracing|metrics?|perf(?:ormance)?|dspy|bundle|bundles|persist(?:ed|ence)?|stored|storage|loops?|evaloop|eval_loop|specs?)\b/i.test(focus);
+}
+
 export function focusAllowsInquirerMemory(focus: string) {
   return /\b(memory|remember|convention|pattern|known\s+issue|lesson|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|context|retrieval|previous|earlier|history)\b/i.test(focus);
 }
