@@ -17,6 +17,8 @@ export const GLOBAL_NOISY_SOURCE_PATTERNS = [
   // their vendored extension trees. Never project context.
   /(?:^|\/)\.nvm\//i,
   /(?:^|\/)\.roo\//i,
+  // Foreign agent tooling state (Claude Code config/skills).
+  /(?:^|\/)\.claude\//i,
   /(?:^|\/)\.antigravity\//i,
   /(?:^|\/)\.mtplx\//i,
   /(?:^|\/)\.41d\//i,

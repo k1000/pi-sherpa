@@ -168,7 +168,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) continue;
-    if (item.type === "file_exact" && isBareDirectorySource(item.source)) continue;
+    if ((item.type === "file_exact" || item.type === "file" || item.type === "file_snippet") && isBareDirectorySource(item.source)) continue;
     if (isSherpaOwnConfigSource(item.source) && !focusAllowsSherpaConfig(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
     if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
