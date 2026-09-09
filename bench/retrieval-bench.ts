@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { addExplicitPathCandidates } from "../lib/exact-source";
 import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "../lib/file-candidates";
+import { addSembleCandidates } from "../lib/semble-candidates";
 import { postProcessCandidates } from "../lib/candidate-postprocess";
 
 type RetrievalCase = {
@@ -63,6 +64,8 @@ function labelExists(label: string): boolean {
   return existsSync(abs);
 }
 
+const SEMBLE_CONFIG = { enabled: true, command: "semble", topK: 8, timeoutMs: 5000 };
+
 async function retrieve(testCase: RetrievalCase): Promise<string[]> {
   const found: string[] = [];
   const add = (type: string, source: string) => { if (source) found.push(source); };
@@ -72,6 +75,7 @@ async function retrieve(testCase: RetrievalCase): Promise<string[]> {
   await addRoutedFileCandidates({ cwd: CWD }, testCase.focus, testCase.mode, sourcePlan, add as never);
   await addIndicatorFileCandidates({ cwd: CWD }, testCase.mode, sourcePlan, indicators, add as never);
   await retryFrontDoorFileCandidates({ cwd: CWD }, testCase.focus, testCase.mode, sourcePlan, [] as never, add as never, () => true);
+  await addSembleCandidates({ config: { semble: SEMBLE_CONFIG } }, { cwd: CWD }, testCase.focus, testCase.mode, sourcePlan, indicators, add as never);
   return found;
 }
 
