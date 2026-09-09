@@ -111,6 +111,8 @@ export function candidateSortKey(item: ContextItemLike, focus: string, mode: str
   return value;
 }
 
+const CODE_KIND_TYPES = new Set(["file", "pi_extension_file", "file_exact"]);
+
 /** Directory key for context diversity (last 4 path components). */
 export function parentDirKey(source: string): string {
   const p = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "");
@@ -205,18 +207,25 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     seen.add(key);
     out.push(item);
   }
-  // Context diversity: don't spend the whole top slots on one directory. Extras
-  // are kept but pushed behind candidates from other directories. Route stubs
-  // (directory pointers) are content-free, so they always rank last.
+  // Context diversity: don't spend the whole top slots on one directory or on one
+  // kind. Extras are kept but pushed behind candidates from other directories and
+  // kinds. Route stubs (directory pointers) are content-free, so they rank last.
   const primary: T[] = [];
   const overflow: T[] = [];
   const routeOverflow: T[] = [];
   const dirCounts = new Map<string, number>();
+  let codeKindCount = 0;
+  // Only diversify by kind when another kind is actually available; otherwise
+  // keep the directory-diversity order for all-code pools.
+  const hasNonCodeKind = out.some((item) => !CODE_KIND_TYPES.has(item.type) && item.type !== "pi_extension_route");
   for (const item of out) {
     if (item.type === "pi_extension_route") { routeOverflow.push(item); continue; }
     const dirKey = parentDirKey(item.source);
     const count = dirCounts.get(dirKey) ?? 0;
     if (count >= 2) { overflow.push(item); continue; }
+    const isCodeKind = CODE_KIND_TYPES.has(item.type);
+    if (hasNonCodeKind && isCodeKind && codeKindCount >= 2) { overflow.push(item); continue; }
+    if (isCodeKind) codeKindCount++;
     dirCounts.set(dirKey, count + 1);
     primary.push(item);
   }

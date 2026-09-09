@@ -278,6 +278,17 @@ const routeRanked = postProcessCandidates(routeCand, "review pi-sherpa context c
 assert("route stub ranks last behind content", routeRanked[routeRanked.length - 1]?.type === "pi_extension_route");
 assert("route stub is still retained", routeRanked.some((c) => c.type === "pi_extension_route"));
 
+// ─── 28. Kind diversity: code items cannot monopolize the top slots ───
+const kindCand: ContextItem[] = [
+  { type: "file", source: "repo://src/a.ts", summary: "a", relevance: 0.9 },
+  { type: "file", source: "repo://lib/b.ts", summary: "b", relevance: 0.88 },
+  { type: "file", source: "repo://pkg/c.ts", summary: "c", relevance: 0.86 },
+  { type: "doc_snippet", source: "repo://notes/design.md", summary: "design note", relevance: 0.3 },
+];
+const kindRanked = postProcessCandidates(kindCand, "implement login handler", "explicit", fixedNow);
+assert("kind diversity: a knowledge item enters the top 3", kindRanked.slice(0, 3).some((c) => c.type === "doc_snippet"));
+assert("kind diversity: overflow code items retained", kindRanked.length === 4);
+
 // ─── Report ───
 if (failed === 0) {
   console.log(`✅ All ${passed} ranking tests passed`);
