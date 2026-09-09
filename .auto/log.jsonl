@@ -1,0 +1,1 @@
+{"type":"config","name":"Sherpa deterministic selection quality (real-eval labels)","metricName":"label_loss","metricUnit":"","bestDirection":"lower"}
