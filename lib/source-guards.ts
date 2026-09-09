@@ -34,7 +34,9 @@ export function focusAllowsHistoricalMemory(focus: string) {
  * source-grounded context.
  */
 export function focusAllowsSurrealMemory(focus: string) {
-  return /\b(memory|remember|archivist|note|notes|lesson|lessons|convention|conventions|pattern|patterns|knowledge|kb|graph|surrealdb)\b/i.test(focus);
+  // 'memory' alone is too generic (Sherpa/memory-architecture prompts mention it),
+  // and surreal archivist notes are labeled noise 7x / missed 0x in the corpus.
+  return /\b(remember|archivist|note|notes|lesson|lessons|convention|conventions|pattern|patterns|knowledge|kb|graph|surrealdb)\b/i.test(focus);
 }
 
 /**
