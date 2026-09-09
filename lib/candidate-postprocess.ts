@@ -206,18 +206,21 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     out.push(item);
   }
   // Context diversity: don't spend the whole top slots on one directory. Extras
-  // are kept but pushed behind candidates from other directories.
+  // are kept but pushed behind candidates from other directories. Route stubs
+  // (directory pointers) are content-free, so they always rank last.
   const primary: T[] = [];
   const overflow: T[] = [];
+  const routeOverflow: T[] = [];
   const dirCounts = new Map<string, number>();
   for (const item of out) {
+    if (item.type === "pi_extension_route") { routeOverflow.push(item); continue; }
     const dirKey = parentDirKey(item.source);
     const count = dirCounts.get(dirKey) ?? 0;
     if (count >= 2) { overflow.push(item); continue; }
     dirCounts.set(dirKey, count + 1);
     primary.push(item);
   }
-  return [...primary, ...overflow];
+  return [...primary, ...overflow, ...routeOverflow];
 }
 
 /**

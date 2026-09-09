@@ -269,6 +269,15 @@ assert(
   postProcessCandidates(metadataCand, "fix the route table in routes.md", "front-door", fixedNow).some((c) => c.source.includes("routes.md")),
 );
 
+// ─── 27. Route stubs rank behind content-bearing candidates ───
+const routeCand: ContextItem[] = [
+  { type: "pi_extension_route", source: "repo://.pi/agent/extensions/pi-sherpa", summary: "extension route", relevance: 1 },
+  { type: "file", source: "repo://src/app.ts", summary: "app", relevance: 0.4 },
+];
+const routeRanked = postProcessCandidates(routeCand, "review pi-sherpa context curation quality", "explicit", fixedNow);
+assert("route stub ranks last behind content", routeRanked[routeRanked.length - 1]?.type === "pi_extension_route");
+assert("route stub is still retained", routeRanked.some((c) => c.type === "pi_extension_route"));
+
 // ─── Report ───
 if (failed === 0) {
   console.log(`✅ All ${passed} ranking tests passed`);
