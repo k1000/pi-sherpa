@@ -6,6 +6,7 @@
  * @sherpa-safe true
  */
 
+import { homedir } from "node:os";
 import { candidateSortKey, postProcessCandidates, parentDirKey, decayScore, frequencyScore, applyRecencyBoost } from "../lib/candidate-postprocess";
 
 type ContextItem = { type: string; source: string; summary: string; raw?: string; relevance: number; lastAccessedAt?: number; accessCount?: number };
@@ -292,6 +293,20 @@ const kindCand: ContextItem[] = [
 const kindRanked = postProcessCandidates(kindCand, "implement login handler", "explicit", fixedNow);
 assert("kind diversity: a knowledge item enters the top 3", kindRanked.slice(0, 3).some((c) => c.type === "doc_snippet"));
 assert("kind diversity: overflow code items retained", kindRanked.length === 4);
+
+// ─── 29. Home-root clutter is dropped unless the prompt names the file ───
+const homeRootCand: ContextItem[] = [
+  { type: "file", source: `repo://${homedir()}/stray-oneoff.sh`, summary: "stray script", relevance: 0.9 },
+  { type: "file", source: "repo://src/app.ts", summary: "app", relevance: 0.4 },
+];
+assert(
+  "home-root clutter excluded for unrelated prompts",
+  !postProcessCandidates(homeRootCand, "setup chromemcp", "front-door", fixedNow).some((c) => c.source.includes("stray-oneoff.sh")),
+);
+assert(
+  "home-root file kept when the prompt names it",
+  postProcessCandidates(homeRootCand, "debug stray-oneoff.sh failure", "front-door", fixedNow).some((c) => c.source.includes("stray-oneoff.sh")),
+);
 
 // ─── Report ───
 if (failed === 0) {

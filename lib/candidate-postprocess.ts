@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { focusAllowsGenericSource, genericSourceClass } from "./generic-source";
 import { isGloballyNoisySource } from "./noise-filter";
 import { computeLifecycleStage, type LifecycleStage } from "./lifecycle";
@@ -123,6 +124,20 @@ export function parentDirKey(source: string): string {
 }
 
 /**
+ * A file sitting directly in the user's home directory is container clutter, not
+ * project context (label census: 95 noise / 0 missed). Allowed when the prompt
+ * names the file, so explicit requests still work.
+ */
+function isHomeRootClutter(source: string, focus: string) {
+  const p = source.replace(/^repo:\/\//, "").replace(/^file:\/\//, "").replace(/:\d+(?::\d+)?$/, "");
+  const home = homedir();
+  if (!p.startsWith(`${home}/`)) return false;
+  const rel = p.slice(home.length + 1);
+  if (!rel || rel.includes("/")) return false;
+  return rel.length > 2 && !focus.toLowerCase().includes(rel.toLowerCase());
+}
+
+/**
  * True when a `file_exact` source points at a bare directory or filesystem root
  * with no filename. A directory listing is not usable context on its own.
  */
@@ -186,6 +201,7 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) continue;
     if ((item.type === "file_exact" || item.type === "file" || item.type === "file_snippet") && isBareDirectorySource(item.source)) continue;
+    if (isHomeRootClutter(item.source, focus)) continue;
     if (isSherpaOwnConfigSource(item.source) && !focusAllowsSherpaConfig(focus)) continue;
     if (isAgentMetadataIndex(item.source) && !focusAllowsAgentMetadata(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) continue;
