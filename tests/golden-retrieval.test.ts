@@ -76,6 +76,9 @@ test("golden: explicit skill prompts may include skill docs, ordinary code promp
   const skill = candidate({ type: "doc_snippet", source: "file://~/.pi/agent/skills/use-sherpa/SKILL.md", relevance: 0.8, summary: "Use Sherpa before non-trivial tasks" });
   assertExcludesAny(sourcesFor("fix source planning in index.ts", [skill]), "/.pi/agent/skills/");
   assertIncludesAny(sourcesFor("review the use-sherpa skill instructions", [skill]), "/.pi/agent/skills/");
+  // Non-instruction files in a skill directory are ordinary knowledge, not skill intent.
+  const lessons = candidate({ type: "doc_snippet", source: "repo://.pi/agent/skills/m5sticks3/LESSONS.md", relevance: 0.8, summary: "Ollama GPU timeout lessons" });
+  assertIncludesAny(sourcesFor("fix ollama gpu timeout on macOS", [lessons]), "LESSONS.md");
 });
 
 test("golden: pi-sherpa prompt routes to extension code instead of unrelated research memory", () => {

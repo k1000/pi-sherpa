@@ -4,7 +4,10 @@ export function genericSourceClass(source: string): GenericSourceClass | undefin
   const normalized = source.replace(/\\/g, "/").toLowerCase();
   if (normalized.includes("docs/mission_prompt.md") || normalized.includes("docs/missions.md")) return "mission";
   if (normalized.includes("documentation-drift") || normalized.includes("archivist_actionable_solutions.md") || normalized.includes("archivist-sherpa-gap-analysis")) return "archivist";
-  if (normalized.includes("/.pi/agent/skills/")) return "skill";
+  // Only SKILL.md is the agent's operating instruction for a skill and therefore
+  // needs skill intent. Other files in a skill directory (LESSONS.md, references)
+  // are ordinary knowledge: label census shows they are missed 3x / noise 0x.
+  if (/(?:^|\/)\.pi\/agent\/skills\/[^/]+\/skill\.md(?::\d+)?$/i.test(normalized)) return "skill";
   if (normalized === "repo://readme.md" || normalized.endsWith("/readme.md") || normalized.includes("/readme.md:")) return "readme";
   return undefined;
 }
