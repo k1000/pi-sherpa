@@ -15,6 +15,7 @@ import {
   isRootReadmeSource,
   isStickyGenericSnippet,
   permitsRootReadme,
+  focusAllowsSurrealMemory,
 } from "./source-guards";
 
 type ContextItemLike = {
@@ -39,6 +40,15 @@ export function sourceCorrespondenceThreshold(focus: string, mode: string) {
 export function sourceDedupeKey(source: string) {
   if (source.startsWith("repo://README.md")) return "repo://README.md";
   return source.replace(/:\d+(?::\d+)?$/, "");
+}
+
+/**
+ * True when a URL candidate merely echoes a URL the user already typed in the
+ * prompt. Re-emitting it as retrieved context adds no information.
+ */
+export function focusMentionsUrl(focus: string, source: string) {
+  const url = source.trim().replace(/\/+$/, "");
+  return url.length > 8 && (focus.includes(url) || focus.includes(`${url}/`));
 }
 
 export function candidateSortKey(item: ContextItemLike, focus: string, mode: string, now?: number) {
@@ -103,6 +113,8 @@ export function postProcessCandidates<T extends ContextItemLike>(candidates: T[]
     if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) continue;
     if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) continue;
     if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource) continue;
+    if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) continue;
+    if (item.type === "url_reference" && focusMentionsUrl(focus, item.source)) continue;
     const key = sourceDedupeKey(item.source);
     if (seen.has(key)) continue;
     if (isRootReadmeSource(item.source)) {

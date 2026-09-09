@@ -26,6 +26,15 @@ export function focusAllowsHistoricalMemory(focus: string) {
   return /\b(previous|earlier|history|historical|journal|timeline|session|last time|recent session|past session|what happened|we discussed)\b/i.test(focus);
 }
 
+/**
+ * SurrealDB archivist notes are durable-memory artifacts. They are only useful
+ * when the prompt is actually about memory/knowledge; otherwise they crowd out
+ * source-grounded context.
+ */
+export function focusAllowsSurrealMemory(focus: string) {
+  return /\b(memory|remember|archivist|note|notes|lesson|lessons|convention|conventions|pattern|patterns|knowledge|kb|graph|surrealdb)\b/i.test(focus);
+}
+
 export function focusAllowsInquirerMemory(focus: string) {
   return /\b(memory|remember|convention|pattern|known\s+issue|lesson|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|context|retrieval|previous|earlier|history)\b/i.test(focus);
 }
