@@ -183,6 +183,29 @@ function projectMemoryMatchesFocus(item: ContextItemLike, focus: string) {
   return terms.some((term) => haystack.includes(term));
 }
 
+export function allCandidatesCategoricallyExcluded(candidates: ContextItemLike[], focus: string) {
+  if (!candidates.length) return false;
+  const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
+  return candidates.every((item) => {
+    if (isGloballyNoisySource(item.source)) return true;
+    if (genericSourceClass(item.source) && !focusAllowsGenericSource(item.source, focus)) return true;
+    if (item.type === "git_status" && !focusAllowsGitStatus(focus)) return true;
+    if (item.type === "research_memory" && !focusAllowsResearchMemory(focus)) return true;
+    if (item.type === "inquirer_memory" && !focusAllowsInquirerMemory(focus)) return true;
+    if (isHistoricalMemorySource(item) && !focusAllowsHistoricalMemory(focus)) return true;
+    if (item.type === "project_memory" && !projectMemoryMatchesFocus(item, focus)) return true;
+    if ((item.type === "file_exact" || item.type === "file" || item.type === "file_snippet") && isBareDirectorySource(item.source)) return true;
+    if (isHomeRootClutter(item.source, focus)) return true;
+    if (isSherpaOwnConfigSource(item.source) && !focusAllowsSherpaConfig(focus)) return true;
+    if (isAgentMetadataIndex(item.source) && !focusAllowsAgentMetadata(focus)) return true;
+    if (isPackageManifestSource(item.source) && !focusAllowsPackageManifest(focus) && wantsSource && !focusMentionsPackageDir(focus, item.source)) return true;
+    if (item.type === "surreal_memory" && !focusAllowsSurrealMemory(focus)) return true;
+    if (isRuntimeLogSource(item.source) && !focusAllowsRuntimeLogs(focus)) return true;
+    if (isSherpaTraceSource(item.source) && !focusAllowsSherpaTraces(focus)) return true;
+    return item.type === "url_reference" && focusMentionsUrl(focus, item.source);
+  });
+}
+
 export function postProcessCandidates<T extends ContextItemLike>(candidates: T[], focus: string, mode: string, now?: number): T[] {
   const wantsSource = isCodePrompt(focus) || isSourceLookupPrompt(focus);
   const _now = now ?? Date.now();

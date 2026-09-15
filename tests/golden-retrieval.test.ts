@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { conciseSummary, extractQueryTarget, heuristicSourcePlan, isPiSherpaMetaDebugPrompt, isTraceLogMetricsPrompt, parseCompiledContextItems, postProcessCandidates, resolveModelFilterPool } from "../index";
+import { allCandidatesCategoricallyExcluded } from "../lib/candidate-postprocess";
 import { addInquirerCandidates } from "../lib/basic-candidate-sources";
 import { contextCompilerMessage } from "../lib/context-compiler";
 import { readSnippetAround } from "../lib/file-snippet";
@@ -140,6 +141,16 @@ test("golden: sidecar model filters candidates even when the deterministic prefi
 
   // only a truly empty search (zero raw candidates) bypasses the model
   assert.equal(resolveModelFilterPool([], []), undefined);
+});
+
+test("golden: categorically excluded candidates bypass model curation safely", () => {
+  const prompt = "fix source planning";
+  const excluded = [
+    candidate({ type: "git_status", source: "git://status", relevance: 0.9, summary: " M README.md" }),
+    candidate({ type: "research_memory", source: "kb://research/old.md", relevance: 0.8, summary: "unrelated research" }),
+  ];
+  assert.equal(allCandidatesCategoricallyExcluded(excluded, prompt), true);
+  assert.equal(allCandidatesCategoricallyExcluded([...excluded, candidate({ type: "file", source: "repo://lib/source-planning.ts:1", relevance: 0.01, summary: "weak hit" })], prompt), false, "a potentially relevant file must remain model-filtered");
 });
 
 test("golden: query target extraction identifies action, targets, and evidence type", () => {

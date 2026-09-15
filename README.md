@@ -46,6 +46,10 @@ Archivist owns:
 
 Sherpa uses a dedicated sidecar model unless `useMainPiModel` is explicitly enabled in `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`. This installation's global Sherpa config uses `deepseek/deepseek-v4-flash` so Sherpa stays aligned with Archivist while remaining separate from the main Pi model.
 
+## Timing metrics
+
+When `debug.timing.enabled` is set, `/sherpa:timing` summarizes the most recent 200KB of sampled JSONL events by action (count, p50, p95, and max). The report is sampled: events below `debug.timing.thresholdMs` are intentionally not logged.
+
 ## Verification
 
 Run the extension-local check script after prompt, memory, routing, automation, or lifecycle changes:

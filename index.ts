@@ -1,6 +1,6 @@
 import type { UserMessage } from "@mariozechner/pi-ai";
 import { addDocCandidates, addInquirerCandidates, addSessionCandidates, addUrlReferences } from "./lib/basic-candidate-sources";
-import { candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
+import { allCandidatesCategoricallyExcluded, candidateSortKey, postProcessCandidates } from "./lib/candidate-postprocess";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import {
@@ -72,6 +72,7 @@ import { indexSessionLog, searchSessions, loadSession, listSessions, getIndexedE
 import type { SessionSearchMatch } from "./lib/session-search";
 import { writeNudge } from "./lib/nudge";
 import type { NudgeTarget } from "./lib/nudge";
+import { formatTimingReport, parseTimingRecords } from "./lib/timing-metrics";
 import { ensureRouteMap } from "./lib/route-map";
 import { addSembleCandidates } from "./lib/semble-candidates";
 import { parseRgOutput, rg } from "./lib/rg";
@@ -397,14 +398,33 @@ const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
 
+function timingLogPath(timing: SherpaConfig["debug"]["timing"], cwd: string) {
+  const configured = timing.logPath || ".pi/sherpa/timing.jsonl";
+  return path.isAbsolute(configured) ? configured : path.join(cwd, configured);
+}
+
+function readTimingLogTail(target: string, maxBytes = 200_000) {
+  if (!existsSync(target)) return "";
+  const size = statSync(target).size;
+  if (size <= maxBytes) return readFileSync(target, "utf8");
+  const buffer = Buffer.alloc(maxBytes);
+  const fd = openSync(target, "r");
+  try {
+    readSync(fd, buffer, 0, maxBytes, size - maxBytes);
+    const tail = buffer.toString("utf8");
+    return tail.slice(tail.indexOf("\n") + 1);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function logSherpaTiming(state: State | undefined, ctx: ExtensionContext, action: string, startedAt: number, details: Record<string, unknown> = {}) {
   try {
     const timing = state?.config.debug?.timing;
     if (!timing?.enabled) return;
     const durationMs = Date.now() - startedAt;
     if (durationMs < Math.max(0, timing.thresholdMs ?? 0)) return;
-    const configured = timing.logPath || ".pi/sherpa/timing.jsonl";
-    const target = path.isAbsolute(configured) ? configured : path.join(ctx.cwd, configured);
+    const target = timingLogPath(timing, ctx.cwd);
     mkdirSync(path.dirname(target), { recursive: true });
     appendFileSync(target, JSON.stringify({ at: new Date().toISOString(), action, durationMs, ...details }) + "\n");
     if (ctx.hasUI && durationMs >= Math.max(0, timing.notifyThresholdMs ?? 2000)) {
@@ -547,7 +567,11 @@ export function resolveModelFilterPool(filteredPool: ContextItem[], candidates: 
 }
 
 async function compileContextWithModel(state: State, ctx: ExtensionContext, focus: string, mode: string, candidates: ContextItem[]): Promise<CurateResult> {
-  const pool = resolveModelFilterPool(postProcessCandidates(candidates, focus, mode).slice(0, 12), candidates);
+  const filteredCandidates = postProcessCandidates(candidates, focus, mode).slice(0, 12);
+  if (!filteredCandidates.length && allCandidatesCategoricallyExcluded(candidates, focus)) {
+    return { items: [], abstain: true, abstainReason: "all candidates rejected by deterministic source guardrails", rejected: [], confidence: 0.95, planner: "heuristic", plannerReason: "categorically irrelevant candidates bypassed model curation" };
+  }
+  const pool = resolveModelFilterPool(filteredCandidates, candidates);
   if (!pool) return { items: [], abstain: true, abstainReason: "no candidates found by any source", rejected: [], confidence: 0.3, planner: "heuristic", plannerReason: "empty search — no candidates for the sidecar model to filter" };
 
   const fallback = () => {
@@ -1652,6 +1676,12 @@ export default function (pi: ExtensionAPI) {
     const automations = discoverRunnableAutomations(ctx.cwd);
     const lines = automations.map(a => `- ${formatRunnableAutomation(a, state?.automation.runStats[a.name])}`).slice(0, 80);
     ctx.ui.notify(lines.length ? lines.join("\n") : "No project automations discovered", "info");
+  }});
+
+  pi.registerCommand("sherpa:timing", { description: "Show recent sampled Sherpa timing metrics", handler: async (_args, ctx) => {
+    const timing = (state?.config ?? loadConfig(ctx.cwd)).debug.timing;
+    const records = parseTimingRecords(readTimingLogTail(timingLogPath(timing, ctx.cwd)));
+    ctx.ui.notify(formatTimingReport(records, timing.thresholdMs), "info");
   }});
 
   pi.on("before_agent_start", async (event, ctx) => {
