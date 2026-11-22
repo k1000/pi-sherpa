@@ -55,6 +55,7 @@ import { retrievalEnabled } from "./lib/source-activation";
 import { focusAllowsGitStatus, focusAllowsHistoricalMemory, focusAllowsInquirerMemory, focusAllowsPackageManifest, focusAllowsResearchMemory, isGenericNoiseSource, isHistoricalMemorySource, isPackageManifestSource, isRootReadmeSource, isStickyGenericSnippet, permitsRootReadme } from "./lib/source-guards";
 import { extractJsonArray, extractJsonObject } from "./lib/json-utils";
 import { collectRecentTaskFileEvidence, extractMentionedRepoFiles } from "./lib/repo-file-evidence";
+import { pruneShadowTaskEpisodes, writeShadowTaskEpisode } from "./lib/shadow-task-episodes";
 import { conciseSummary, isSlashCommandPrompt, isTrivial } from "./lib/text-utils";
 import { safeNotify, toolErrorResult } from "./lib/tool-results";
 import type { ContextSignalV1, SuggestedCommand } from "./lib/context-types";
@@ -394,6 +395,7 @@ const FRONT_DOOR_QUALITY_TIMEOUT_MS = 8_000;
 const SOURCE_PLANNER_TIMEOUT_MS = 12_000;
 const FRONT_DOOR_SOURCE_TIMEOUT_MS = 6_000;
 const EXPLICIT_SOURCE_TIMEOUT_MS = 12_000;
+const EXPLICIT_RETRIEVAL_TIMEOUT_MS = 18_000;
 const DSPY_COMPILE_MIN_EVALUATIONS = 10;
 const DSPY_COMPILE_MIN_AVG_METRIC = 0.65;
 const DSPY_COMPILE_MIN_HIGH_EXAMPLES = 3;
@@ -746,15 +748,20 @@ export function retrievalTimeoutMs(mode: string) {
 }
 
 export async function withRetrievalTimeout<T>(label: string, task: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       task,
-      timeoutAfter<T>(timeoutMs, `${label} timed out after ${timeoutMs}ms`),
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
     ]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[sherpa] retrieval source skipped: ${message}`);
     return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -762,29 +769,39 @@ function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, add: AddContextItem, enabled: (s: Source) => boolean, onSource?: (label: string) => void): Promise<void>[] {
-  const tasks: Promise<void>[] = [];
+type RetrievalBatch = Array<Parameters<AddContextItem>>;
+
+export async function withRetrievalBatch(label: string, task: (add: AddContextItem) => Promise<unknown> | unknown, timeoutMs: number): Promise<RetrievalBatch> {
+  const batch: RetrievalBatch = [];
+  const result = await withRetrievalTimeout(label, (async () => {
+    // Defer synchronous source scans so the UI can paint and async sources start together.
+    await yieldToUi();
+    await task((...candidate) => { batch.push(candidate); });
+    return batch.slice();
+  })(), timeoutMs);
+  // Late results after a timeout can only mutate the private batch, never the merge.
+  return result ?? [];
+}
+
+function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: string, mode: string, sourcePlan: SourcePlan, indicators: SearchIndicators, options: { searchOtherProjects?: boolean; includeTaxonomy?: boolean }, enabled: (s: Source) => boolean, onSource?: (label: string) => void): Promise<RetrievalBatch>[] {
+  const tasks: Promise<RetrievalBatch>[] = [];
   const timeoutMs = retrievalTimeoutMs(mode);
-  const push = (label: string, task: () => Promise<unknown> | unknown) => {
-    tasks.push(withRetrievalTimeout(label, (async () => {
+  const push = (label: string, task: (add: AddContextItem) => Promise<unknown> | unknown) => {
+    tasks.push(withRetrievalBatch(label, (sourceAdd) => {
       onSource?.(label);
-      // Many candidate sources do synchronous file/index scanning before their first
-      // await. Defer source start so Sherpa's status widget can paint between phases
-      // instead of making Pi look frozen during long retrieval bursts.
-      await yieldToUi();
-      return task();
-    })(), timeoutMs).then(() => undefined));
+      return task(sourceAdd);
+    }, timeoutMs));
   };
-  if (enabled("files")) push("files", () => addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
-  if (enabled("semble") && state.config.semble?.enabled) push("semble", () => addSembleCandidates(state, ctx, focus, mode, sourcePlan, indicators, add));
-  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) push("graphify", async () => {
+  if (enabled("files")) push("files", (add) => addFileCandidates(ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("semble") && state.config.semble?.enabled) push("semble", (add) => addSembleCandidates(state, ctx, focus, mode, sourcePlan, indicators, add));
+  if (enabled("graphify") && state.config.graphify?.enabled && graphifyAllowedForQuery(focus)) push("graphify", async (add) => {
     const raw = await searchGraphify(ctx.cwd, focus, state.config.graphify);
     if (raw) add("graphify_code_graph", `graphify://${path.relative(ctx.cwd, graphifyGraphPath(ctx.cwd, state.config.graphify)) || state.config.graphify.graphPath}`, raw, 0.32);
   });
-  if (enabled("docs")) push("docs", () => addDocCandidates(ctx, mode, sourcePlan, indicators, add));
-  if (enabled("git") && focusAllowsGitStatus(focus)) push("git", async () => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05));
-  if (enabled("web")) push("web", async () => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); });
-  if (enabled("project_memory")) push("project_memory", () => addProjectMemoryCandidates(
+  if (enabled("docs")) push("docs", (add) => addDocCandidates(ctx, mode, sourcePlan, indicators, add));
+  if (enabled("git") && focusAllowsGitStatus(focus)) push("git", async (add) => add("git_status", "git://status", await gitChanged(ctx.cwd), 0.05));
+  if (enabled("web")) push("web", async (add) => { for (const r of await searchWebForState(ctx.cwd, state, focus, DEFAULT_CONFIG.web.cacheTtlMs)) add("web_snippet", r.url, `${r.title}\n${r.snippet}`, 0.25); });
+  if (enabled("project_memory")) push("project_memory", (add) => addProjectMemoryCandidates(
     obsidianMemoryPath(state),
     obsidianVaultPath(state),
     focus,
@@ -792,13 +809,13 @@ function collectRetrievalTasks(state: State, ctx: ExtensionContext, focus: strin
     options,
     add,
   ));
-  if (enabled("session")) push("session", () => addSessionCandidates(ctx, add));
-  if (enabled("project_memory")) push("memory_index", () => addMemoryIndexCandidates(ctx, focus, indicators, {
+  if (enabled("session")) push("session", (add) => addSessionCandidates(ctx, add));
+  if (enabled("project_memory")) push("memory_index", (add) => addMemoryIndexCandidates(ctx, focus, indicators, {
     scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
     catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
     evaluationRoot: obsidianMemoryPath(state),
   }, add));
-  if (enabled("inquirer") && focusAllowsInquirerMemory(focus)) push("inquirer", () => addInquirerCandidates(state.config.inquirer, focus, add));
+  if (enabled("inquirer") && focusAllowsInquirerMemory(focus)) push("inquirer", (add) => addInquirerCandidates(state.config.inquirer, focus, add));
   return tasks;
 }
 
@@ -809,9 +826,11 @@ async function buildBundle(state: State, ctx: ExtensionContext, focus: string, m
 
   addUrlReferences(state, focus, add);
   await timedSherpa(state, ctx, `buildBundle.collectRetrievalTasks.${mode}`, async () => {
-    await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, add, enabled, (label) => {
-      options.onProgress?.(`searching ${label}`, `Candidates so far: ${candidates.length}`);
+    const results = await Promise.allSettled(collectRetrievalTasks(state, ctx, focus, mode, sourcePlan, indicators, options, enabled, (label) => {
+      options.onProgress?.(`searching ${label}`, "Collecting sources in parallel");
     }));
+    // Combine only settled sources, in source order, before ranking/curation.
+    for (const result of results) if (result.status === "fulfilled") for (const candidate of result.value) add(...candidate);
   }, { focus: focus.slice(0, 160), sources: sourcePlan.sources });
   options.onProgress?.("retrying file search", `Candidates so far: ${candidates.length}`);
   await timedSherpa(state, ctx, `buildBundle.retryFrontDoorFileCandidates.${mode}`, async () => {
@@ -966,6 +985,37 @@ export default function (pi: ExtensionAPI) {
         else setSherpaStatus(ctx);
       },
     };
+  };
+
+  const runExplicitRetrieval = async (
+    ctx: ExtensionContext,
+    focus: string,
+    tokenBudget: number,
+    options: {
+      sources?: string[];
+      searchOtherProjects?: boolean;
+      includeTaxonomy?: boolean;
+      onPlan?: (sourcePlan: SourcePlan, indicators: SearchIndicators) => void;
+      onProgress?: (phase: string, detail?: string) => void;
+    } = {},
+  ): Promise<{ sourcePlan: SourcePlan; indicators: SearchIndicators; bundle: ContextBundle }> => {
+    const currentState = state!;
+    return Promise.race([
+      (async () => {
+        const { sourcePlan, indicators } = await planSources(currentState, ctx, focus, "explicit", options.sources);
+        options.onPlan?.(sourcePlan, indicators);
+        const bundle = await buildBundle(currentState, ctx, focus, "explicit", tokenBudget, sourcePlan, indicators, {
+          searchOtherProjects: options.searchOtherProjects,
+          includeTaxonomy: options.includeTaxonomy,
+          onProgress: options.onProgress,
+        });
+        return { sourcePlan, indicators, bundle };
+      })(),
+      timeoutAfter<{ sourcePlan: SourcePlan; indicators: SearchIndicators; bundle: ContextBundle }>(
+        EXPLICIT_RETRIEVAL_TIMEOUT_MS,
+        `explicit retrieval timed out after ${EXPLICIT_RETRIEVAL_TIMEOUT_MS}ms`,
+      ),
+    ]);
   };
 
   const compileDspyCandidate = async (ctx: ExtensionContext, reason: string, notify: boolean, options: { force?: boolean } = {}) => {
@@ -1382,6 +1432,9 @@ export default function (pi: ExtensionAPI) {
             finalText: recentText.slice(-2000),
           });
 
+          // Local-only, bounded evidence before any reflection/preservation decision.
+          writeShadowTaskEpisode({ bundle, evaluation: deterministicEval, files: { ...evidence, referencedFiles, changedFiles }, cwd, messages: recentMessages });
+
           // Defer model reflection to background worker.
           runBackgroundTaskReflection(stateObj, ctx, cwd, bundle, deterministicEval, outcome, evidence, referencedFiles, changedFiles, recentText, recentMessages);
         }
@@ -1400,6 +1453,7 @@ export default function (pi: ExtensionAPI) {
     currentTurnIsSlashCommand = false;
     try {
       if (!state.config.enabled) return;
+      try { pruneShadowTaskEpisodes(); } catch { /* shadow retention must not disrupt session startup */ }
       getProjectKBBasedir(ctx.cwd);
       ensureRouteMap(state.config.routeMap, ctx.cwd);
       ctx.ui.setStatus(SHERPA_LEGACY_UI_KEY, undefined);
@@ -1447,19 +1501,27 @@ export default function (pi: ExtensionAPI) {
     } catch { /* session indexing is best-effort */ }
   };
 
+  const indexMemoryAfterShutdown = (ctx: ExtensionContext) => {
+    const workerScript = path.join(path.dirname(__filename), "scripts", "background-memory-indexer.ts");
+    const config = JSON.stringify({
+      scratchpadRoot: scratchpadRootPath(state!, ctx.cwd),
+      catalogRoots: [ctx.cwd, obsidianMemoryPath(state!)],
+      evaluationRoot: obsidianMemoryPath(state!),
+    });
+    try {
+      const worker = spawn("bun", ["run", workerScript, ctx.cwd, config], { cwd: ctx.cwd, detached: true, stdio: "ignore" });
+      worker.on("error", () => {});
+      worker.unref();
+    } catch { /* memory indexing is best-effort during shutdown */ }
+  };
+
   pi.on("session_shutdown", (_event, ctx) => {
     if (state?.config.enabled) {
       if (state.config.sources.session) indexSessionsAfterShutdown(ctx.cwd);
-      void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {});
-      // Keep retrieval read-only during a session; refresh the local FTS index only
-      // after work is complete so it cannot delay a prompt or tool result.
-      try {
-        indexSherpaMemory(ctx.cwd, {
-          scratchpadRoot: scratchpadRootPath(state, ctx.cwd),
-          catalogRoots: [ctx.cwd, obsidianMemoryPath(state)],
-          evaluationRoot: obsidianMemoryPath(state),
-        });
-      } catch { /* memory indexing is best-effort during shutdown */ }
+      // Defer synchronous preflight in the auto-compile path until after Pi has
+      // released the TUI; it is not part of a session's shutdown contract.
+      setTimeout(() => { void maybeAutoCompileDspy(ctx, "session_shutdown").catch(() => {}); }, 0);
+      indexMemoryAfterShutdown(ctx);
     }
     closeSessionDb();
     closeSherpaMemoryIndexes();
@@ -1685,6 +1747,13 @@ export default function (pi: ExtensionAPI) {
   }});
 
   pi.on("before_agent_start", async (event, ctx) => {
+    currentTurnIsSlashCommand = false;
+    // Custom-message turns (including /sherpa results) have no user prompt.
+    if (!("prompt" in event) || typeof event.prompt !== "string") return;
+
+    // Honor configuration changes immediately; otherwise a disabled front door
+    // remains active until a manual reload and can keep blocking new prompts.
+    if (state) state.config = loadConfig(ctx.cwd);
     const startedAt = Date.now();
     let outcome = "skipped";
     try {
@@ -1789,12 +1858,16 @@ export default function (pi: ExtensionAPI) {
         const _state = state; // capture at function scope to avoid TDZ issues
         const expanded = (params.expandHandles ?? []).map(h => _state.handles.get(h)).filter(Boolean) as ContextItem[];
         sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
-        const { sourcePlan, indicators } = await timedSherpa(_state, ctx, "tool.sherpa_request_context.planSources", () => planSources(_state, ctx, params.focus, "explicit", params.sources), { focus: params.focus.slice(0, 160), sources: params.sources });
-        sherpaUi.update(
-          `searching ${sourcePlan.sources.join(", ")}`,
-          `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
-        );
-        const bundle = await timedSherpa(_state, ctx, "tool.sherpa_request_context.buildBundle", () => buildBundle(_state, ctx, params.focus, "explicit", params.tokenBudget ?? _state.config.explicit.tokenBudget, sourcePlan, indicators, { searchOtherProjects: params.searchOtherProjects, includeTaxonomy: params.includeTaxonomy, onProgress: (phase, detail) => sherpaUi.update(phase, detail) }), { focus: params.focus.slice(0, 160), sources: sourcePlan.sources });
+        const { bundle } = await runExplicitRetrieval(ctx, params.focus, params.tokenBudget ?? _state.config.explicit.tokenBudget, {
+          sources: params.sources,
+          searchOtherProjects: params.searchOtherProjects,
+          includeTaxonomy: params.includeTaxonomy,
+          onPlan: (sourcePlan, indicators) => sherpaUi.update(
+            `searching ${sourcePlan.sources.join(", ")}`,
+            `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+          ),
+          onProgress: (phase, detail) => sherpaUi.update(phase, detail),
+        });
         sherpaUi.update("formatting context", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
         void maybeAutoCompileDspy(ctx, "bundle");
         const extra = expanded.map(i => `\n\n## Expanded ${i.handle}\nSource: ${i.source}\n\n${(i.raw ?? i.summary).slice(0, (params.tokenBudget ?? 3000) * 4)}`).join("");
@@ -1918,12 +1991,13 @@ export default function (pi: ExtensionAPI) {
       // User-invoked /sherpa should behave like an intervention: inject the context and wake the
       // main agent. Source planning chooses the likely stores before expensive retrieval.
       sherpaUi.update("planning sources", "Choosing memory/files/docs/git sources.");
-      const { sourcePlan, indicators } = await timedSherpa(state, ctx, "command.sherpa.planSources", () => planSources(state!, ctx, focus, "explicit"), { focus: focus.slice(0, 160) });
-      sherpaUi.update(
-        `searching ${sourcePlan.sources.join(", ")}`,
-        `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
-      );
-      const bundle = await timedSherpa(state, ctx, "command.sherpa.buildBundle", () => buildBundle(state!, ctx, focus, "explicit", state!.config.explicit.tokenBudget, sourcePlan, indicators), { focus: focus.slice(0, 160), sources: sourcePlan.sources });
+      const { bundle } = await runExplicitRetrieval(ctx, focus, state!.config.explicit.tokenBudget, {
+        onPlan: (sourcePlan, indicators) => sherpaUi.update(
+          `searching ${sourcePlan.sources.join(", ")}`,
+          `Planner: ${sourcePlan.planner}; indicators: ${indicators.indicators.slice(0, 5).join(", ") || "none"}`,
+        ),
+        onProgress: (phase, detail) => sherpaUi.update(phase, detail),
+      });
       sherpaUi.update("curating results", `Candidates: ${bundle.candidateCount ?? bundle.items.length}; selected: ${bundle.items.length}`);
       bundle.items = filterAlreadySeenSources(ctx, bundle.items, state);
       void maybeAutoCompileDspy(ctx, "bundle");
@@ -1939,6 +2013,9 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Sherpa found ${bundle.items.length} useful items; triggering agent`, "info");
       pi.sendMessage({ customType: "sherpa-context", content: bundleMarkdown(bundle), display: true, details: bundle }, { triggerTurn: true, deliverAs: "steer" });
       persist();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Sherpa context skipped: ${message}`, "warning");
     } finally {
       sherpaUi.done();
       logSherpaTiming(state, ctx, "command.sherpa.total", commandTiming, { focus: focus.slice(0, 160) });

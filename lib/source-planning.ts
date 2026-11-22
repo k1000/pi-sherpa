@@ -20,6 +20,26 @@ type SourceStateLike = { config: { sources: Record<string, boolean> } };
 export type SearchIndicators = { indicators: string[]; reason: string; confidence: number; planner: "heuristic" | "llm" };
 
 const ALL_RETRIEVAL_SOURCES: Source[] = ["files", "semble", "graphify", "docs", "git", "session", "project_memory", "inquirer", "web"];
+// These phrases name public product knowledge even when the user omits "web".
+// They add web; only an explicit internet-only request removes local sources.
+const IMPLICIT_EXTERNAL_INTENT = /\b(official\s+(?:docs?|documentation|website|site)|provider\s+evidence|public\s+pricing|pricing\s+(?:for|of)|list\s+of\s+models|models?\s+supported\s+by|supported\s+by\s+\S+)\b/i;
+
+function constrainExplicitSources(focus: string, sources: Source[]): Source[] {
+  const f = focus.toLowerCase();
+  // Public-catalog and official-provider requests, like explicit web searches,
+  // are not permission to search local context. Comparisons need both kinds of evidence.
+  if ((/\b(internet|the web|web search|online)\b/.test(f) || IMPLICIT_EXTERNAL_INTENT.test(f))
+    && !/\b(compare|versus|vs\.?|against|our|local|this repo|in the repo)\b/.test(f)) return ["web"];
+
+  if (/\b(search|find|look up|retrieve|recall|remember|saved|stored|what did)\b/.test(f)
+    && !/\b(fix|debug|test|implement|refactor|code|repo|repository|file|function|module|implementation)\b/.test(f)) {
+    const oracle = /\binquirer\b|api\.enquirer\.app/.test(f);
+    const local = /\b(project memory|scratchpad|obsidian|local memory)\b/.test(f);
+    if (oracle && !local) return ["inquirer"];
+    if (local && !oracle) return ["project_memory"];
+  }
+  return sources;
+}
 
 export function normalizeSources(input: string[] | undefined, mode: string): Source[] {
   const allowed = new Set<Source>(mode === "front-door"
@@ -44,16 +64,19 @@ const SHERPA_STOP_WORDS = new Set([
 export function extractSearchTerms(query: string, max = 12): string[] {
   const raw = query.match(/[A-Za-z0-9_./-]{4,}/g) ?? [];
   const seen = new Set<string>();
-  const terms: string[] = [];
+  // Identifier-like tokens (camelCase, snake_case, dotted, paths, digits) are far
+  // more discriminative for code search than plain prose words, so they go first.
+  const identifierLike: string[] = [];
+  const words: string[] = [];
   for (const t of raw) {
     const lower = t.toLowerCase();
     if (SHERPA_STOP_WORDS.has(lower)) continue;
     if (seen.has(lower)) continue;
     seen.add(lower);
-    terms.push(t);
-    if (terms.length >= max) break;
+    const isIdentifier = /[A-Z]/.test(t.slice(1)) || /[._/]/.test(t) || /\d/.test(t);
+    (isIdentifier ? identifierLike : words).push(t);
   }
-  return terms;
+  return [...identifierLike, ...words].slice(0, max);
 }
 
 // Fallback: extract search terms the same way the old pipeline used.
@@ -68,17 +91,19 @@ export function heuristicSourcePlan(focus: string, mode: string): SourcePlan {
   const add = (...ss: Source[]) => { for (const s of ss) if (!sources.includes(s)) sources.push(s); };
 
   if (/\b(fix|bug|implement|refactor|test|typecheck|lint|compile|failing|error|exception|stack|function|class|api|route|service|schema|repository|component|module)\b/.test(f)) add("files", "semble");
-  if (/\b(doc|docs|readme|guide|explain|overview|architecture|design|how\s+to|reference|manual)\b/.test(f)) add("docs");
+  if (/\b(doc|docs|documentation|readme|guide|explain|overview|architecture|design|how\s+to|reference|manual)\b/.test(f)) add("docs");
   if (/\b(architecture|architectural|topology|call path|calls?|dependencies|dependency|relationship|relationships|connects?|connected|concept|conceptual|flow|flows|lifecycle|pipeline|boundary|boundaries|system|design|domain|integration|interactions?|how\s+.+\s+fits|end-to-end|e2e)\b/.test(f)) add("files", "semble", "graphify", "docs", "project_memory", "inquirer");
   if (/\b(git|diff|changed|changes|status|staged|unstaged|commit|branch|recent)\b/.test(f)) add("git");
   if (/\b(sherpa|performance|health|trace|traces|retrieval|evaluation|evaluations|quality|useful|usefull|working|correctly|corectly)\b/.test(f)) add("docs", "project_memory", "inquirer", "files");
   if (isTraceLogMetricsPrompt(f) || isPiSherpaMetaDebugPrompt(f)) add("files", "docs", "project_memory", "inquirer");
   if (/\b(memory|remember|convention|pattern|known\s+issue|lesson|skill|kb|knowledge|policy|catalog|taxonomy|tag|tags|ontology|surrealdb|graph\s+memory)\b/.test(f)) add("project_memory", "inquirer");
-  if (/\b(internet|web|online|search\s+web|latest|current|today|recent\s+news|external\s+source|documentation\s+online)\b/.test(f)) add("web");
+  if (/\b(compare|versus|vs\.?|against|distinguish)\b/.test(f) && /\b(our|local|this repo|in the repo|repository|codebase|configuration)\b/.test(f)) add("files", "semble");
+  if (/\b(internet|web|online|search\s+web|latest|today|recent\s+news|external\s+source|documentation\s+online|current(?:\s+[a-z0-9._-]+){0,3}\s+(?:news|release|version|pricing|price|weather|models?))\b/.test(f) || IMPLICIT_EXTERNAL_INTENT.test(f)) add("web");
   if (mode !== "front-door" && /\b(previous|earlier|continue|session|conversation|last\s+time|we\s+discussed)\b/.test(f)) add("session");
 
   if (!sources.length) add(...(mode === "front-door" ? ["files", "semble", "docs", "inquirer"] as Source[] : ["files", "semble", "graphify", "docs", "git", "project_memory", "inquirer"] as Source[]));
-  return { sources, reason: `heuristic matched ${sources.join(", ")}`, confidence: sources.length === 1 ? 0.7 : 0.6, planner: "heuristic" };
+  const selected = constrainExplicitSources(focus, sources);
+  return { sources: selected, reason: `heuristic matched ${selected.join(", ")}`, confidence: selected.length === 1 ? 0.7 : 0.6, planner: "heuristic" };
 }
 
 export function sourcePlanningMessage(focus: string): UserMessage {
@@ -101,7 +126,9 @@ export function sourcePlanningMessage(focus: string): UserMessage {
       "- If the prompt asks about architecture, topology, call paths, dependencies, relationships, subsystem boundaries, or how X connects to Y, choose graphify + files + semble.",
       "- If the prompt spans conceptual setup, flows, lifecycles, boundaries, or how code fits into a system, choose graphify + files + semble + project_memory + inquirer, and docs when durable docs likely help.",
       "Prefer the fewest sources likely to contain the answer.",
-      "Choose web only for current/latest/online facts not in the repo.",
+      "Choose web only for current/latest/online facts not in the repo. For an internet-only request, do not search local sources unless comparing with our own material.",
+      "project_memory is local Obsidian/project memory and its local index; inquirer is the Oracle-hosted Inquirer Memory API (SurrealDB), not the local SurrealDB instance or web search.",
+      "When a request explicitly names one memory source, use that one; use both only when the request needs both.",
       "",
       "Return ONLY valid JSON matching this exact shape; no Markdown, prose, or a second JSON object:",
       '{"indicators":{"indicators":["..."],"reason":"...","confidence":0.0},"sources":{"sources":["files","semble"],"reason":"...","confidence":0.0}}',
@@ -146,11 +173,11 @@ export function heuristicSearchIndicators(focus: string): SearchIndicators {
 export function routedFallbackPlan(state: SourceStateLike, focus: string, mode: string, routePlan?: RoutePlan): SourcePlan {
   const fallbackPlan = { ...heuristicSourcePlan(focus, mode), routePlan };
   if (routePlan) {
-    fallbackPlan.sources = normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode);
+    fallbackPlan.sources = constrainExplicitSources(focus, normalizeSources([...fallbackPlan.sources, ...(routePlan.read.length ? ["files"] : []), ...(routePlan.docs.length ? ["docs"] : [])], mode));
     fallbackPlan.reason = `route ${routePlan.name}: ${fallbackPlan.reason}`;
     fallbackPlan.confidence = Math.max(fallbackPlan.confidence, 0.8);
   }
-  fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, fallbackPlan.sources);
+  fallbackPlan.sources = applyConditionalSourceActivation(state, focus, mode, constrainExplicitSources(focus, fallbackPlan.sources));
   return fallbackPlan;
 }
 
@@ -189,7 +216,7 @@ export function parsePlannedSourcePlan(state: SourceStateLike, focus: string, mo
     }), mode);
   if (!sourcePlan?.sources.length) return null;
   const mergedSources = normalizeSources([...sourcePlan.sources, ...(routePlan?.read.length ? ["files"] : []), ...(routePlan?.docs.length ? ["docs"] : [])], mode);
-  const activeSources = applyConditionalSourceActivation(state, focus, mode, mergedSources);
+  const activeSources = applyConditionalSourceActivation(state, focus, mode, constrainExplicitSources(focus, mergedSources));
   if (!activeSources.length) return null;
   return { ...sourcePlan, sources: activeSources, routePlan };
 }

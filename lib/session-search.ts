@@ -8,7 +8,7 @@
  * See: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
  */
 
-import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, renameSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, statSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
@@ -60,6 +60,7 @@ export type SessionSearchConfig = {
 
 const DEFAULT_DB_PATH = ".pi-memory/session-search.db";
 const DEFAULT_SESSION_LOG = "hyperpod-tmp/session.jsonl";
+const MAX_INDEX_BYTES_PER_FILE = 2 * 1024 * 1024;
 
 // ── DB wrapper ─────────────────────────────────────────────────────
 
@@ -278,24 +279,62 @@ export class SessionSearchDb {
     const mtimeKey = `last_indexed_mtime:${filePath}`;
     const sizeKey = `last_indexed_size:${filePath}`;
     const offsetKey = `last_offset:${filePath}`;
+    const skipKey = `skipping_oversized_line:${filePath}`;
 
     const storedMtime = this.getMeta(mtimeKey, "0");
     const storedSize = this.getMeta(sizeKey, "0");
-    if (storedMtime !== "0" && fileStat.mtimeMs === Number(storedMtime) && fileStat.size === Number(storedSize)) {
-      return 0;
-    }
-
     let lastOffset = Number(this.getMeta(offsetKey, "0"));
     const fileSize = fileStat.size;
-    if (fileSize < lastOffset) { lastOffset = 0; }
+    if (fileSize < lastOffset) {
+      lastOffset = 0;
+      this.setMeta(skipKey, "0");
+    }
+    if (storedMtime !== "0" && fileStat.mtimeMs === Number(storedMtime) && fileStat.size === Number(storedSize) && fileSize === lastOffset) {
+      return 0;
+    }
     if (fileSize === lastOffset) return 0;
 
-    const buffer = readFileSync(filePath);
-    const remaining = buffer.subarray(lastOffset).toString("utf8");
+    // Index a bounded complete-line chunk so a large session log cannot block
+    // a tool call by being read in full. The stored byte offset resumes on the
+    // next invocation without splitting UTF-8 characters or JSON lines.
+    const bytesToRead = Math.min(fileSize - lastOffset, MAX_INDEX_BYTES_PER_FILE);
+    const fd = openSync(filePath, "r");
+    let buffer: Buffer;
+    let bytesRead: number;
+    try {
+      buffer = Buffer.allocUnsafe(bytesToRead);
+      bytesRead = readSync(fd, buffer, 0, bytesToRead, lastOffset);
+    } finally {
+      closeSync(fd);
+    }
+    const chunk = buffer.subarray(0, bytesRead);
+    let skipping = this.getMeta(skipKey) === "1";
+    let start = 0;
+    if (skipping) {
+      const newline = chunk.indexOf(0x0a);
+      start = newline < 0 ? chunk.length : newline + 1;
+      skipping = newline < 0;
+    }
+    const content = chunk.subarray(start);
+    const completeLength = lastOffset + bytesRead < fileSize ? content.lastIndexOf(0x0a) + 1 : content.length;
+    if (completeLength <= 0) {
+      // Skip an oversized record across bounded reads, including after restart.
+      this.setMeta(skipKey, skipping || content.length > 0 ? "1" : "0");
+      this.setMeta(offsetKey, lastOffset + bytesRead);
+      this.setMeta(sizeKey, fileSize);
+      this.setMeta(mtimeKey, fileStat.mtimeMs);
+      return 0;
+    }
+    this.setMeta(skipKey, "0");
+    const consumedBytes = content.subarray(0, completeLength);
+    const remaining = consumedBytes.toString("utf8");
     const lines = remaining.split("\n").filter(Boolean);
+    const nextOffset = lastOffset + start + completeLength;
 
     if (lines.length === 0) {
-      this.setMeta(offsetKey, String(fileSize));
+      this.setMeta(offsetKey, String(nextOffset));
+      this.setMeta(sizeKey, String(fileSize));
+      this.setMeta(mtimeKey, String(fileStat.mtimeMs));
       return 0;
     }
 
@@ -313,7 +352,7 @@ export class SessionSearchDb {
     });
     insertEntries(lines);
 
-    this.setMeta(offsetKey, String(fileSize));
+    this.setMeta(offsetKey, String(nextOffset));
     this.setMeta(sizeKey, String(fileSize));
     this.setMeta(mtimeKey, String(fileStat.mtimeMs));
     this.setMeta("last_indexed_at", new Date().toISOString());

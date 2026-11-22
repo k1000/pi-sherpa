@@ -21,6 +21,7 @@ import path from "node:path";
 import { addExplicitPathCandidates } from "../lib/exact-source";
 import { addIndicatorFileCandidates, addRoutedFileCandidates, retryFrontDoorFileCandidates } from "../lib/file-candidates";
 import { addSembleCandidates } from "../lib/semble-candidates";
+import { heuristicIndicators } from "../lib/source-planning";
 import { postProcessCandidates } from "../lib/candidate-postprocess";
 
 type RetrievalCase = {
@@ -70,7 +71,14 @@ async function retrieve(testCase: RetrievalCase): Promise<string[]> {
   const found: string[] = [];
   const add = (type: string, source: string) => { if (source) found.push(source); };
   const sourcePlan = testCase.sourcePlan as never;
-  const indicators = { indicators: testCase.indicators } as never;
+  // For fallback/heuristic traces the recorded indicators are exactly the
+  // current heuristic output, so recompute them: that keeps improvements to the
+  // heuristic measurable instead of being frozen into the fixture.
+  const indicators = {
+    indicators: ["fallback", "heuristic"].includes(testCase.planner)
+      ? heuristicIndicators(testCase.focus)
+      : testCase.indicators,
+  } as never;
   addExplicitPathCandidates(CWD, testCase.focus, add as never);
   await addRoutedFileCandidates({ cwd: CWD }, testCase.focus, testCase.mode, sourcePlan, add as never);
   await addIndicatorFileCandidates({ cwd: CWD }, testCase.mode, sourcePlan, indicators, add as never);

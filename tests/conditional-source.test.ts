@@ -60,6 +60,14 @@ test("queryPattern condition matches", () => {
   assertEqual(evaluateSource(source, codeCtx), "inactive", "web inactive for code query");
 });
 
+test("web activation recognizes implicit public-catalog intent", () => {
+  const source: ConditionalSource = {
+    id: "web", label: "Web",
+    when: { queryPattern: ["list of models", "supported by"] },
+  };
+  assertEqual(evaluateSource(source, { ...allEnabled, query: "Show me the list of models supported by Qwen Cloud" }), "active", "public provider catalog activates web");
+});
+
 test("requireSources condition (AND)", () => {
   const source: ConditionalSource = {
     id: "semantic_memory", label: "Semantic memory",

@@ -81,14 +81,17 @@ async function getRelations(config: InquirerCandidateConfig, from: string): Prom
 }
 
 async function addGraphCandidates(config: InquirerCandidateConfig, store: MemoryApiStore, seeds: Array<{ id: string; score: number }>, seenArtifacts: Set<string>, add: AddCandidateItem): Promise<void> {
-  const queued = seeds.map((seed) => ({ ...seed, hop: 0 }));
+  const resultLimit = config.searchLimit || 8;
+  const relationLimit = Math.max(16, resultLimit * 4);
+  const queued = seeds.slice(0, relationLimit).map((seed) => ({ ...seed, hop: 0 }));
   const seenRelations = new Set<string>();
   let added = 0;
-  while (queued.length && added < (config.searchLimit || 8)) {
+  while (queued.length && added < resultLimit && seenRelations.size < relationLimit) {
     const current = queued.shift()!;
     if (current.hop >= 2) continue;
     const relations = await getRelations(config, current.id);
     for (const relation of relations) {
+      if (seenRelations.size >= relationLimit) break;
       const target = String(relation.to ?? "").trim();
       if (!target || seenRelations.has(`${current.id}->${target}`)) continue;
       seenRelations.add(`${current.id}->${target}`);
@@ -132,8 +135,8 @@ async function addGraphCandidates(config: InquirerCandidateConfig, store: Memory
           // Graph expansion is opportunistic; direct vector results remain useful.
         }
       }
-      queued.push({ id: target, score: graphScore, hop: current.hop + 1 });
-      if (added >= (config.searchLimit || 8)) break;
+      if (queued.length < relationLimit) queued.push({ id: target, score: graphScore, hop: current.hop + 1 });
+      if (added >= resultLimit) break;
     }
   }
 }

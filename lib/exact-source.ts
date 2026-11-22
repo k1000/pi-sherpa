@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 const EXACT_SOURCE_LIMIT = 8;
@@ -61,10 +61,19 @@ export function readExplicitSource(abs: string): { raw: string; boost: number } 
   try {
     const st = statSync(abs);
     if (st.isFile()) {
-      const bytes = readFileSync(abs);
-      const head = bytes.subarray(0, Math.min(bytes.length, 4096));
-      if (head.includes(0)) return undefined;
-      return { raw: bytes.toString("utf8", 0, Math.min(bytes.length, 5000)), boost: 0.9 };
+      // Explicit paths are user hints, not permission to synchronously load an
+      // arbitrary file into Pi's event loop. Inspect only the rendered prefix.
+      const byteCount = Math.min(st.size, 5000);
+      const fd = openSync(abs, "r");
+      try {
+        const bytes = Buffer.allocUnsafe(byteCount);
+        const bytesRead = readSync(fd, bytes, 0, byteCount, 0);
+        const content = bytes.subarray(0, bytesRead);
+        if (content.subarray(0, Math.min(content.length, 4096)).includes(0)) return undefined;
+        return { raw: content.toString("utf8"), boost: 0.9 };
+      } finally {
+        closeSync(fd);
+      }
     }
     if (st.isDirectory()) return {
       raw: `Directory explicitly requested: ${abs}\n\nEntries:\n${readdirSync(abs).slice(0, 80).join("\n")}`,

@@ -170,6 +170,51 @@ test("incremental indexing handles non-ASCII byte offsets", () => withTemp((dir)
   db.close();
 }));
 
+test("indexes large logs in bounded complete-line chunks", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const largePrompt = "x".repeat(1_200_000);
+  const first = JSON.stringify({ sessionId: "large", ts: "2026-06-01T10:00:00.000Z", kind: "prompt", prompt: largePrompt });
+  const second = JSON.stringify({ sessionId: "large", ts: "2026-06-01T10:00:01.000Z", kind: "response", response: largePrompt });
+  writeFileSync(logPath, `${first}\n${second}\n`);
+
+  const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 1, "first bounded chunk indexes one complete entry");
+  assertEqual(db.indexNewEntries(), 1, "second bounded chunk resumes at the stored offset");
+  assertEqual(db.getIndexedEntryCount(), 2, "both large entries are indexed");
+  db.close();
+}));
+
+test("skips oversized records across runs without losing following entries", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const oversized = JSON.stringify({ sessionId: "oversized", prompt: "x".repeat(5 * 1024 * 1024) });
+  const following = JSON.stringify({ sessionId: "following", prompt: "searchable recovery" });
+  writeFileSync(logPath, `${oversized}\n${following}\n`);
+
+  let db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "first chunk skips oversized record");
+  db.close();
+  db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "skip state persists after reopening");
+  assertEqual(db.indexNewEntries(), 1, "third chunk recovers at next complete record");
+  assertEqual(db.getIndexedEntryCount(), 1, "oversized fragments are not indexed");
+  assert(db.search("recovery").some((r) => r.sessionId === "following"), "following entry is searchable");
+  assertEqual(db.indexNewEntries(), 0, "completed file is not reindexed");
+  db.close();
+}));
+
+test("oversized unterminated records remain skipped when appended", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const oversized = "x".repeat(3 * 1024 * 1024);
+  writeFileSync(logPath, oversized);
+  const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "first oversized chunk skipped");
+  assertEqual(db.indexNewEntries(), 0, "unterminated remainder skipped");
+  writeFileSync(logPath, `${oversized}tail\n${JSON.stringify({ sessionId: "after", prompt: "after oversized" })}\n`);
+  assertEqual(db.indexNewEntries(), 1, "append resumes only after newline");
+  assertEqual(db.getIndexedEntryCount(), 1, "no oversized fragments indexed");
+  db.close();
+}));
+
 test("index resets when session log is truncated", () => withTemp((dir) => {
   const logPath = path.join(dir, "session.jsonl");
   writeFileSync(logPath, sampleSessionLog());

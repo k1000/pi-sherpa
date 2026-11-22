@@ -63,7 +63,7 @@ const BUILT_IN_SOURCES: ConditionalSource[] = [
     label: "Web search results",
     when: {
       minRelevance: 0.6,
-      queryPattern: ["search", "find", "look up", "what is", "how to", "latest", "current", "news"],
+      queryPattern: ["search", "find", "look up", "what is", "how to", "latest", "current", "news", "internet", "online", "web", "official", "provider evidence", "public pricing", "pricing for", "pricing of", "list of models", "supported by"],
     },
   },
   {
