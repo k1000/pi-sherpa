@@ -24,7 +24,7 @@ Input-side paid tokens: 399 543 121 = 12 918 165 fresh + 386 624 956 cache read.
 - read — 386 results, amortized 69.5 M → **17.4 %**; median 1 399, p90 5 444, max 14 498
 - j01n — 786 results, 6.2 %; median 40
 - codemode — 175 results, 0.8 %; median 67; 12 of 98 sessions; `searchTools` used 0 times, `models.classify` 0 times
-- Sherpa blocks in assistant transcripts: **0** — the extension was not active on the measured host, so there is no evidence yet that it saves anything
+- Sherpa injections: **0**, detected from the transcript record (`customType: "sherpa-context"`, the value at index.ts:436) rather than from text. The detector fires on the same corpus for `j01n` (995), `j01n-peer-spawn-budget` (2) and `codemode-store` (1), so this is a real zero: the extension was not active on the measured host and there is no evidence yet that it saves anything
 
 Two conclusions the numbers force:
 
@@ -44,7 +44,7 @@ Non-goals: replacing the chat model that distils bundles; blocking reads; auto-p
 
 ### P0-1 Measurement (ships first, changes no behaviour)
 
-Per turn, append one JSONL row to `.pi-memory/sherpa/metrics/<date>.jsonl`: `ts, sessionId, hook (front-door|explicit|tool_result), plannedSources, planner, items, injectedTokens, confidence, abstainReason, guardInterceptions, guardTokensAvoided, curationModelTokens`. Aggregation script: `scripts/sherpa-metrics.mjs` (added in this PR) already reports the transcript-side baseline; extend it with the per-turn file.
+Per turn, append one JSONL row to `.pi-memory/sherpa/metrics/<date>.jsonl`: `ts, sessionId, hook (front-door|explicit|tool_result), plannedSources, planner, items, injectedTokens, confidence, abstainReason, guardInterceptions, guardTokensAvoided, curationModelTokens`. Aggregation script: `scripts/sherpa-metrics.mjs` already reports the transcript-side baseline; extend it with the per-turn file. It distinguishes an injection (`customType: "sherpa-context"`) from assistant prose mentioning Sherpa, and charges a tool result to the assistant turns that strictly follow it — a result in the final turn costs zero. Both rules are pinned by `scripts/sherpa-metrics.test.mjs`.
 Acceptance: `bun run metrics` prints today's injected tokens, abstention rate and guard savings from real files.
 
 ### P0-2 Capability detection instead of assumption
