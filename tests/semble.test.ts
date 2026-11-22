@@ -7,12 +7,14 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parseSembleSearchOutput, readSembleState, writeSembleState } from "../lib/semble";
+import { addInquirerCandidates } from "../lib/basic-candidate-sources";
+import { MemoryApiStore } from "../../archivist/lib/memory-api";
 
-const tests: Array<{ name: string; fn: () => void }> = [];
+const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [];
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void) { tests.push({ name, fn }); }
+function test(name: string, fn: () => void | Promise<void>) { tests.push({ name, fn }); }
 function assert(condition: unknown, message: string) { if (!condition) throw new Error(message); }
 
 test("parseSembleSearchOutput parses markdown results", () => {
@@ -62,8 +64,46 @@ test("Semble state is persisted under .pi/sherpa", () => {
   }
 });
 
+test("Inquirer candidates return empty for missing config", async () => {
+  const added: unknown[] = [];
+  await addInquirerCandidates(undefined, "remember source routing", (...args) => added.push(args));
+  assert(added.length === 0, `expected no candidates, got ${added.length}`);
+});
+
+test("Inquirer candidates return empty when API search fails", async () => {
+  const original = MemoryApiStore.prototype.search;
+  try {
+    MemoryApiStore.prototype.search = async function () { throw new Error("network unavailable"); };
+    const added: unknown[] = [];
+    await addInquirerCandidates({ enabled: true, url: "http://localhost:3000", searchLimit: 3 }, "remember source routing", (...args) => added.push(args));
+    assert(added.length === 0, `expected no candidates on API failure, got ${added.length}`);
+  } finally {
+    MemoryApiStore.prototype.search = original;
+  }
+});
+
+test("Inquirer vector search results become memory candidates", async () => {
+  const original = MemoryApiStore.prototype.search;
+  try {
+    MemoryApiStore.prototype.search = async function (query: { text: string; limit?: number }) {
+      assert(query.text === "remember source routing", "expected focus text to be searched");
+      assert(query.limit === 3, "expected configured search limit");
+      return [{ artifact: { id: "artifact-1", title: "Routing lesson", summary: "Use source plans for retrieval." }, score: 0.82 }];
+    };
+    const added: Array<{ type: string; source: string; raw: string; relBoost?: number }> = [];
+    await addInquirerCandidates({ enabled: true, url: "http://localhost:3000", searchLimit: 3, tokenEnv: "MEMORY_API_TOKEN" }, "remember source routing", (type, source, raw, relBoost) => added.push({ type, source, raw, relBoost }));
+    assert(added.length === 1, `expected one candidate, got ${added.length}`);
+    assert(added[0]!.type === "inquirer_memory", "expected inquirer memory type");
+    assert(added[0]!.source === "inquirer_memory://artifact-1", "expected stable inquirer source label");
+    assert(added[0]!.raw.includes("Routing lesson"), "expected artifact title in raw text");
+    assert(added[0]!.relBoost === 0.82, "expected relevance from vector score");
+  } finally {
+    MemoryApiStore.prototype.search = original;
+  }
+});
+
 for (const { name, fn } of tests) {
-  try { fn(); passed++; console.log(`✅ ${name}`); }
+  try { await fn(); passed++; console.log(`✅ ${name}`); }
   catch (error) { failed++; console.error(`❌ ${name}`); console.error(error); }
 }
 

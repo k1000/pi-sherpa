@@ -6,7 +6,8 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { classifyTaskOutcome, compactScratchpad, suggestVerificationCommands } from "../lib/lifecycle";
+import { isSlashCommandPrompt, postProcessCandidates } from "../index";
+import { classifyTaskOutcome, compactScratchpad, compactScratchpadLifecycle, computeLifecycleStage, detectKnowledgeGaps, formatKnowledgeGapsForCompiler, suggestVerificationCommands } from "../lib/lifecycle";
 
 const tests: Array<{ name: string; fn: () => void }> = [];
 let passed = 0;
@@ -18,6 +19,13 @@ function withTemp(fn: (dir: string) => void) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "sherpa-lifecycle-"));
   try { fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
+
+test("slash command prompts bypass automatic processing", () => {
+  assert(isSlashCommandPrompt("/compact") === true, "slash commands should be skipped");
+  assert(isSlashCommandPrompt("  /skill:tdd") === true, "indented slash commands should be skipped");
+  assert(isSlashCommandPrompt("implement /compact handling") === false, "inline slashes are not commands");
+  assert(isSlashCommandPrompt(undefined) === false, "non-string prompts are not commands");
+});
 
 test("classifyTaskOutcome detects core outcomes", () => {
   assert(classifyTaskOutcome("implemented and verified, tests passed").outcome === "completed", "expected completed");
@@ -44,6 +52,79 @@ test("suggestVerificationCommands recommends focused frontend checks", () => {
   const advice = suggestVerificationCommands(["src/server/public/client.js"]);
   assert(advice.commands.some((item) => item.command === "bun test src/server/frontend.test.ts"), "missing HyperPod frontend test");
 });
+
+test("detectKnowledgeGaps finds repeated capitalized entities missing from catalog", () => {
+  const gaps = detectKnowledgeGaps("Investigate VectorVault", [
+    "VectorVault errors mention GraphNexus integration.",
+    "GraphNexus needs docs.",
+    "GraphNexus routing is unclear.",
+  ], []);
+  const gap = gaps.find((item) => item.entity === "GraphNexus");
+  assert(Boolean(gap), `expected GraphNexus gap, got ${gaps.map((item) => item.entity).join(", ")}`);
+  assert(gap!.mentionCount === 3, `expected 3 mentions, got ${gap!.mentionCount}`);
+  assert(formatKnowledgeGapsForCompiler(gaps).includes("Knowledge gaps detected"), "expected compiler gap section");
+});
+
+test("detectKnowledgeGaps filters catalog entries and below-threshold mentions", () => {
+  const catalog = [{ id: "graphnexus", title: "GraphNexus", summary: "Known routing system", path: "docs/graphnexus.md" }];
+  const gaps = detectKnowledgeGaps("Review GraphNexus", [
+    "GraphNexus is cataloged.",
+    "VectorVault appears once only.",
+  ], catalog);
+  assert(!gaps.some((item) => item.entity === "GraphNexus"), "cataloged entity should not be a gap");
+  assert(!gaps.some((item) => item.entity === "VectorVault"), "single-mention entity should not be a gap");
+});
+
+test("computeLifecycleStage classifies active, fading, archived, defaults, and high-confidence immunity", () => {
+  const now = Date.parse("2026-07-13T00:00:00.000Z");
+  const daysAgo = (days: number) => now - days * 24 * 60 * 60 * 1000;
+  assert(computeLifecycleStage(daysAgo(1), 3, now) === "active", "recent memories should be active");
+  assert(computeLifecycleStage(daysAgo(31), 3, now) === "fading", "31 day old memories should be fading");
+  assert(computeLifecycleStage(daysAgo(61), 3, now) === "archived", "61 day old memories should be archived");
+  assert(computeLifecycleStage(daysAgo(365), 8, now) === "active", "high confidence memories should be immune");
+  assert(computeLifecycleStage(undefined, undefined, now) === "active", "missing timestamp should default active");
+});
+
+test("postProcessCandidates filters archived items and downranks fading items", () => {
+  const now = Date.parse("2026-07-13T00:00:00.000Z");
+  const daysAgo = (days: number) => now - days * 24 * 60 * 60 * 1000;
+  const active = { handle: "ctx-active", type: "project_memory", source: "kb://memory/active.md", relevance: 0.4, summary: "remember routing pattern", raw: "remember routing pattern", lastAccessedAt: daysAgo(1), confidence: 3 };
+  const fading = { handle: "ctx-fading", type: "project_memory", source: "kb://memory/fading.md", relevance: 0.8, summary: "remember routing pattern", raw: "remember routing pattern", lastAccessedAt: daysAgo(31), confidence: 3 };
+  const archived = { handle: "ctx-archived", type: "project_memory", source: "kb://memory/archived.md", relevance: 0.95, summary: "remember routing pattern", raw: "remember routing pattern", lastAccessedAt: daysAgo(61), confidence: 3 };
+  const compat = { handle: "ctx-compat", type: "project_memory", source: "kb://memory/compat.md", relevance: 0.3, summary: "remember routing pattern", raw: "remember routing pattern" };
+  const actual = postProcessCandidates([fading, archived, active, compat], "remember routing pattern", "explicit", now).map((item) => item.source);
+  assert(!actual.includes("kb://memory/archived.md"), "archived item should be filtered");
+  assert(actual.includes("kb://memory/compat.md"), "missing lifecycle fields should remain active-compatible");
+  assert(actual.indexOf("kb://memory/active.md") < actual.indexOf("kb://memory/fading.md"), "fading item should rank below active despite higher base relevance");
+});
+
+test("compactScratchpadLifecycle moves archived entries and protects high-confidence entries", () => withTemp((dir) => {
+  const now = Date.parse("2026-07-13T00:00:00.000Z");
+  const sections = path.join(dir, "sections");
+  mkdirSync(sections, { recursive: true });
+  writeFileSync(path.join(sections, "todo.md"), [
+    "### stale — 2026-04-01T00:00:00.000Z",
+    "",
+    "old note\nconfidence: 3",
+    "",
+    "### protected — 2026-04-01T00:00:00.000Z",
+    "",
+    "important note\nconfidence: 9",
+    "",
+    "### recent — 2026-07-01T00:00:00.000Z",
+    "",
+    "recent note",
+    "",
+  ].join("\n"));
+  const result = compactScratchpadLifecycle(dir, { now });
+  assert(result.archived.includes("todo.md"), "expected lifecycle archive");
+  const remaining = readFileSync(path.join(sections, "todo.md"), "utf8");
+  const archived = readFileSync(path.join(dir, ".archived", "todo.md"), "utf8");
+  assert(archived.includes("old note"), "stale low-confidence entry should move to archive");
+  assert(!remaining.includes("old note"), "stale entry should be removed from active section");
+  assert(remaining.includes("important note"), "high-confidence stale entry should remain active");
+  assert(remaining.includes("recent note"), "recent entry should remain active");
+}));
 
 test("compactScratchpad archives large sections", () => withTemp((dir) => {
   const sections = path.join(dir, "sections");

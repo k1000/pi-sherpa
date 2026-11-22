@@ -8,7 +8,7 @@
  * See: https://hermes-agent.nousresearch.com/docs/user-guide/features/memory
  */
 
-import { existsSync, readFileSync, mkdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, statSync, renameSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
@@ -40,24 +40,41 @@ export type SessionSearchResult = {
 export type SessionSearchConfig = {
   /** Path to the SQLite FTS5 database file. Default: ~/.pi-memory/session-search.db */
   dbPath?: string;
-  /** Path to the session log JSONL file. Default: ~/hyperpod-tmp/session.jsonl */
+  /** Path to the session log file or directory of .jsonl files. Default: ~/hyperpod-tmp/session.jsonl */
   sessionLogPath?: string;
   /** Maximum results per search query. Default: 10 */
   maxResults?: number;
+  /** Max new files to scan per indexNewEntries call (0 = unlimited). Default: 50 */
+  maxFilesPerRun?: number;
+  /** Rotate the cache when db+WAL+SHM exceed this size. Default: 2 GiB. */
+  maxDbBytes?: number;
+  /** Keep at most this many indexed entries. Default: 100k. */
+  maxEntries?: number;
+  /** Extra entries allowed before pruning, to avoid pruning after every indexed file. Default: 10k. */
+  pruneSlackEntries?: number;
+  /** Number of rotated cache files to keep per db/wal/shm file. Default: 2. */
+  maxRotatedCaches?: number;
 };
 
 // ── Defaults ────────────────────────────────────────────────────────
 
 const DEFAULT_DB_PATH = ".pi-memory/session-search.db";
 const DEFAULT_SESSION_LOG = "hyperpod-tmp/session.jsonl";
+const MAX_INDEX_BYTES_PER_FILE = 2 * 1024 * 1024;
 
 // ── DB wrapper ─────────────────────────────────────────────────────
 
 export class SessionSearchDb {
   private db: SqliteDatabase;
+  private ftsAvailable = false;
   private dbPath: string;
   private sessionLogPath: string;
   private maxResults: number;
+  private maxFilesPerRun: number;
+  private maxDbBytes: number;
+  private maxEntries: number;
+  private pruneSlackEntries: number;
+  private maxRotatedCaches: number;
 
   constructor(baseDir: string, config?: SessionSearchConfig) {
     this.dbPath = path.resolve(baseDir, config?.dbPath ?? DEFAULT_DB_PATH);
@@ -65,10 +82,16 @@ export class SessionSearchDb {
       config?.sessionLogPath ?? path.join(homedir(), DEFAULT_SESSION_LOG),
     );
     this.maxResults = config?.maxResults ?? 10;
+    this.maxFilesPerRun = config?.maxFilesPerRun ?? 50;
+    this.maxDbBytes = config?.maxDbBytes ?? 2 * 1024 * 1024 * 1024;
+    this.maxEntries = config?.maxEntries ?? 100_000;
+    this.pruneSlackEntries = config?.pruneSlackEntries ?? 10_000;
+    this.maxRotatedCaches = config?.maxRotatedCaches ?? 2;
 
     // Ensure parent directory exists
     const dir = path.dirname(this.dbPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    this.rotateOversizedCache();
 
     this.db = openSqliteDatabase(this.dbPath, "Sherpa session search");
 
@@ -78,21 +101,41 @@ export class SessionSearchDb {
     this.ensureSchema();
   }
 
+  private rotateOversizedCache(): void {
+    if (this.maxDbBytes <= 0) return;
+    const files = [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`];
+    const totalBytes = files.reduce((sum, file) => sum + (existsSync(file) ? statSync(file).size : 0), 0);
+    if (totalBytes <= this.maxDbBytes) return;
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    for (const file of files) {
+      if (!existsSync(file)) continue;
+      try { renameSync(file, `${file}.rotated-${stamp}`); }
+      catch { /* cache rotation is best-effort; startup should continue */ }
+    }
+    this.cleanupRotatedCaches(files);
+  }
+
+  private cleanupRotatedCaches(files: string[]): void {
+    if (this.maxRotatedCaches < 0) return;
+    for (const file of files) {
+      try {
+        const dir = path.dirname(file);
+        const prefix = `${path.basename(file)}.rotated-`;
+        const rotated = readdirSync(dir)
+          .filter((name) => name.startsWith(prefix))
+          .map((name) => path.join(dir, name))
+          .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+        for (const oldFile of rotated.slice(this.maxRotatedCaches)) unlinkSync(oldFile);
+      } catch { /* rotated cache cleanup is best-effort */ }
+    }
+  }
+
   private ensureSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
-      )
-    `);
-    this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS session_entries_fts USING fts5(
-        session_id,
-        ts,
-        kind,
-        text,
-        content='session_entries',
-        content_rowid='rowid'
       )
     `);
     this.db.exec(`
@@ -104,19 +147,34 @@ export class SessionSearchDb {
         text TEXT NOT NULL
       )
     `);
-    // Triggers to keep FTS in sync
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS session_entries_ai AFTER INSERT ON session_entries BEGIN
-        INSERT INTO session_entries_fts(rowid, session_id, ts, kind, text)
-        VALUES (new.rowid, new.session_id, new.ts, new.kind, new.text);
-      END
-    `);
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS session_entries_ad AFTER DELETE ON session_entries BEGIN
-        INSERT INTO session_entries_fts(session_entries_fts, rowid, session_id, ts, kind, text)
-        VALUES ('delete', old.rowid, old.session_id, old.ts, old.kind, old.text);
-      END
-    `);
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS session_entries_fts USING fts5(
+          session_id,
+          ts,
+          kind,
+          text,
+          content='session_entries',
+          content_rowid='rowid'
+        )
+      `);
+      // Triggers to keep FTS in sync when the runtime provides FTS5.
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS session_entries_ai AFTER INSERT ON session_entries BEGIN
+          INSERT INTO session_entries_fts(rowid, session_id, ts, kind, text)
+          VALUES (new.rowid, new.session_id, new.ts, new.kind, new.text);
+        END
+      `);
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS session_entries_ad AFTER DELETE ON session_entries BEGIN
+          INSERT INTO session_entries_fts(session_entries_fts, rowid, session_id, ts, kind, text)
+          VALUES ('delete', old.rowid, old.session_id, old.ts, old.kind, old.text);
+        END
+      `);
+      this.ftsAvailable = true;
+    } catch {
+      this.ftsAvailable = false;
+    }
   }
 
   /**
@@ -136,13 +194,20 @@ export class SessionSearchDb {
     ).run(key, String(value));
   }
 
+  private getMeta(key: string, fallback = ""): string {
+    const row = this.db.query(
+      "SELECT value FROM session_meta WHERE key = ?",
+    ).get(key) as { value: string } | null;
+    return row?.value ?? fallback;
+  }
+
   private setLastIndexedOffset(offset: number): void {
     this.setMeta("last_indexed_offset", offset);
   }
 
   private resetIndexProgress(): void {
     this.db.exec("DELETE FROM session_entries");
-    this.db.exec("DELETE FROM session_entries_fts");
+    if (this.ftsAvailable) this.db.exec("DELETE FROM session_entries_fts");
     this.setLastIndexedOffset(0);
   }
 
@@ -157,27 +222,119 @@ export class SessionSearchDb {
   }
 
   /**
-   * Index any new entries from the session log.
+   * Index any new entries from the session log directory.
    * Returns the number of new entries indexed.
    */
-  indexNewEntries(): number {
-    if (!existsSync(this.sessionLogPath)) return 0;
+  private sessionLogFiles(maxFiles = 0): string[] {
+    if (!existsSync(this.sessionLogPath)) return [];
+    const stat = statSync(this.sessionLogPath);
+    if (stat.isFile()) return [this.sessionLogPath];
+    const all: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isFile() && entry.name.endsWith(".jsonl")) all.push(full);
+      }
+    };
+    walk(this.sessionLogPath);
+    // Sort newest-first, but cap after filtering to changed/unindexed files.
+    // Capping before filtering starves older unindexed files forever once the
+    // newest N files are already current.
+    all.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    if (maxFiles <= 0) return all;
+    return all.filter((file) => !this.isFileIndexCurrent(file)).slice(0, maxFiles);
+  }
 
-    let lastOffset = this.getLastIndexedOffset();
-    const fileSize = statSync(this.sessionLogPath).size;
-
-    if (fileSize < lastOffset) {
-      this.resetIndexProgress();
-      lastOffset = 0;
+  private isFileIndexCurrent(filePath: string): boolean {
+    try {
+      const fileStat = statSync(filePath);
+      const storedMtime = this.getMeta(`last_indexed_mtime:${filePath}`, "0");
+      const storedSize = this.getMeta(`last_indexed_size:${filePath}`, "0");
+      const lastOffset = Number(this.getMeta(`last_offset:${filePath}`, "0"));
+      return storedMtime !== "0"
+        && fileStat.mtimeMs === Number(storedMtime)
+        && fileStat.size === Number(storedSize)
+        && fileStat.size === lastOffset;
+    } catch {
+      return true;
     }
-    if (fileSize === lastOffset) return 0; // Nothing new
+  }
 
-    const buffer = readFileSync(this.sessionLogPath);
-    const remaining = buffer.subarray(lastOffset).toString("utf8");
+  indexNewEntries(): number {
+    const files = this.sessionLogFiles(this.maxFilesPerRun);
+    if (files.length === 0) return 0;
+    let total = 0;
+    for (const file of files) {
+      total += this.indexFile(file);
+    }
+    return total;
+  }
+
+  private indexFile(filePath: string): number {
+    if (!existsSync(filePath)) return 0;
+    const fileStat = statSync(filePath);
+    if (!fileStat.isFile()) return 0;
+
+    const mtimeKey = `last_indexed_mtime:${filePath}`;
+    const sizeKey = `last_indexed_size:${filePath}`;
+    const offsetKey = `last_offset:${filePath}`;
+    const skipKey = `skipping_oversized_line:${filePath}`;
+
+    const storedMtime = this.getMeta(mtimeKey, "0");
+    const storedSize = this.getMeta(sizeKey, "0");
+    let lastOffset = Number(this.getMeta(offsetKey, "0"));
+    const fileSize = fileStat.size;
+    if (fileSize < lastOffset) {
+      lastOffset = 0;
+      this.setMeta(skipKey, "0");
+    }
+    if (storedMtime !== "0" && fileStat.mtimeMs === Number(storedMtime) && fileStat.size === Number(storedSize) && fileSize === lastOffset) {
+      return 0;
+    }
+    if (fileSize === lastOffset) return 0;
+
+    // Index a bounded complete-line chunk so a large session log cannot block
+    // a tool call by being read in full. The stored byte offset resumes on the
+    // next invocation without splitting UTF-8 characters or JSON lines.
+    const bytesToRead = Math.min(fileSize - lastOffset, MAX_INDEX_BYTES_PER_FILE);
+    const fd = openSync(filePath, "r");
+    let buffer: Buffer;
+    let bytesRead: number;
+    try {
+      buffer = Buffer.allocUnsafe(bytesToRead);
+      bytesRead = readSync(fd, buffer, 0, bytesToRead, lastOffset);
+    } finally {
+      closeSync(fd);
+    }
+    const chunk = buffer.subarray(0, bytesRead);
+    let skipping = this.getMeta(skipKey) === "1";
+    let start = 0;
+    if (skipping) {
+      const newline = chunk.indexOf(0x0a);
+      start = newline < 0 ? chunk.length : newline + 1;
+      skipping = newline < 0;
+    }
+    const content = chunk.subarray(start);
+    const completeLength = lastOffset + bytesRead < fileSize ? content.lastIndexOf(0x0a) + 1 : content.length;
+    if (completeLength <= 0) {
+      // Skip an oversized record across bounded reads, including after restart.
+      this.setMeta(skipKey, skipping || content.length > 0 ? "1" : "0");
+      this.setMeta(offsetKey, lastOffset + bytesRead);
+      this.setMeta(sizeKey, fileSize);
+      this.setMeta(mtimeKey, fileStat.mtimeMs);
+      return 0;
+    }
+    this.setMeta(skipKey, "0");
+    const consumedBytes = content.subarray(0, completeLength);
+    const remaining = consumedBytes.toString("utf8");
     const lines = remaining.split("\n").filter(Boolean);
+    const nextOffset = lastOffset + start + completeLength;
 
     if (lines.length === 0) {
-      this.setLastIndexedOffset(fileSize);
+      this.setMeta(offsetKey, String(nextOffset));
+      this.setMeta(sizeKey, String(fileSize));
+      this.setMeta(mtimeKey, String(fileStat.mtimeMs));
       return 0;
     }
 
@@ -195,10 +352,26 @@ export class SessionSearchDb {
     });
     insertEntries(lines);
 
-    this.setLastIndexedOffset(fileSize);
-    this.setMeta("last_indexed_size", fileSize);
+    this.setMeta(offsetKey, String(nextOffset));
+    this.setMeta(sizeKey, String(fileSize));
+    this.setMeta(mtimeKey, String(fileStat.mtimeMs));
     this.setMeta("last_indexed_at", new Date().toISOString());
+    this.pruneOldEntries();
     return indexed;
+  }
+
+  private pruneOldEntries(): void {
+    if (this.maxEntries <= 0) return;
+    const count = this.getIndexedEntryCount();
+    const pruneAt = this.maxEntries + Math.max(0, this.pruneSlackEntries);
+    if (count <= pruneAt) return;
+    const deleteBeforeRow = this.db.query(
+      "SELECT rowid FROM session_entries ORDER BY rowid DESC LIMIT 1 OFFSET ?",
+    ).get(this.maxEntries - 1) as { rowid: number } | null;
+    if (!deleteBeforeRow) return;
+    this.db.query("DELETE FROM session_entries WHERE rowid < ?").run(deleteBeforeRow.rowid);
+    this.setMeta("last_pruned_at", new Date().toISOString());
+    this.setMeta("last_pruned_to_entries", this.maxEntries);
   }
 
   /**
@@ -206,11 +379,9 @@ export class SessionSearchDb {
    */
   search(query: string, limit?: number): SessionSearchMatch[] {
     const effectiveLimit = Math.min(limit ?? this.maxResults, 100);
+    const safeQuery = sanitizeFts5Query(query);
+    if (!this.ftsAvailable || !safeQuery) return this.fallbackSearch(query, effectiveLimit);
     try {
-      // Sanitize FTS5 query — escape special characters, keep basic syntax
-      const safeQuery = sanitizeFts5Query(query);
-      if (!safeQuery) return [];
-
       const rows = this.db.query(`
         SELECT e.rowid as id, e.session_id as sessionId, e.ts, e.kind,
                snippet(session_entries_fts, 4, '<b>', '</b>', '…', 40) as snippet,
@@ -224,7 +395,7 @@ export class SessionSearchDb {
 
       return rows;
     } catch {
-      // If FTS5 query fails (e.g., bad syntax), fall back to LIKE search
+      // If FTS5 is unavailable in this runtime or query fails, fall back to LIKE search.
       return this.fallbackSearch(query, effectiveLimit);
     }
   }

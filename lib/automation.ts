@@ -292,28 +292,39 @@ function scriptFileCommand(rel: string, name: string): string {
   return `node ${rel}`;
 }
 
+function discoverScriptFiles(root: string, maxDepth = 2): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > maxDepth) return;
+    for (const name of readdirSync(dir).sort()) {
+      const p = path.join(dir, name);
+      const st = statSync(p);
+      if (st.isDirectory()) walk(p, depth + 1);
+      else if (st.isFile() && /\.(sh|js|mjs|cjs|ts|tsx|py)$/.test(name)) out.push(p);
+    }
+  };
+  walk(root, 0);
+  return out;
+}
+
 function discoverScriptsDir(cwd: string): RunnableAutomation[] {
   const scriptsDir = path.join(cwd, "scripts");
   if (!existsSync(scriptsDir)) return [];
   try {
-    return readdirSync(scriptsDir).sort()
-      .filter((name) => {
-        const scriptPath = path.join(scriptsDir, name);
-        return statSync(scriptPath).isFile() && /\.(sh|js|mjs|cjs|ts|tsx|py)$/.test(name);
-      })
-      .map((name) => {
-        const rel = path.relative(cwd, path.join(scriptsDir, name)).replace(/\\/g, "/");
-        const command = scriptFileCommand(rel, name);
-        const metadata = parseAutomationMetadata(readFileSync(path.join(scriptsDir, name), "utf8"));
-        return {
-          name: rel,
-          kind: "repo-script" as const,
-          command,
-          cwd,
-          ...metadata,
-          safety: metadata.safety ?? classifyAutomationSafety(command, metadata),
-        };
-      });
+    return discoverScriptFiles(scriptsDir).map((scriptPath) => {
+      const name = path.basename(scriptPath);
+      const rel = path.relative(cwd, scriptPath).replace(/\\/g, "/");
+      const command = scriptFileCommand(rel, name);
+      const metadata = parseAutomationMetadata(readFileSync(scriptPath, "utf8"));
+      return {
+        name: rel,
+        kind: "repo-script" as const,
+        command,
+        cwd,
+        ...metadata,
+        safety: metadata.safety ?? classifyAutomationSafety(command, metadata),
+      };
+    });
   } catch {
     return [];
   }

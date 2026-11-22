@@ -13,6 +13,29 @@ export type TaskFileEvidence = {
 
 export type EvalTaskKind = "code_edit" | "debug" | "docs" | "meta_analysis" | "ops" | "unknown";
 
+export type ScoringParams = { relevanceWeight: number; recencyWeight: number; frequencyWeight: number };
+export type SimulationResult = {
+  evaluations: number;
+  improved: number;
+  worsened: number;
+  unchanged: number;
+  averageCurrent: number;
+  averageProposed: number;
+  averageDelta: number;
+  pValue: number;
+  apply: boolean;
+};
+
+export type OverlapReport = {
+  checked: number;
+  averageOverlap: number;
+  threshold: number;
+  regressions: Array<{ bundleId: string; focus: string; overlap: number; originalSources: string[]; replayedSources: string[] }>;
+  ok: boolean;
+};
+
+export const DEFAULT_SCORING_PARAMS: ScoringParams = { relevanceWeight: 0.6, recencyWeight: 0.2, frequencyWeight: 0.2 };
+
 export type PostTaskEvaluationInput = {
   bundle: ContextBundleRecord;
   outcome: TaskOutcome;
@@ -89,6 +112,157 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
 }
 
+function normalizeScoringParams(params: ScoringParams): ScoringParams {
+  const relevanceWeight = Math.max(0, params.relevanceWeight);
+  const recencyWeight = Math.max(0, params.recencyWeight);
+  const frequencyWeight = Math.max(0, params.frequencyWeight);
+  const total = relevanceWeight + recencyWeight + frequencyWeight || 1;
+  return { relevanceWeight: relevanceWeight / total, recencyWeight: recencyWeight / total, frequencyWeight: frequencyWeight / total };
+}
+
+function evaluationTimeMs(evaluation: ContextEvaluation): number {
+  const parsed = Date.parse(evaluation.evaluatedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function recentEvaluations(evaluations: ContextEvaluation[], limit: number): ContextEvaluation[] {
+  return [...evaluations]
+    .sort((a, b) => evaluationTimeMs(b) - evaluationTimeMs(a))
+    .slice(0, limit);
+}
+
+function scoreEvaluationWithParams(evaluation: ContextEvaluation, params: ScoringParams): number {
+  const p = normalizeScoringParams(params);
+  return clamp01(
+    (p.relevanceWeight * evaluation.scores.relevance)
+    + (p.recencyWeight * evaluation.scores.precision)
+    + (p.frequencyWeight * evaluation.scores.recall),
+  );
+}
+
+export function signTestPValue(improved: number, worsened: number): number {
+  const n = improved + worsened;
+  if (n === 0) return 1;
+  const wins = Math.max(improved, worsened);
+  let tail = 0;
+  for (let k = wins; k <= n; k++) {
+    let comb = 1;
+    for (let i = 1; i <= k; i++) comb = comb * (n - i + 1) / i;
+    tail += comb * Math.pow(0.5, n);
+  }
+  return Math.min(1, tail * 2);
+}
+
+function itemSource(item: { source?: string }): string {
+  return String(item.source ?? "").replace(/:\d+(?::\d+)?$/, "");
+}
+
+export function calculateSourceOverlap(original: Array<{ source?: string }>, replayed: Array<{ source?: string }>): number {
+  const originalSources = new Set(original.map(itemSource).filter(Boolean));
+  if (!originalSources.size) return replayed.length ? 0 : 1;
+  const replayedSources = new Set(replayed.map(itemSource).filter(Boolean));
+  let hits = 0;
+  for (const source of originalSources) if (replayedSources.has(source)) hits++;
+  return hits / originalSources.size;
+}
+
+export async function replayPastQueries(
+  evaluations: ContextEvaluation[],
+  state: { bundleRecords?: Map<string, ContextBundleRecord>; replayQuery?: (bundle: ContextBundleRecord, ctx: unknown) => Promise<{ items: ContextBundleRecord["items"] }> | { items: ContextBundleRecord["items"] }; config?: { selfVerification?: { overlapThreshold?: number } } },
+  ctx: unknown,
+): Promise<OverlapReport> {
+  const threshold = state.config?.selfVerification?.overlapThreshold ?? 0.7;
+  const regressions: OverlapReport["regressions"] = [];
+  let total = 0;
+  let checked = 0;
+  for (const evaluation of recentEvaluations(evaluations, 20)) {
+    const bundle = state.bundleRecords?.get(evaluation.bundleId);
+    if (!bundle) continue;
+    const replayed = state.replayQuery ? await state.replayQuery(bundle, ctx) : { items: bundle.items };
+    const overlap = calculateSourceOverlap(bundle.items, replayed.items ?? []);
+    checked++;
+    total += overlap;
+    if (overlap < threshold) {
+      regressions.push({
+        bundleId: bundle.bundleId,
+        focus: bundle.focus,
+        overlap,
+        originalSources: bundle.items.map(itemSource).filter(Boolean),
+        replayedSources: (replayed.items ?? []).map(itemSource).filter(Boolean),
+      });
+    }
+  }
+  return { checked, averageOverlap: total / (checked || 1), threshold, regressions, ok: regressions.length === 0 };
+}
+
+export async function checkRetrievalRegression(
+  ctx: { note?: (message: string) => void } | undefined,
+  state: { bundleRecords?: Map<string, ContextBundleRecord>; replayQuery?: (bundle: ContextBundleRecord, ctx: unknown) => Promise<{ items: ContextBundleRecord["items"] }> | { items: ContextBundleRecord["items"] }; config?: { selfVerification?: { enabled?: boolean; overlapThreshold?: number } } },
+  evaluations: ContextEvaluation[],
+): Promise<boolean> {
+  if (state.config?.selfVerification?.enabled === false) return true;
+  const report = await replayPastQueries(evaluations, state, ctx);
+  for (const regression of report.regressions) {
+    ctx?.note?.(`Sherpa retrieval overlap regression: ${regression.bundleId} overlap=${regression.overlap.toFixed(2)} below threshold=${report.threshold.toFixed(2)} focus=${regression.focus}`);
+  }
+  return report.ok;
+}
+
+export function simulateParameterChange(evaluations: ContextEvaluation[], currentParams: ScoringParams, proposedParams: ScoringParams): SimulationResult {
+  const window = recentEvaluations(evaluations, 50);
+  let improved = 0;
+  let worsened = 0;
+  let unchanged = 0;
+  let currentTotal = 0;
+  let proposedTotal = 0;
+  for (const evaluation of window) {
+    const current = scoreEvaluationWithParams(evaluation, currentParams);
+    const proposed = scoreEvaluationWithParams(evaluation, proposedParams);
+    currentTotal += current;
+    proposedTotal += proposed;
+    const delta = proposed - current;
+    if (delta > 0.0001) improved++;
+    else if (delta < -0.0001) worsened++;
+    else unchanged++;
+  }
+  const pValue = signTestPValue(improved, worsened);
+  const averageCurrent = currentTotal / (window.length || 1);
+  const averageProposed = proposedTotal / (window.length || 1);
+  return {
+    evaluations: window.length,
+    improved,
+    worsened,
+    unchanged,
+    averageCurrent,
+    averageProposed,
+    averageDelta: averageProposed - averageCurrent,
+    pValue,
+    apply: window.length >= 10 && improved > worsened && pValue < 0.05,
+  };
+}
+
+export function applyParameterChangeIfSignificant<TState extends { config: { scoring?: ScoringParams } }>(state: TState, ctx: { note?: (message: string) => void } | undefined, proposedParams: ScoringParams, evaluations: ContextEvaluation[]): SimulationResult {
+  const current = state.config.scoring ?? DEFAULT_SCORING_PARAMS;
+  const simulation = simulateParameterChange(evaluations, current, proposedParams);
+  if (simulation.apply) {
+    state.config.scoring = normalizeScoringParams(proposedParams);
+    ctx?.note?.(`Sherpa scoring coefficients updated after evidence-gated replay: Δ=${simulation.averageDelta.toFixed(3)}, p=${simulation.pValue.toFixed(4)}`);
+  }
+  return simulation;
+}
+
+export function proposeScoringParamsFromEvaluations(evaluations: ContextEvaluation[], current: ScoringParams = DEFAULT_SCORING_PARAMS): ScoringParams {
+  const recent = recentEvaluations(evaluations, 50);
+  if (!recent.length) return current;
+  const avg = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+  const relevance = avg(recent.map((e) => e.scores.relevance));
+  const precision = avg(recent.map((e) => e.scores.precision));
+  const recall = avg(recent.map((e) => e.scores.recall));
+  if (recall > Math.max(relevance, precision) + 0.1) return normalizeScoringParams({ ...current, frequencyWeight: current.frequencyWeight + 0.1, relevanceWeight: Math.max(0, current.relevanceWeight - 0.1) });
+  if (precision > Math.max(relevance, recall) + 0.1) return normalizeScoringParams({ ...current, recencyWeight: current.recencyWeight + 0.1, relevanceWeight: Math.max(0, current.relevanceWeight - 0.1) });
+  return normalizeScoringParams(current);
+}
+
 function isDocumentationFile(file: string): boolean {
   return /(^|\/)(readme|docs?|documentation|adr|adrs)(\/|\.|$)/i.test(file) || /\.(md|mdx|rst|adoc|txt)$/i.test(file);
 }
@@ -162,20 +336,106 @@ function evaluationImprovementHint(missed: string[], noise: string[], taskKind: 
     : "Penalize repeated generic documentation snippets and meta-review docs unless the query asks for them.";
 }
 
-function evaluationReflection(input: PostTaskEvaluationInput, taskKind: EvalTaskKind, usedFiles: string[], coveredFiles: string[], missed: string[], noise: string[]): string {
+function retrievalVerdict(scores: { relevance: number; precision: number; recall: number }): string {
+  if (scores.relevance >= 0.7 && scores.precision >= 0.6 && scores.recall >= 0.6) return "useful";
+  if (scores.relevance >= 0.35 || scores.precision >= 0.4 || scores.recall >= 0.4) return "partial";
+  return "miss";
+}
+
+function evaluationReflection(input: PostTaskEvaluationInput, taskKind: EvalTaskKind, usedFiles: string[], coveredFiles: string[], missed: string[], noise: string[], scores: { relevance: number; precision: number; recall: number }): string {
+  const verdict = retrievalVerdict(scores);
   return [
     `Automatic post-task evaluation for ${input.bundle.bundleId}.`,
     `Focus: ${input.bundle.focus}`,
     `Task kind: ${taskKind}.`,
     `Outcome: ${input.outcome}.`,
+    `Retrieval verdict: ${verdict} (relevance=${scores.relevance}, precision=${scores.precision}, recall=${scores.recall}).`,
     `Used files: ${usedFiles.length ? usedFiles.join(", ") : "none detected"}.`,
     `Covered files: ${coveredFiles.length ? coveredFiles.join(", ") : "none"}.`,
     missed.length ? `Missed files: ${missed.join(", ")}.` : "No missed files detected from tool/change evidence.",
     noise.length ? `Noise sources: ${uniq(noise).join(", ")}.` : "No obvious noisy sources detected.",
+    verdict === "miss" ? "Likely cause: selected context did not overlap the files or intent evidence seen during the task; improve routing, exact path matching, or source filtering." : "Likely cause: selected context overlapped enough task evidence to be useful; keep tuning noisy and missed sources from the lists above.",
   ].join("\n");
 }
 
+export type ReflectionUsefulness = "useful" | "partial" | "unused" | "harmful" | "not_needed";
+
+export type ReflectionModelParseResult = {
+  evalRecord: ContextEvaluation;
+  usefulness?: ReflectionUsefulness;
+  shouldPreserve?: boolean;
+  lesson?: string;
+};
+
+const REFLECTION_USEFULNESS = new Set<ReflectionUsefulness>(["useful", "partial", "unused", "harmful", "not_needed"]);
+const TASK_OUTCOMES = new Set<ContextEvaluation["taskOutcome"]>(["completed", "partial", "failed", "reverted", "blocked", "unknown"]);
+
+function stringArray(value: unknown, limit = 20): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniq(value.filter((item): item is string => typeof item === "string" && item.trim()).map((item) => item.trim())).slice(0, limit);
+}
+
+function numberScore(value: unknown, fallback: number): number {
+  return typeof value === "number" ? Number(clamp01(value).toFixed(2)) : fallback;
+}
+
+function usefulnessScores(usefulness: ReflectionUsefulness | undefined, base: ContextEvaluation["scores"]): ContextEvaluation["scores"] {
+  if (!usefulness) return base;
+  if (usefulness === "useful") return { relevance: Math.max(base.relevance, 0.75), precision: Math.max(base.precision, 0.7), recall: Math.max(base.recall, 0.7) };
+  if (usefulness === "partial") return { relevance: Math.max(base.relevance, 0.45), precision: Math.max(base.precision, 0.4), recall: Math.max(base.recall, 0.4) };
+  if (usefulness === "harmful") return { relevance: Math.min(base.relevance, 0.1), precision: Math.min(base.precision, 0.1), recall: Math.min(base.recall, 0.25) };
+  if (usefulness === "unused") return { relevance: Math.min(base.relevance, 0.25), precision: Math.min(base.precision, 0.1), recall: base.recall };
+  return { relevance: Math.min(base.relevance, 0.35), precision: Math.min(base.precision, 0.2), recall: base.recall };
+}
+
+export function applyReflectionModelOutput(base: ContextEvaluation, parsed: unknown): ReflectionModelParseResult {
+  if (!parsed || typeof parsed !== "object") return { evalRecord: base };
+  const obj = parsed as Record<string, unknown>;
+  const usefulness = REFLECTION_USEFULNESS.has(obj.sherpa_context_usefulness as ReflectionUsefulness)
+    ? obj.sherpa_context_usefulness as ReflectionUsefulness
+    : undefined;
+  const outcome = TASK_OUTCOMES.has(obj.outcome as ContextEvaluation["taskOutcome"])
+    ? obj.outcome as ContextEvaluation["taskOutcome"]
+    : base.taskOutcome;
+  const modelScores = typeof obj.scores === "object" && obj.scores ? obj.scores as Record<string, unknown> : {};
+  const usefulnessAdjusted = usefulnessScores(usefulness, base.scores);
+  const scores = {
+    relevance: numberScore(modelScores.relevance, usefulnessAdjusted.relevance),
+    precision: numberScore(modelScores.precision, usefulnessAdjusted.precision),
+    recall: numberScore(modelScores.recall, usefulnessAdjusted.recall),
+  };
+  const missed = stringArray(obj.missed_context ?? obj.missedContext, 20);
+  const noise = stringArray(obj.noisy_context ?? obj.noisyContext, 20);
+  const lesson = typeof obj.lesson === "string" ? obj.lesson.trim().slice(0, 600) : undefined;
+  const modelReason = typeof obj.reason === "string" ? obj.reason.trim().slice(0, 800) : undefined;
+  const improvementHint = typeof obj.improvement_hint === "string" ? obj.improvement_hint.trim().slice(0, 300) : base.improvementHint;
+  const reflectionLines = [
+    base.reflection,
+    "",
+    "## Sidecar task reflection",
+    usefulness ? `Sherpa context usefulness: ${usefulness}.` : undefined,
+    `Model outcome: ${outcome}.`,
+    modelReason ? `Reason: ${modelReason}` : undefined,
+    lesson ? `Lesson: ${lesson}` : undefined,
+  ].filter(Boolean) as string[];
+  return {
+    evalRecord: {
+      ...base,
+      taskOutcome: outcome,
+      scores,
+      missed: missed.length ? missed : base.missed,
+      noise: noise.length ? noise : base.noise,
+      reflection: reflectionLines.join("\n"),
+      improvementHint,
+    },
+    usefulness,
+    shouldPreserve: obj.should_preserve === true || obj.shouldPreserve === true,
+    lesson,
+  };
+}
+
 export function evaluatePostTaskContext(input: PostTaskEvaluationInput): ContextEvaluation {
+  const sourcePlanConfidence = input.bundle.sourcePlanConfidence;
   const usedFiles = evaluationUsedFiles(input);
   const items = input.bundle.items ?? [];
   const taskKind = classifyEvalTaskKind(input);
@@ -199,9 +459,10 @@ export function evaluatePostTaskContext(input: PostTaskEvaluationInput): Context
     },
     noise: uniq(noise).slice(0, 20),
     missed: missed.slice(0, 20),
-    reflection: evaluationReflection(input, taskKind, usedFiles, coveredFiles, missed, noise),
+    reflection: evaluationReflection(input, taskKind, usedFiles, coveredFiles, missed, noise, { relevance, precision, recall }),
     improvementHint: evaluationImprovementHint(missed, noise, taskKind),
     evaluatedAt: new Date().toISOString(),
+    plannerConfidence: sourcePlanConfidence,
   };
 }
 
@@ -221,14 +482,9 @@ function maxSignal(map: Map<string, number>, key: string, count: number): void {
 
 function addMissedPattern(signals: FeedbackSignals, pattern: string, count: number, mode: "increment" | "max"): void {
   const normalizedMiss = normalizedPathFragment(pattern);
-  if (normalizedMiss) {
-    const update = mode === "increment" ? incrementSignal : maxSignal;
-    update(signals.missedPaths, normalizedMiss, count);
-  }
-  for (const term of basenameTerms(pattern)) {
-    const update = mode === "increment" ? incrementSignal : maxSignal;
-    update(signals.missedTerms, term, count);
-  }
+  const update = mode === "increment" ? incrementSignal : maxSignal;
+  if (normalizedMiss) update(signals.missedPaths, normalizedMiss, count);
+  for (const term of basenameTerms(pattern)) update(signals.missedTerms, term, count);
 }
 
 function feedbackSignals(evals: ContextEvaluation[], quality?: SherpaQualitySummary): FeedbackSignals {
@@ -245,7 +501,7 @@ function feedbackSignals(evals: ContextEvaluation[], quality?: SherpaQualitySumm
 function missedSignalDelta(source: string, signals: FeedbackSignals): number {
   let delta = 0;
   for (const [missedPath, count] of signals.missedPaths) {
-    if (source.includes(missedPath)) delta += Math.min(0.5, 0.25 * count);
+    if (source.includes(missedPath)) delta += Math.min(0.6, 0.3 * count);
   }
   for (const [term, count] of signals.missedTerms) {
     if (source.includes(term)) delta += Math.min(0.35, 0.12 * count);
@@ -255,8 +511,8 @@ function missedSignalDelta(source: string, signals: FeedbackSignals): number {
 
 function candidateFeedbackDelta(candidate: { source: string }, signals: FeedbackSignals, focus?: string): number {
   const exactNoise = signals.noisy.get(candidate.source) ?? 0;
-  const noiseDelta = exactNoise ? -Math.min(0.6, 0.2 * exactNoise) : 0;
-  const genericDelta = isGenericNoiseSource(candidate.source) && !focusAllowsGenericSource(candidate.source, focus) ? -0.45 : 0;
+  const noiseDelta = exactNoise ? -Math.min(0.9, 0.25 * exactNoise) : 0;
+  const genericDelta = isGenericNoiseSource(candidate.source) && !focusAllowsGenericSource(candidate.source, focus) ? -0.55 : 0;
   return noiseDelta + genericDelta + missedSignalDelta(candidate.source.toLowerCase(), signals);
 }
 

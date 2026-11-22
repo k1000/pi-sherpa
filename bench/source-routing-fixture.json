@@ -1,0 +1,23 @@
+{
+  "version": "source-routing-shadow-v1",
+  "cases": [
+    { "id": "web-release", "prompt": "Search the internet for the latest TypeScript release.", "expected": "web", "required": ["web"] },
+    { "id": "web-weather", "prompt": "Browse online for today's weather forecast in Reykjavik.", "expected": "web", "required": ["web"] },
+    { "id": "web-paper", "prompt": "Look up the newest published research paper on solid-state batteries on the web.", "expected": "web", "required": ["web"] },
+    { "id": "web-url", "prompt": "Read and summarize this public article: https://example.org/guide.", "expected": "web", "required": ["web"] },
+    { "id": "code-symbol", "prompt": "Find the function that parses API responses in this repository.", "expected": "repo_code", "required": ["files", "semble"] },
+    { "id": "code-test", "prompt": "Fix the failing parser test in src/parser.test.ts.", "expected": "repo_code", "required": ["files", "semble"] },
+    { "id": "code-route", "prompt": "Where is the checkout API route implemented in our codebase?", "expected": "repo_code", "required": ["files", "semble"] },
+    { "id": "docs-readme", "prompt": "Read this repository's README for setup instructions.", "expected": "repo_docs", "required": ["docs"] },
+    { "id": "docs-contract", "prompt": "What do our local project docs say about the API contract?", "expected": "repo_docs", "required": ["docs"] },
+    { "id": "git-diff", "prompt": "Show me the unstaged git diff in this checkout.", "expected": "git", "required": ["git"] },
+    { "id": "git-commit", "prompt": "Which files changed in the last commit?", "expected": "git", "required": ["git"] },
+    { "id": "memory-obsidian", "prompt": "Find the deployment checklist in local Obsidian project memory.", "expected": "project_memory", "required": ["project_memory"] },
+    { "id": "memory-scratchpad", "prompt": "What did I save in the local scratchpad about migrations?", "expected": "project_memory", "required": ["project_memory"] },
+    { "id": "oracle-lesson", "prompt": "Find the saved deployment lesson in Inquirer on Oracle.", "expected": "inquirer", "required": ["inquirer"] },
+    { "id": "oracle-policy", "prompt": "Retrieve the stored compliance policy from the Oracle Inquirer knowledge database.", "expected": "inquirer", "required": ["inquirer"] },
+    { "id": "session-previous", "prompt": "What did we decide in our previous conversation?", "expected": "session", "required": ["session"] },
+    { "id": "mixed-web-code", "prompt": "Search the internet for current WebSocket guidance and compare it with our repository implementation.", "expected": "mixed", "required": ["web", "files", "semble"] },
+    { "id": "mixed-memories", "prompt": "Compare the local Obsidian rollout note with its stored Inquirer copy on Oracle.", "expected": "mixed", "required": ["project_memory", "inquirer"] }
+  ]
+}

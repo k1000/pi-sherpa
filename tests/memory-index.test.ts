@@ -98,6 +98,20 @@ test("reindex is idempotent", () => withTemp((dir) => {
   assertEqual(second.scratchpadEntries, first.scratchpadEntries, "scratchpad stable after reindex");
 }));
 
+test("reindex prunes stale scratchpad entries and indexes archives", () => withTemp((dir) => {
+  seedMemoryFiles(dir);
+  indexSherpaMemory(dir);
+  const observationPath = path.join(dir, ".pi-memory", "scratchpad", "sections", "observation.md");
+  writeFileSync(observationPath, ["# observation", "", "### Fresh", "", "Fresh compacted content"].join("\n"));
+  const archiveDir = path.join(dir, ".pi-memory", "scratchpad", "archive");
+  mkdirSync(archiveDir, { recursive: true });
+  writeFileSync(path.join(archiveDir, "2026-06-15-observation.md"), "Archived unique Sherpa FTS5 fallback detail");
+  const stats = indexSherpaMemory(dir);
+  assertEqual(stats.scratchpadEntries, 2, "only current section entries remain structured");
+  assert(!searchSherpaMemory(dir, "Project uses SQLite", 10).some((r) => r.sourcePath === observationPath), "stale current-section document was pruned");
+  assert(searchSherpaMemory(dir, "Archived unique Sherpa", 10).some((r) => r.kind === "scratchpad:archive"), "archive content remains searchable");
+}));
+
 for (const { name, fn } of tests) {
   try { fn(); passed++; console.log(`✅ ${name}`); }
   catch (error) { failed++; console.error(`❌ ${name}`); console.error(error); }

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs";
 import path from "node:path";
 import type { ContextEvaluation } from "./evaluation";
+import { proposeScoringParamsFromEvaluations, type ScoringParams } from "./post-task-evaluation";
 
 export type DspyTraceCandidate = {
   handle: string;
@@ -18,12 +19,19 @@ export type DspyTraceDecision = {
   reasons: string[];
 };
 
+export type DspyTraceStageLabels = {
+  processDecision: string;
+  dataSufficiency: string;
+  finalContext: string;
+};
+
 export type DspyTraceRecord = {
   version: 1;
   at: string;
   bundleId: string;
   focus: string;
   mode: string;
+  stageLabels?: DspyTraceStageLabels;
   sourcePlan: { sources: string[]; reason: string; confidence: number; planner: string };
   indicators: { indicators: string[]; reason: string; confidence: number; planner: string };
   candidateCount: number;
@@ -34,6 +42,7 @@ export type DspyTraceRecord = {
     abstainReason: string;
     confidence: number;
     planner: string;
+    plannerReason?: string;
     rejected: Array<{ index: number; reason: string; source: string }>;
   };
   decisions?: DspyTraceDecision[];
@@ -56,6 +65,11 @@ export type DspyTraceReport = {
   topRejected: Array<{ source: string; count: number }>;
   topSuppressed: Array<{ source: string; count: number }>;
   topReasons: Array<{ reason: string; count: number }>;
+  topSourcePlanReasons: Array<{ reason: string; count: number }>;
+  topCurationReasons: Array<{ reason: string; count: number }>;
+  topProcessDecisions: Array<{ reason: string; count: number }>;
+  topDataSufficiency: Array<{ reason: string; count: number }>;
+  topFinalContext: Array<{ reason: string; count: number }>;
 };
 
 export type DspyTrainingExample = {
@@ -141,8 +155,15 @@ export function readDspyTraces(cwd: string, limit = 2000): DspyTraceRecord[] {
 
 function topCounts(items: string[], limit = 8): Array<{ source: string; count: number }> {
   const counts = new Map<string, number>();
-  for (const item of items) counts.set(item, (counts.get(item) ?? 0) + 1);
+  for (const item of items) {
+    const key = item.trim();
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([source, count]) => ({ source, count }));
+}
+
+function reasonCounts(items: string[], limit = 8): Array<{ reason: string; count: number }> {
+  return topCounts(items, limit).map(({ source, count }) => ({ reason: source, count }));
 }
 
 export function summarizeDspyTraces(traces: DspyTraceRecord[]): DspyTraceReport {
@@ -152,7 +173,7 @@ export function summarizeDspyTraces(traces: DspyTraceRecord[]): DspyTraceReport 
   const rejected = decisions.filter((d) => d.decision === "rejected");
   const suppressed = decisions.filter((d) => d.decision === "suppressed");
   const boosted = decisions.filter((d) => d.decision === "boosted");
-  const reasonCounts = topCounts(decisions.flatMap((d) => d.reasons), 10).map(({ source, count }) => ({ reason: source, count }));
+  const decisionReasonCounts = reasonCounts(decisions.flatMap((d) => d.reasons), 10);
   return {
     traces: traces.length,
     averageCandidates: avg(traces.map((t) => t.candidateCount || t.candidates?.length || 0)),
@@ -162,7 +183,12 @@ export function summarizeDspyTraces(traces: DspyTraceRecord[]): DspyTraceReport 
     topSelected: topCounts([...selected, ...boosted].map((d) => d.source)),
     topRejected: topCounts(rejected.map((d) => d.source)),
     topSuppressed: topCounts(suppressed.map((d) => d.source)),
-    topReasons: reasonCounts,
+    topReasons: decisionReasonCounts,
+    topSourcePlanReasons: reasonCounts(traces.map((trace) => trace.sourcePlan?.reason ?? ""), 10),
+    topCurationReasons: reasonCounts(traces.map((trace) => trace.curate?.plannerReason || trace.curate?.abstainReason || ""), 10),
+    topProcessDecisions: reasonCounts(traces.map((trace) => trace.stageLabels?.processDecision ?? ""), 10),
+    topDataSufficiency: reasonCounts(traces.map((trace) => trace.stageLabels?.dataSufficiency ?? ""), 10),
+    topFinalContext: reasonCounts(traces.map((trace) => trace.stageLabels?.finalContext ?? ""), 10),
   };
 }
 
@@ -199,6 +225,10 @@ function exampleFromTrace(trace: DspyTraceRecord, evaluation?: ContextEvaluation
     reflection: evaluation?.reflection,
     improvementHint: evaluation?.improvementHint,
   };
+}
+
+export function proposeDspyScoringParams(evaluations: ContextEvaluation[], current: ScoringParams): ScoringParams {
+  return proposeScoringParamsFromEvaluations(evaluations, current);
 }
 
 export function exportDspyDataset(cwd: string, evaluations: ContextEvaluation[], options: { limit?: number; devRatio?: number } = {}): { trainPath: string; devPath: string; metaPath: string; train: number; dev: number; traces: number; matchedEvaluations: number; averageMetric: number; highScoringExamples: number; lowScoringExamples: number } {

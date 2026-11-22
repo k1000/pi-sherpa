@@ -14,6 +14,18 @@ export function isUnsafeBroadSearchRoot(searchPath: string): boolean {
 }
 
 /**
+ * A broad home root cannot be searched as-is (too slow, too noisy), but the Pi
+ * agent's own config/extension tree is bounded (~2.5k files, <0.1s) and is what
+ * users ask about when they work from the home directory. Scope home-root
+ * searches to that subtree instead of bailing out entirely.
+ */
+export function scopedBroadSearchRoot(searchPath: string): string {
+  if (path.resolve(searchPath) !== os.homedir()) return searchPath;
+  const piAgentRoot = path.join(os.homedir(), ".pi", "agent");
+  return existsSync(piAgentRoot) ? piAgentRoot : searchPath;
+}
+
+/**
  * Parse ripgrep `-n` output in `file:line:content` form.
  * Splits only on the first two colons so URLs, JSON, and other colon-rich
  * content remain intact.
@@ -34,12 +46,58 @@ export function parseRgOutput(output: string, limit = 30): RgMatch[] {
 
 export async function rg(cwd: string, query: string | string[], searchPath = cwd): Promise<string> {
   const queryText = Array.isArray(query) ? query.join(" ") : query;
-  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 6) ?? [];
-  if (!terms.length || isUnsafeBroadSearchRoot(searchPath)) return "";
+  const terms = queryText.match(/[A-Za-z0-9_./-]{4,}/g)?.slice(0, 12) ?? [];
+  const effectiveSearchPath = scopedBroadSearchRoot(searchPath);
+  if (!terms.length || isUnsafeBroadSearchRoot(effectiveSearchPath)) return "";
   const bundledRg = path.join(cwd, "bin", "rg");
   const rgBin = existsSync(bundledRg) ? bundledRg : "rg";
   try {
-    const { stdout } = await execFileAsync(rgBin, ["-n", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--glob", "!.next", "--glob", "!dist", terms.join("|"), searchPath], { timeout: 3000, maxBuffer: 500_000 });
+    const excludeGlobs = [
+      "!.git",
+      "!node_modules",
+      "!.next",
+      "!dist",
+      "!build",
+      "!coverage",
+      "!.pi-memory",
+      "!**/.pi-memory/**",
+      "!graphify-out",
+      "!**/graphify-out/**",
+      "!agent-disabled-extension-backups",
+      "!**/agent-disabled-extension-backups/**",
+      "!extensions-disabled",
+      "!**/extensions-disabled/**",
+      "!extensions.disabled",
+      "!**/extensions.disabled/**",
+      "!**/.pi/revolver/**",
+      // Loop run logs/specs and Sherpa's own caches are diagnostic artifacts,
+      // not project context; they match indicator terms and crowd top-12 slots.
+      "!**/.pi/loops/**",
+      "!**/.pi/sherpa/**",
+      "!.zcompdump*",
+      "!**/.zcompdump*",
+      "!.zsh_history",
+      "!**/.zsh_history",
+      "!.bun",
+      "!**/.bun/**",
+      "!.cdk/cache",
+      "!**/.cdk/cache/**",
+      "!Library/Caches",
+      "!**/Library/Caches/**",
+      "!.omp/logs",
+      "!**/.omp/logs/**",
+      "!*.bundle.js",
+      "!*.min.js",
+      "!*.bak",
+      "!*.bak-*",
+      "!*.backup",
+      "!*.db",
+      "!*.sqlite",
+    ];
+    // Deterministic output order: ripgrep parallelizes traversal, so without
+    // --sort the first-N match cap picks a different subset on every run.
+    const args = ["-n", "--hidden", "--sort", "path", ...excludeGlobs.flatMap((glob) => ["--glob", glob]), terms.join("|"), effectiveSearchPath];
+    const { stdout } = await execFileAsync(rgBin, args, { timeout: 3000, maxBuffer: 2_000_000 });
     return stdout;
   } catch (e: any) { return e.stdout ?? ""; }
 }

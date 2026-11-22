@@ -6,14 +6,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { evaluatePostTaskContext, applyEvaluationFeedbackToCandidates, classifyEvalTaskKind } from "../lib/post-task-evaluation";
-import { readQualitySummary, writeQualitySummary, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
+import { applyEvaluationFeedbackToCandidates, applyParameterChangeIfSignificant, applyReflectionModelOutput, calculateSourceOverlap, checkRetrievalRegression, classifyEvalTaskKind, DEFAULT_SCORING_PARAMS, evaluatePostTaskContext, replayPastQueries, signTestPValue, simulateParameterChange } from "../lib/post-task-evaluation";
+import { readQualitySummary, writeQualitySummary, summarizeEvaluations, type ContextBundleRecord, type ContextEvaluation } from "../lib/evaluation";
 
-const tests: Array<{ name: string; fn: () => void }> = [];
+const tests: Array<{ name: string; fn: () => void | Promise<void> }> = [];
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void) { tests.push({ name, fn }); }
+function test(name: string, fn: () => void | Promise<void>) { tests.push({ name, fn }); }
 function assert(condition: unknown, message: string) { if (!condition) throw new Error(message); }
 function withTemp(fn: (dir: string) => void) {
   const dir = mkdtempSync(path.join(os.tmpdir(), "sherpa-eval-"));
@@ -182,6 +182,37 @@ test("quality summary can be written and read back", () => withTemp((dir) => {
   assert(summary?.topMissed[0]?.pattern === "src/server/public/client.js", "expected top missed path");
 }));
 
+test("sidecar reflection output overrides usefulness, missed/noisy context, and lesson", () => {
+  const base: ContextEvaluation = {
+    bundleId: "bundle-test",
+    taskOutcome: "unknown",
+    scores: { relevance: 0.2, precision: 0.2, recall: 0.2 },
+    noise: [],
+    missed: [],
+    reflection: "base reflection",
+    improvementHint: "base hint",
+    evaluatedAt: new Date().toISOString(),
+  };
+  const result = applyReflectionModelOutput(base, {
+    outcome: "completed",
+    sherpa_context_usefulness: "useful",
+    missed_context: ["src/exact.ts"],
+    noisy_context: ["repo://README.md"],
+    lesson: "Exact source paths beat generic README context.",
+    should_preserve: true,
+    improvement_hint: "Boost exact source paths.",
+    reason: "Agent used the exact path after reflection.",
+  });
+  assert(result.evalRecord.taskOutcome === "completed", "expected outcome override");
+  assert(result.evalRecord.scores.relevance >= 0.75, "expected usefulness to boost relevance");
+  assert(result.evalRecord.missed.includes("src/exact.ts"), "expected missed context");
+  assert(result.evalRecord.noise.includes("repo://README.md"), "expected noisy context");
+  assert(result.evalRecord.reflection.includes("Sidecar task reflection"), "expected sidecar reflection section");
+  assert(result.shouldPreserve === true, "expected preserve flag");
+  assert(result.lesson === "Exact source paths beat generic README context.", "expected lesson");
+  assert(result.evalRecord.improvementHint === "Boost exact source paths.", "expected hint override");
+});
+
 test("feedback does not boost unrelated generic page.tsx candidates", () => {
   const evals: ContextEvaluation[] = [{
     bundleId: "bundle-test",
@@ -201,8 +232,124 @@ test("feedback does not boost unrelated generic page.tsx candidates", () => {
   assert(adjusted[1].relevance === 0.25, "unrelated page.tsx should not be boosted by generic basename");
 });
 
+test("summarizeEvaluations computes averageConfidenceError from planner confidence vs recall", () => {
+  const evals: ContextEvaluation[] = [
+    makeBaseEval({ bundleId: "b1", plannerConfidence: 0.9, scores: { relevance: 0.8, precision: 0.7, recall: 0.8 } }),
+    makeBaseEval({ bundleId: "b2", plannerConfidence: 0.6, scores: { relevance: 0.5, precision: 0.5, recall: 0.5 } }),
+    makeBaseEval({ bundleId: "b3", plannerConfidence: 0.3, scores: { relevance: 0.3, precision: 0.3, recall: 0.2 } }),
+  ];
+  // confidence errors: |0.9-0.8|=0.1, |0.6-0.5|=0.1, |0.3-0.2|=0.1 → avg 0.1
+  const summary = summarizeEvaluations(evals);
+  assert(Math.abs(summary.averageConfidenceError - 0.1) < 0.001,
+    `expected avg confidenceError 0.1, got ${summary.averageConfidenceError}`);
+  assert(typeof summary.averageConfidenceError === "number", "averageConfidenceError should be a number");
+});
+
+test("simulateParameterChange computes replay overlap and sign-test significance", () => {
+  const evals = Array.from({ length: 12 }, (_, index) => makeBaseEval({
+    bundleId: `better-${index}`,
+    scores: { relevance: 0.2, precision: 0.2, recall: 0.9 },
+  }));
+  const result = simulateParameterChange(evals, DEFAULT_SCORING_PARAMS, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 });
+  assert(result.improved === 12, `expected all improved, got ${result.improved}`);
+  assert(result.worsened === 0, `expected none worsened, got ${result.worsened}`);
+  assert(result.averageProposed > result.averageCurrent, "expected proposed params to improve replay score");
+  assert(result.pValue < 0.05, `expected significant p-value, got ${result.pValue}`);
+  assert(result.apply, "expected simulation to pass evidence gate");
+  assert(signTestPValue(12, 0) < 0.05, "expected sign test to be significant for 12 wins");
+});
+
+test("applyParameterChangeIfSignificant rejects too few or mixed evaluations", () => {
+  const state = { config: { scoring: { ...DEFAULT_SCORING_PARAMS } } };
+  const notes: string[] = [];
+  const few = Array.from({ length: 5 }, (_, index) => makeBaseEval({ bundleId: `few-${index}`, scores: { relevance: 0.2, precision: 0.2, recall: 0.9 } }));
+  const fewResult = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, few);
+  assert(!fewResult.apply, "too few evaluations should not apply");
+  assert(state.config.scoring.relevanceWeight === DEFAULT_SCORING_PARAMS.relevanceWeight, "params should remain unchanged for too few evals");
+
+  const mixed = Array.from({ length: 12 }, (_, index) => makeBaseEval({
+    bundleId: `mixed-${index}`,
+    scores: index % 2 === 0 ? { relevance: 0.2, precision: 0.2, recall: 0.9 } : { relevance: 0.9, precision: 0.2, recall: 0.2 },
+  }));
+  const mixedResult = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, mixed);
+  assert(!mixedResult.apply, "mixed evaluations should not apply");
+  assert(notes.length === 0, "rejected changes should not write observation notes");
+});
+
+test("applyParameterChangeIfSignificant applies and logs significant improvements", () => {
+  const state = { config: { scoring: { ...DEFAULT_SCORING_PARAMS } } };
+  const notes: string[] = [];
+  const evals = Array.from({ length: 12 }, (_, index) => makeBaseEval({ bundleId: `apply-${index}`, scores: { relevance: 0.2, precision: 0.2, recall: 0.9 } }));
+  const result = applyParameterChangeIfSignificant(state, { note: (message) => notes.push(message) }, { relevanceWeight: 0.2, recencyWeight: 0.1, frequencyWeight: 0.7 }, evals);
+  assert(result.apply, "significant improvement should apply");
+  assert(state.config.scoring.frequencyWeight > DEFAULT_SCORING_PARAMS.frequencyWeight, "frequency weight should increase");
+  assert(notes.some((message) => message.includes("evidence-gated replay")), "expected observation note");
+});
+
+test("source overlap calculation handles identical, partial, and empty overlap", () => {
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }, { source: "repo://b.ts" }], [{ source: "repo://a.ts" }, { source: "repo://b.ts" }]) === 1, "identical sources should fully overlap");
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }, { source: "repo://b.ts" }], [{ source: "repo://a.ts" }]) === 0.5, "half overlap should be 0.5");
+  assert(calculateSourceOverlap([{ source: "repo://a.ts" }], [{ source: "repo://c.ts" }]) === 0, "disjoint overlap should be 0");
+});
+
+test("self-verification flags overlap regression and logs warnings", async () => {
+  const original = bundle([
+    { handle: "ctx-1", type: "file", source: "repo://a.ts", summary: "A" },
+    { handle: "ctx-2", type: "file", source: "repo://b.ts", summary: "B" },
+  ]);
+  const evals = [makeBaseEval({ bundleId: original.bundleId })];
+  const state = {
+    config: { selfVerification: { enabled: true, overlapThreshold: 0.7 } },
+    bundleRecords: new Map([[original.bundleId, original]]),
+    replayQuery: () => ({ items: [{ handle: "ctx-new", type: "file", source: "repo://a.ts", summary: "A" }] }),
+  };
+  const report = await replayPastQueries(evals, state, {});
+  assert(report.checked === 1, "expected one replayed query");
+  assert(report.regressions.length === 1, "expected overlap regression");
+  assert(report.regressions[0]!.overlap === 0.5, `expected 0.5 overlap, got ${report.regressions[0]!.overlap}`);
+  const notes: string[] = [];
+  const ok = await checkRetrievalRegression({ note: (message) => notes.push(message) }, state, evals);
+  assert(!ok, "regression should fail self-verification");
+  assert(notes.some((message) => message.includes("overlap=0.50")), "expected scratchpad warning note");
+});
+
+test("self-verification passes when replayed retrieval overlaps original sources", async () => {
+  const original = bundle([{ handle: "ctx-1", type: "file", source: "repo://a.ts", summary: "A" }]);
+  const evals = [makeBaseEval({ bundleId: original.bundleId })];
+  const ok = await checkRetrievalRegression({ note: () => { throw new Error("should not log"); } }, {
+    config: { selfVerification: { enabled: true, overlapThreshold: 0.7 } },
+    bundleRecords: new Map([[original.bundleId, original]]),
+    replayQuery: () => ({ items: [{ handle: "ctx-1b", type: "file", source: "repo://a.ts:10", summary: "A" }] }),
+  }, evals);
+  assert(ok, "matching replay should pass self-verification");
+});
+
+test("summarizeEvaluations returns 0 confidenceError when no evals have plannerConfidence", () => {
+  const evals: ContextEvaluation[] = [
+    makeBaseEval({ bundleId: "b1" }),
+    makeBaseEval({ bundleId: "b2" }),
+  ];
+  const summary = summarizeEvaluations(evals);
+  assert(summary.averageConfidenceError === 0,
+    `expected 0 confidenceError, got ${summary.averageConfidenceError}`);
+});
+
+function makeBaseEval(overrides: Partial<ContextEvaluation> & { bundleId: string }): ContextEvaluation {
+  return {
+    bundleId: overrides.bundleId,
+    taskOutcome: overrides.taskOutcome ?? "unknown",
+    scores: overrides.scores ?? { relevance: 0.5, precision: 0.5, recall: 0.5 },
+    noise: overrides.noise ?? [],
+    missed: overrides.missed ?? [],
+    reflection: overrides.reflection ?? "",
+    improvementHint: overrides.improvementHint ?? "",
+    evaluatedAt: overrides.evaluatedAt ?? new Date().toISOString(),
+    plannerConfidence: overrides.plannerConfidence ?? undefined,
+  };
+}
+
 for (const { name, fn } of tests) {
-  try { fn(); passed++; console.log(`✅ ${name}`); }
+  try { await fn(); passed++; console.log(`✅ ${name}`); }
   catch (error) { failed++; console.error(`❌ ${name}`); console.error(error); }
 }
 

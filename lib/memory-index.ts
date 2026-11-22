@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { parseCsvRows } from "./catalog";
+import { fileIsMaterialized } from "./common";
 import { openSqliteDatabase, type SqliteDatabase } from "./sqlite";
 
 export type MemoryIndexConfig = {
@@ -18,6 +19,7 @@ export type MemoryIndexConfig = {
   catalogRoots?: string[];
   evaluationRoot?: string;
   nudgeDigestPath?: string;
+  reflectRoot?: string;
 };
 
 export type MemoryIndexStats = {
@@ -47,6 +49,7 @@ const SCRATCHPAD_SECTIONS = ["todo", "observation", "issue", "next", "distill_ca
 
 export class SherpaMemoryIndex {
   private db: SqliteDatabase;
+  private ftsAvailable = false;
   readonly dbPath: string;
 
   constructor(baseDir: string, config: MemoryIndexConfig = {}) {
@@ -68,16 +71,6 @@ export class SherpaMemoryIndex {
         summary TEXT,
         hash TEXT NOT NULL,
         updated_at TEXT NOT NULL
-      )
-    `);
-    this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-        id UNINDEXED,
-        kind,
-        source_path,
-        title,
-        summary,
-        body
       )
     `);
     this.db.exec(`
@@ -132,6 +125,21 @@ export class SherpaMemoryIndex {
         updated_at TEXT NOT NULL
       )
     `);
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+          id UNINDEXED,
+          kind,
+          source_path,
+          title,
+          summary,
+          body
+        )
+      `);
+      this.ftsAvailable = true;
+    } catch {
+      this.ftsAvailable = false;
+    }
   }
 
   close(): void { this.db.close(); }
@@ -143,6 +151,8 @@ export class SherpaMemoryIndex {
     const catalogRoots = config.catalogRoots?.length ? config.catalogRoots : [baseDir];
     for (const root of catalogRoots) this.indexCatalog(path.resolve(baseDir, root));
 
+    this.indexReflect(path.resolve(baseDir, config.reflectRoot ?? path.join(baseDir, ".pi", "reflect")));
+
     if (config.evaluationRoot) this.indexEvaluations(path.resolve(baseDir, config.evaluationRoot));
     if (config.nudgeDigestPath) this.indexDedupHashes(path.resolve(baseDir, config.nudgeDigestPath));
     else this.indexDedupHashes(path.join(scratchpadRoot, "nudge-digest.jsonl"));
@@ -153,24 +163,40 @@ export class SherpaMemoryIndex {
 
   indexScratchpad(scratchpadRoot: string): void {
     const sectionsDir = path.join(scratchpadRoot, "sections");
-    if (!existsSync(sectionsDir)) return;
-    for (const section of SCRATCHPAD_SECTIONS) {
-      const filePath = path.join(sectionsDir, `${section}.md`);
-      if (!existsSync(filePath)) continue;
-      const raw = readFileSync(filePath, "utf8");
-      const entries = splitScratchpadEntries(raw);
-      entries.forEach((entry, index) => {
-        const id = stableId("scratchpad", filePath, section, String(index), entry.body);
-        const hash = sha256(entry.body);
-        this.upsertScratchpadEntry({ id, section, sourcePath: filePath, ...entry, hash });
-        this.upsertDocument({ id, kind: `scratchpad:${section}`, sourcePath: filePath, title: entry.title || section, summary: summarize(entry.body), body: entry.body, hash });
-      });
+    if (existsSync(sectionsDir)) {
+      for (const section of SCRATCHPAD_SECTIONS) {
+        const filePath = path.join(sectionsDir, `${section}.md`);
+        if (!fileIsMaterialized(filePath)) continue;
+        this.clearSourcePath(filePath);
+        this.db.query("DELETE FROM scratchpad_entries WHERE source_path = ?").run(filePath);
+        const raw = readFileSync(filePath, "utf8");
+        const entries = splitScratchpadEntries(raw);
+        entries.forEach((entry, index) => {
+          const id = stableId("scratchpad", filePath, section, String(index), entry.body);
+          const hash = sha256(entry.body);
+          this.upsertScratchpadEntry({ id, section, sourcePath: filePath, ...entry, hash });
+          this.upsertDocument({ id, kind: `scratchpad:${section}`, sourcePath: filePath, title: entry.title || section, summary: summarize(entry.body), body: entry.body, hash });
+        });
+      }
+    }
+    const archiveDir = path.join(scratchpadRoot, "archive");
+    if (!existsSync(archiveDir)) return;
+    for (const file of readdirSync(archiveDir).filter((name) => name.endsWith(".md"))) {
+      const sourcePath = path.join(archiveDir, file);
+      if (!fileIsMaterialized(sourcePath)) continue;
+      this.clearSourcePath(sourcePath);
+      const raw = readFileSync(sourcePath, "utf8");
+      const id = stableId("scratchpad-archive", sourcePath, raw);
+      const hash = sha256(raw);
+      this.upsertDocument({ id, kind: "scratchpad:archive", sourcePath, title: `Scratchpad archive ${file}`, summary: summarize(raw), body: raw, hash });
     }
   }
 
   indexCatalog(root: string): void {
     const catalogPath = path.join(root, "catalog.csv");
-    if (!existsSync(catalogPath)) return;
+    if (!fileIsMaterialized(catalogPath)) return;
+    this.clearSourcePath(catalogPath);
+    this.db.query("DELETE FROM catalog_entries WHERE catalog_path = ?").run(catalogPath);
     const rows = parseCsvRows(readFileSync(catalogPath, "utf8"));
     rows.forEach((row, index) => {
       const body = [row.id, row.scope, row.project, row.area, row.category, row.type, row.title, row.summary, row.aliases, row.tags, row.routes, row.keywords, row.path].filter(Boolean).join("\n");
@@ -181,11 +207,42 @@ export class SherpaMemoryIndex {
     });
   }
 
+  indexReflect(reflectRoot: string): void {
+    const indexPath = path.join(reflectRoot, "index.jsonl");
+    if (!fileIsMaterialized(indexPath)) return;
+    this.clearSourcePath(indexPath);
+    const reflectionDir = path.join(reflectRoot, "reflections");
+    for (const line of readFileSync(indexPath, "utf8").split(/\r?\n/).filter(Boolean)) {
+      try {
+        const entry = JSON.parse(line) as { id?: string; type?: string; title?: string; summary?: string; body?: string; context?: string; evidence?: string; application?: string; verification?: string; importance?: string; tags?: string[]; file?: string; createdAt?: string; source?: string };
+        if (!entry.id) continue;
+        const mdPath = entry.file ? path.join(reflectionDir, entry.file) : "";
+        const embedded = [entry.body, entry.context, entry.evidence, entry.application, entry.verification].filter(Boolean).join("\n\n");
+        const body = embedded || (mdPath && fileIsMaterialized(mdPath) ? readFileSync(mdPath, "utf8") : [entry.title, entry.summary, entry.tags?.join(" ")].filter(Boolean).join("\n"));
+        const id = stableId("reflect", indexPath, entry.id, body);
+        const hash = sha256(body);
+        this.upsertDocument({
+          id,
+          kind: `reflect:${entry.type || "entry"}`,
+          sourcePath: indexPath,
+          title: entry.title || entry.id,
+          summary: entry.summary || summarize(body),
+          body: [entry.id, entry.type, entry.importance, entry.source, entry.tags?.join(" "), body].filter(Boolean).join("\n"),
+          hash,
+          scope: "project",
+        });
+      } catch { /* ignore malformed reflect entries */ }
+    }
+  }
+
   indexEvaluations(root: string): void {
     const dir = path.join(root, "wiki", "evidence", "sherpa-evaluations");
     if (!existsSync(dir)) return;
     for (const file of readdirSync(dir).filter((name) => name.endsWith(".md"))) {
       const sourcePath = path.join(dir, file);
+      if (!fileIsMaterialized(sourcePath)) continue;
+      this.clearSourcePath(sourcePath);
+      this.db.query("DELETE FROM evaluations WHERE source_path = ?").run(sourcePath);
       const raw = readFileSync(sourcePath, "utf8");
       const fm = parseFrontmatter(raw);
       const bundleId = fm.bundle_id || file.replace(/\.md$/, "");
@@ -198,7 +255,7 @@ export class SherpaMemoryIndex {
   }
 
   indexDedupHashes(digestPath: string): void {
-    if (!existsSync(digestPath)) return;
+    if (!fileIsMaterialized(digestPath)) return;
     const stmt = this.db.query("INSERT OR REPLACE INTO dedup_hashes (hash, kind, created_at) VALUES (?, ?, ?)");
     for (const line of readFileSync(digestPath, "utf8").split(/\r?\n/).filter(Boolean)) {
       try {
@@ -210,10 +267,10 @@ export class SherpaMemoryIndex {
 
   search(query: string, limit = 10): MemorySearchResult[] {
     const safe = sanitizeFtsQuery(query);
-    if (!safe) return [];
     const capped = Math.max(1, Math.min(100, Math.floor(limit)));
-    try {
-      return this.db.query(`
+    if (this.ftsAvailable && safe) {
+      try {
+        return this.db.query(`
         SELECT d.id, d.kind, d.source_path as sourcePath, d.title, COALESCE(d.summary, '') as summary,
                snippet(documents_fts, 5, '<b>', '</b>', '…', 40) as snippet,
                rank
@@ -222,19 +279,21 @@ export class SherpaMemoryIndex {
         WHERE documents_fts MATCH ?
         ORDER BY rank
         LIMIT ?
-      `).all(safe, capped) as MemorySearchResult[];
-    } catch {
-      const like = `%${query.replace(/[%_]/g, "\\$&")}%`;
-      return this.db.query(`
-        SELECT id, kind, source_path as sourcePath, title, COALESCE(summary, '') as summary,
-               summary as snippet,
-               0.0 as rank
-        FROM documents
-        WHERE title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\'
-        ORDER BY updated_at DESC
-        LIMIT ?
-      `).all(like, like, capped) as MemorySearchResult[];
+        `).all(safe, capped) as MemorySearchResult[];
+      } catch {
+        // Fall through to portable LIKE search below.
+      }
     }
+    const like = `%${query.replace(/[%_]/g, "\\$&")}%`;
+    return this.db.query(`
+      SELECT id, kind, source_path as sourcePath, title, COALESCE(summary, '') as summary,
+             summary as snippet,
+             0.0 as rank
+      FROM documents
+      WHERE title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR source_path LIKE ? ESCAPE '\\'
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(like, like, like, capped) as MemorySearchResult[];
   }
 
   stats(): MemoryIndexStats {
@@ -255,15 +314,26 @@ export class SherpaMemoryIndex {
     };
   }
 
+  private clearSourcePath(sourcePath: string): void {
+    const rows = this.db.query("SELECT id FROM documents WHERE source_path = ?").all(sourcePath) as Array<{ id: string }>;
+    this.db.query("DELETE FROM documents WHERE source_path = ?").run(sourcePath);
+    if (this.ftsAvailable) {
+      const stmt = this.db.query("DELETE FROM documents_fts WHERE id = ?");
+      for (const row of rows) stmt.run(row.id);
+    }
+  }
+
   private upsertDocument(input: { id: string; kind: string; sourcePath: string; title: string; summary: string; body: string; hash: string; scope?: string }): void {
     const updatedAt = fileUpdatedAt(input.sourcePath);
     this.db.query(`
       INSERT OR REPLACE INTO documents (id, source_path, kind, scope, title, summary, hash, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(input.id, input.sourcePath, input.kind, input.scope ?? null, input.title, input.summary, input.hash, updatedAt);
-    this.db.query("DELETE FROM documents_fts WHERE id = ?").run(input.id);
-    this.db.query("INSERT INTO documents_fts (id, kind, source_path, title, summary, body) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(input.id, input.kind, input.sourcePath, input.title, input.summary, input.body);
+    if (this.ftsAvailable) {
+      this.db.query("DELETE FROM documents_fts WHERE id = ?").run(input.id);
+      this.db.query("INSERT INTO documents_fts (id, kind, source_path, title, summary, body) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(input.id, input.kind, input.sourcePath, input.title, input.summary, input.body);
+    }
   }
 
   private upsertScratchpadEntry(input: { id: string; section: string; sourcePath: string; title: string; body: string; createdAt?: string; hash: string }): void {

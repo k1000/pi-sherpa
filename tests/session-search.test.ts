@@ -3,7 +3,7 @@
  * Run with: bun tests/session-search.test.ts
  */
 
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionSearchDb, closeSessionDb, indexSessionLog, searchSessions } from "../lib/session-search";
@@ -170,14 +170,78 @@ test("incremental indexing handles non-ASCII byte offsets", () => withTemp((dir)
   db.close();
 }));
 
+test("indexes large logs in bounded complete-line chunks", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const largePrompt = "x".repeat(1_200_000);
+  const first = JSON.stringify({ sessionId: "large", ts: "2026-06-01T10:00:00.000Z", kind: "prompt", prompt: largePrompt });
+  const second = JSON.stringify({ sessionId: "large", ts: "2026-06-01T10:00:01.000Z", kind: "response", response: largePrompt });
+  writeFileSync(logPath, `${first}\n${second}\n`);
+
+  const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 1, "first bounded chunk indexes one complete entry");
+  assertEqual(db.indexNewEntries(), 1, "second bounded chunk resumes at the stored offset");
+  assertEqual(db.getIndexedEntryCount(), 2, "both large entries are indexed");
+  db.close();
+}));
+
+test("skips oversized records across runs without losing following entries", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const oversized = JSON.stringify({ sessionId: "oversized", prompt: "x".repeat(5 * 1024 * 1024) });
+  const following = JSON.stringify({ sessionId: "following", prompt: "searchable recovery" });
+  writeFileSync(logPath, `${oversized}\n${following}\n`);
+
+  let db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "first chunk skips oversized record");
+  db.close();
+  db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "skip state persists after reopening");
+  assertEqual(db.indexNewEntries(), 1, "third chunk recovers at next complete record");
+  assertEqual(db.getIndexedEntryCount(), 1, "oversized fragments are not indexed");
+  assert(db.search("recovery").some((r) => r.sessionId === "following"), "following entry is searchable");
+  assertEqual(db.indexNewEntries(), 0, "completed file is not reindexed");
+  db.close();
+}));
+
+test("oversized unterminated records remain skipped when appended", () => withTemp((dir) => {
+  const logPath = path.join(dir, "session.jsonl");
+  const oversized = "x".repeat(3 * 1024 * 1024);
+  writeFileSync(logPath, oversized);
+  const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
+  assertEqual(db.indexNewEntries(), 0, "first oversized chunk skipped");
+  assertEqual(db.indexNewEntries(), 0, "unterminated remainder skipped");
+  writeFileSync(logPath, `${oversized}tail\n${JSON.stringify({ sessionId: "after", prompt: "after oversized" })}\n`);
+  assertEqual(db.indexNewEntries(), 1, "append resumes only after newline");
+  assertEqual(db.getIndexedEntryCount(), 1, "no oversized fragments indexed");
+  db.close();
+}));
+
 test("index resets when session log is truncated", () => withTemp((dir) => {
   const logPath = path.join(dir, "session.jsonl");
   writeFileSync(logPath, sampleSessionLog());
   const db = new SessionSearchDb(dir, { sessionLogPath: logPath });
   assertEqual(db.indexNewEntries(), 8, "initial entries indexed");
   writeFileSync(logPath, JSON.stringify({ sessionId: "new", ts: "2026-06-05T10:00:00.000Z", kind: "prompt", prompt: "after rotation" }) + "\n");
-  assertEqual(db.indexNewEntries(), 1, "truncated log reindexed from start");
-  assertEqual(db.getIndexedEntryCount(), 1, "old entries removed after truncation");
+  assertEqual(db.indexNewEntries(), 1, "truncated log reindexed new entry");
+  assertEqual(db.getIndexedEntryCount(), 9, "old entries preserved after truncation + 1 new");
+  db.close();
+}));
+
+test("directory cap skips current newest files and indexes older unindexed files", () => withTemp((dir) => {
+  const sessionsDir = path.join(dir, "sessions");
+  const dbDir = path.join(dir, "db");
+  const oldLog = path.join(sessionsDir, "old.jsonl");
+  const newLog = path.join(sessionsDir, "new.jsonl");
+  rmSync(sessionsDir, { recursive: true, force: true });
+  mkdirSync(sessionsDir, { recursive: true });
+  writeFileSync(oldLog, "", { flag: "a" });
+  writeFileSync(newLog, "", { flag: "a" });
+  writeFileSync(oldLog, JSON.stringify({ sessionId: "old", ts: "2026-06-01T00:00:00.000Z", kind: "prompt", prompt: "older backlog" }) + "\n");
+  writeFileSync(newLog, JSON.stringify({ sessionId: "new", ts: "2026-06-02T00:00:00.000Z", kind: "prompt", prompt: "newest current" }) + "\n");
+
+  const db = new SessionSearchDb(dbDir, { sessionLogPath: sessionsDir, maxFilesPerRun: 1 });
+  assertEqual(db.indexNewEntries(), 1, "first capped run indexes newest file");
+  assertEqual(db.indexNewEntries(), 1, "second capped run skips current newest and indexes older file");
+  assert(db.search("backlog").some((r) => r.sessionId === "old"), "older unindexed file is searchable");
   db.close();
 }));
 

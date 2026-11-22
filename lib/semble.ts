@@ -83,6 +83,17 @@ export function isUnsafeBroadSembleRoot(cwd: string): boolean {
   return resolved === path.parse(resolved).root || resolved === os.homedir();
 }
 
+/**
+ * Same home-root blind spot as rg: a broad home root is refused, so semantic
+ * search is silently disabled for home-cwd workspaces. Scope it to the bounded
+ * Pi agent tree instead.
+ */
+export function scopedBroadSembleRoot(cwd: string): string {
+  if (path.resolve(cwd) !== os.homedir()) return cwd;
+  const piAgentRoot = path.join(os.homedir(), ".pi", "agent");
+  return existsSync(piAgentRoot) ? piAgentRoot : cwd;
+}
+
 export async function searchSemble(
   cwd: string,
   query: string,
@@ -92,7 +103,8 @@ export async function searchSemble(
   const topK = String(Math.max(1, Math.min(20, Math.floor(config.topK || 8))));
   const timeout = Math.max(500, Math.min(15000, Math.floor(config.timeoutMs || 3000)));
   const head = await currentGitHead(cwd);
-  if (isUnsafeBroadSembleRoot(cwd)) {
+  const searchRoot = scopedBroadSembleRoot(cwd);
+  if (isUnsafeBroadSembleRoot(searchRoot)) {
     writeSembleState(cwd, {
       lastHead: head,
       lastCheckedAt: new Date().toISOString(),
@@ -104,10 +116,15 @@ export async function searchSemble(
   try {
     const { stdout } = await execFileAsync(
       config.command || "semble",
-      ["search", query, cwd, "--top-k", topK],
+      ["search", query, searchRoot, "--top-k", topK],
       { cwd, timeout, maxBuffer: 600_000 },
     );
-    const results = parseSembleSearchOutput(stdout);
+    const parsed = parseSembleSearchOutput(stdout);
+    // Semble returns paths relative to the search root; rewrite them relative to
+    // the real cwd so candidate sources resolve correctly when the root is scoped.
+    const results = searchRoot === cwd
+      ? parsed
+      : parsed.map((r) => ({ ...r, filePath: path.relative(cwd, path.join(searchRoot, r.filePath)) }));
     writeSembleState(cwd, { lastHead: head, lastCheckedAt: new Date().toISOString(), lastResultCount: results.length });
     return results;
   } catch (error) {

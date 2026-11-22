@@ -25,6 +25,14 @@ test("readExplicitSource skips binary files", () => withTemp((dir) => {
   assert.equal(readExplicitSource(binary), undefined);
 }));
 
+test("readExplicitSource reads only the rendered prefix of a large file", () => withTemp((dir) => {
+  const large = path.join(dir, "large.txt");
+  writeFileSync(large, "prefix\n" + "x".repeat(20_000));
+  const result = readExplicitSource(large);
+  assert.equal(result?.raw.length, 5000);
+  assert.ok(result?.raw.startsWith("prefix\n"));
+}));
+
 for (const { name, fn } of tests) {
   try { fn(); passed++; console.log(`✅ ${name}`); }
   catch (error) { failed++; console.error(`❌ ${name}`); console.error(error); }

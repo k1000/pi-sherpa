@@ -28,7 +28,9 @@ export function parseEvaluationArgs(
   lastBundleId: string | undefined,
   lookupBundle: (bundleId: string) => ContextBundleRecord | undefined,
 ) {
-  const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  // Copy the array so that shiftScore's internal .shift() only mutates
+  // our local copy, never the caller's argument.
+  const parts = [...((args ?? "").trim().split(/\s+/).filter(Boolean))];
   const bundleId = parts[0]?.startsWith("bundle-") ? parts.shift()! : lastBundleId;
   const bundle = bundleId ? lookupBundle(bundleId) : undefined;
   const taskOutcome = isEvaluationOutcome(parts[0]) ? parts.shift()! : "unknown";
@@ -60,6 +62,9 @@ export function formatEvaluationSummary(evals: ContextEvaluation[]): string {
   return [
     `Sherpa evaluations: ${evals.length}`,
     `avg relevance=${summary.averageRelevance.toFixed(2)} precision=${summary.averagePrecision.toFixed(2)} recall=${summary.averageRecall.toFixed(2)}`,
+    summary.averageConfidenceError > 0
+      ? `avg confidenceError=${summary.averageConfidenceError.toFixed(3)} (0 = perfectly calibrated)`
+      : "confidenceError: no planner confidence data yet",
     `top noise: ${summary.topNoise.map(n => `${n.source}×${n.count}`).join(", ") || "none"}`,
     `top missed: ${summary.topMissed.map(m => `${m.pattern}×${m.count}`).join(", ") || "none"}`,
     `top hints: ${summary.topHints.slice(0, 3).map(h => h.hint).join(" | ") || "none"}`,

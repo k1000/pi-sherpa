@@ -40,10 +40,15 @@ Archivist owns:
 - **Distillation** — `archivist_distill` (was `sherpa_distill`)
 - **Documentation drift** — `/archivist:docs:audit`
 - **Session-level memory** — `archivist:status`, `archivist:sync-reflect`
+- **Inquirer graph/vector memory** — Archivist writes durable Obsidian notes first, then ingests/mirrors them through the Inquirer Memory API. Sherpa must not connect to SurrealDB or the Inquirer backend directly; it retrieves Archivist-authored knowledge through Obsidian/catalog/index surfaces. If graph/vector recall is needed, enable/sync Archivist/Inquirer rather than adding a Sherpa `surreal_memory` source.
 
 ## Model configuration
 
-Sherpa uses a dedicated sidecar model unless `useMainPiModel` is explicitly enabled in `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`. This installation's global Sherpa config uses `minimax/MiniMax-M2.7-highspeed` so Sherpa stays aligned with Archivist while remaining separate from the main Pi model.
+Sherpa uses a dedicated sidecar model unless `useMainPiModel` is explicitly enabled in `.pi/sherpa.config.json` or `~/.pi/sherpa.config.json`. This installation's global Sherpa config uses `deepseek/deepseek-v4-flash` so Sherpa stays aligned with Archivist while remaining separate from the main Pi model.
+
+## Timing metrics
+
+When `debug.timing.enabled` is set, `/sherpa:timing` summarizes the most recent 200KB of sampled JSONL events by action (count, p50, p95, and max). The report is sampled: events below `debug.timing.thresholdMs` are intentionally not logged.
 
 ## Verification
 

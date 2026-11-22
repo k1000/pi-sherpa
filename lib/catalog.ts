@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync, statSync } from "node:fs";
+import { fileIsMaterialized } from "./common";
 import path from "node:path";
 
 export type CatalogRow = Record<string, string>;
@@ -36,7 +37,7 @@ export function parseCsvRows(raw: string): CatalogRow[] {
 }
 
 export function readCsvRows(target: string): CatalogRow[] {
-  if (!existsSync(target)) return [];
+  if (!fileIsMaterialized(target)) return [];
   return parseCsvRows(readFileSync(target, "utf8"));
 }
 
