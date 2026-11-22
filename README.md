@@ -55,12 +55,18 @@ When `debug.timing.enabled` is set, `/sherpa:timing` summarizes the most recent 
 Run the extension-local check script after prompt, memory, routing, automation, or lifecycle changes:
 
 ```bash
-/Users/kamil/.pi/agent/extensions/pi-sherpa/scripts/check-extension.ts
+bun run check
 ```
 
 This runs:
 
 - all tests under `tests/*.test.ts`
 - an esbuild bundle check for `index.ts`
+
+### Required sibling: archivist
+
+`lib/basic-candidate-sources.ts` and two tests import `../../archivist/lib/memory-api`, which is not declared in `package.json`. The check exits immediately with an explicit message when that checkout is absent. Place `archivist` next to this repo (`../archivist/lib/memory-api.ts`) or replace the import with a vendored client.
+
+Tests carry their own corpora in temp directories; they must not read a developer's real agent directory, because such a path makes them pass in exactly one place and assert nothing anywhere else.
 
 The check script is intentionally stored with the extension, not in project repositories that only exercise Sherpa during testing.

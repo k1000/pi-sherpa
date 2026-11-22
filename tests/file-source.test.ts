@@ -8,7 +8,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { parseRgOutput as parseRgOutputNew, rg } from "../lib/rg";
 
 const execFileAsync = promisify(execFile);
@@ -147,13 +148,35 @@ async function runTests() {
   }
 
   console.log("\n" + "=".repeat(60));
+  rmSync(TEST_CWD, { recursive: true, force: true });
   console.log(`Results: ${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-const TEST_CWD = "/Users/kamil/.pi/agent";
+// A fixed corpus, not a developer's real agent directory. The old value was
+// "/Users/kamil/.pi/agent", so these tests only ever passed on one machine and
+// silently asserted nothing anywhere else.
+function makeFixtureCorpus(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "sherpa-file-source-"));
+  mkdirSync(path.join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    path.join(root, "index.ts"),
+    'export const SHERPA_NAME = "Sherpa";\n// sherpa config provider model retrieval\n',
+  );
+  writeFileSync(
+    path.join(root, ".pi", "sherpa.config.json"),
+    JSON.stringify({ provider: "omlxa", model: "qwen", retrieval: true }, null, 2) + "\n",
+  );
+  writeFileSync(
+    path.join(root, "notes.md"),
+    "# Sherpa notes\nSherpa config provider model selection and retrieval routes.\n",
+  );
+  return root;
+}
+
+const TEST_CWD = makeFixtureCorpus();
 
 test("searchSources: finds Sherpa files", async () => {
   const results = await searchSources(TEST_CWD, "Sherpa", { files: true, docs: false, git: false, session: false });
@@ -172,7 +195,7 @@ test("searchSources: finds config files", async () => {
 });
 
 test("searchSources: git status in git repo", async () => {
-  // /Users/kamil/.pi/agent may not be a git repo, so git might return empty
+  // The fixture is not a git repo, so git search may legitimately return empty
   const results = await searchSources(TEST_CWD, "git status changes", { files: false, docs: false, git: true, session: false });
   // Git search either returns a result or empty - both are valid
   assert(results.length >= 0, "Should not error");
@@ -193,7 +216,7 @@ test("searchSources: all sources combined", async () => {
 });
 
 test("OLD parser vs NEW parser: JSON with provider field", async () => {
-  const rgOutput = `/Users/kamil/.pi/agent/.pi/sherpa.config.json:30:    "provider": "omlxa",`;
+  const rgOutput = `/repo/.pi/sherpa.config.json:30:    "provider": "omlxa",`;
   const oldResults = parseRgOutputOld(rgOutput);
   const newResults = parseRgOutputNew(rgOutput);
   
@@ -203,7 +226,7 @@ test("OLD parser vs NEW parser: JSON with provider field", async () => {
   
   // OLD parser gives wrong file:line for paths with dots
   // NEW parser is more robust
-  assert(newResults[0].fileAndLine === "/Users/kamil/.pi/agent/.pi/sherpa.config.json:30",
+  assert(newResults[0].fileAndLine === "/repo/.pi/sherpa.config.json:30",
          `NEW wrong: ${newResults[0].fileAndLine}`);
 });
 
