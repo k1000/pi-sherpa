@@ -6,10 +6,10 @@
 
 ## 1. What exists today (verified in source, not assumed)
 
-- `before_agent_start` (index.ts:2626) plans sources, builds a bundle within `frontDoor.tokenBudget` (default 1 200), filters already-seen items, and injects `bundleMarkdown`. Abstains via `shouldAbstain` when the best relevance is under 0.4 (front-door).
-- Router: `isTrivial` (index.ts:386) — prompt shorter than 24 chars and no code/error keywords → skip.
-- Relevance: `score()` (index.ts:394) is a substring hit ratio over focus words; `curateWithLlm` reorders/rejects on top of it; `confidence` is carried on every bundle.
-- Guard: `tool_result` (index.ts:2669) compresses `bash`/`run_experiment` output longer than `summarization.maxToolResultChars` (12 000 chars) into a handle via `llmSummarize` with `replacementBudget` (1 500); `/sherpa:expand <handle>` restores raw. `read` is deliberately exempt: "hiding source code makes review harder".
+- `before_agent_start` (index.ts:1749) plans sources, builds a bundle within `frontDoor.tokenBudget` (default 1 200), filters already-seen items, and injects `bundleMarkdown`. Abstains via `shouldAbstain` when the best relevance is under 0.4 (front-door).
+- Router: `isTrivial` (lib/text-utils.ts:5) — prompt shorter than 24 chars and no code/error keywords → skip.
+- Relevance: `score()` (lib/text-utils.ts:12) is a substring hit ratio over focus words; `curateWithLlm` reorders/rejects on top of it; `confidence` is carried on every bundle.
+- Guard: `tool_result` (index.ts:1810) compresses `bash`/`run_experiment` output longer than `summarization.maxToolResultChars` (12 000 chars) into a handle via `llmSummarize` with `replacementBudget` (1 500); `/sherpa:expand <handle>` restores raw. `read` is deliberately exempt: "hiding source code makes review harder".
 - Route map: `lib/route-map.ts` + `catalog.csv`, rows `{name, triggers, read, docs, skip, score}`.
 - Tools: `sherpa_request_context` (schema: focus, taskType, tokenBudget, sources, expandHandles, searchOtherProjects, includeTaxonomy), `sherpa_memory_search`, `sherpa_session_search`, `sherpa_scratchpad_read`, `sherpa_scratchpad_append`, `sherpa_run_automation`, `sherpa_nudge`.
 - Web: `lib/*` fetches Brave when `web.enabled` (default false), `maxResults` 5, `cacheTtlMs` 6 h.
@@ -24,7 +24,7 @@ Input-side paid tokens: 399 543 121 = 12 918 165 fresh + 386 624 956 cache read.
 - read — 386 results, amortized 69.5 M → **17.4 %**; median 1 399, p90 5 444, max 14 498
 - j01n — 786 results, 6.2 %; median 40
 - codemode — 175 results, 0.8 %; median 67; 12 of 98 sessions; `searchTools` used 0 times, `models.classify` 0 times
-- Sherpa injections: **0**, detected from the transcript record (`customType: "sherpa-context"`, the value at index.ts:436) rather than from text. The detector fires on the same corpus for `j01n` (995), `j01n-peer-spawn-budget` (2) and `codemode-store` (1), so this is a real zero: the extension was not active on the measured host and there is no evidence yet that it saves anything
+- Sherpa injections: **0**, detected from the transcript record (`customType: "sherpa-context"`, the value at index.ts:391) rather than from text. The detector fires on the same corpus for `j01n` (995), `j01n-peer-spawn-budget` (2) and `codemode-store` (1), so this is a real zero: the extension was not active on the measured host and there is no evidence yet that it saves anything
 
 Two conclusions the numbers force:
 
@@ -63,7 +63,7 @@ Register with exposure `codemode` and add `mode: "inject" | "bundle"`. `bundle` 
 Rationale for `codemode` over `deferred`: in 175 historical scripts `searchTools` was called zero times, so a tool the model cannot see is a tool it will not find.
 Acceptance: a codemode script calling `tools.sherpa_request_context({mode:"bundle"})` returns the structured bundle; with the tool absent the script fails with `isError` and a readable message.
 
-### P1-1 Rework the existing guard (index.ts:2669)
+### P1-1 Rework the existing guard (index.ts:1810)
 
 - replace `llmSummarize` with spill-to-file plus bounded head+tail (no model call), keeping the handle and `/sherpa:expand` contract
 - threshold in tokens (`chars / 3.5`, start 1 500) via `SHERPA_GUARD_TOKENS`, not chars
@@ -78,7 +78,7 @@ Acceptance: ≥ 85 % agreement with human labels on 100 cached pages; classifier
 
 ### P1-3 Classifier replaces `isTrivial`
 
-`isTrivial` (index.ts:386) skips only prompts under 24 chars. Replace with one classify question on the prompt: `needsContext` (bool) + `kind` (choice: code, docs, web, session, none). False → abstain, one-line block.
+`isTrivial` (lib/text-utils.ts:5) skips only prompts under 24 chars. Replace with one classify question on the prompt: `needsContext` (bool) + `kind` (choice: code, docs, web, session, none). False → abstain, one-line block.
 Acceptance: on 100 historical prompts, correct abstention ≥ 90 %, false abstention on context-needing prompts < 5 %.
 
 ### P1-4 Confidence everywhere
@@ -126,3 +126,23 @@ Acceptance: promote refuses a candidate without a metrics window and names the m
 1. Classifier provider: TypeSafe direct (`jev-latest`, tokens reported at no cost — best for a spike), OpenRouter (`typesafe/jev-1.14`, one key), Cloudflare Workers AI (`@cf/cloudflare/clef*`, needs an account token; ours is zone-scoped to byit.pl), or OpenAI (`gpt-6-luna`, API key, not a `/login` session).
 2. Guard threshold: is 1 500 tokens a starting value anyone may raise, or does it need approval per repo?
 3. `docs/` layout: this repo has none; PRD and baseline live in `docs/` unless they should go into `SHERPA_SYSTEM.md`.
+
+## 9. State after #3 (`main@aecb7f2`)
+
+Every line citation above was re-pinned to this commit. The refactor in #3 moved helpers out of `index.ts` (3 100 → 2 588 lines, 68 modules under `lib/`): `isTrivial` is `lib/text-utils.ts:5`, `score()` is `lib/text-utils.ts:12`, `SHERPA_CONTEXT_TYPE` is `index.ts:391`, `before_agent_start` is `index.ts:1749`, the `tool_result` guard is `index.ts:1810`.
+
+Delivered by #3, so no longer this PRD's work:
+
+- **Source planning.** `lib/source-planning.ts` returns a plan with `planner: heuristic | llm | override | fallback`, a confidence and the chosen sources (`files, git, docs, session, web, logs, project_memory, semble, graphify, inquirer`). An explicit, reasoned route decision now exists — for a retrieval call, not for the front door.
+- **Retrieval feedback and novelty.** `lib/retrieval-feedback.ts` re-ranks from recorded evaluations; session novelty suppresses what the session already saw. This is the mechanism P2-1 would otherwise have had to invent.
+- **Planner visibility.** The transcript UI prints `Planner: <x>; indicators: …`, a working precedent for P0-3's "log every skip with its reason".
+
+Still open, checked against the same commit:
+
+- **P0-2** — no `ctx.tools` or `ctx.modelRegistry` probe exists; the code assumes codemode where it matters.
+- **P0-3** — `routes.csv` (in repo, 11 lines) has `name,triggers,read,docs,skip`; `catalog.csv` is read from the project memory root (`index.ts:273`, `lib/memory-index.ts:196`). Neither carries an `action` column.
+- **P0-4** — `sherpa_request_context` (`index.ts:1840`) takes `focus, tokenBudget, sources, expandHandles`, with no `mode` and no `exposure`, so a codemode script cannot call it and cannot ask for structured refs.
+- **P1-2..P1-4** — `lib/query-classifier.ts` is five boolean predicates over the prompt (`isCodePrompt`, `isSourceLookupPrompt`, `isTraceLogMetricsPrompt`, `isPiSherpaMetaDebugPrompt`, `allowsRepeatedMetaDebugContext`). Routing is still heuristic: no probability, no classifier model, no stored regression set.
+
+In short: P0-1 (the reporter in this repo) and the retrieval half of P0-3 are done; the front door, the guard and the classifier are unchanged by #3.
+
