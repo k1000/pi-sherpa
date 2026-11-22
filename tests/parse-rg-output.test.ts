@@ -7,7 +7,18 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { parseRgOutput, rg, isUnsafeBroadSearchRoot } from "../lib/rg";
+
+// The corpus these tests search. It used to be the literal "/Users/kamil/.pi/agent",
+// so outside that one machine every rg assertion below ran against a missing
+// directory and the "finds Sherpa" cases failed while the "limits to 30 lines"
+// case passed vacuously on an empty result.
+const RG_FIXTURE = mkdtempSync(path.join(tmpdir(), "sherpa-rg-"));
+writeFileSync(path.join(RG_FIXTURE, "sherpa.md"), "Sherpa retrieval notes\n".repeat(3));
+writeFileSync(path.join(RG_FIXTURE, "filler.txt"), "the quick brown fox\n".repeat(60));
 
 const execFileAsync = promisify(execFile);
 
@@ -57,6 +68,7 @@ async function runTests() {
     }
 
     console.log("\n" + "=".repeat(60));
+    rmSync(RG_FIXTURE, { recursive: true, force: true });
     console.log(`Results: ${passed} passed, ${failed} failed`);
     process.exit(failed > 0 ? 1 : 0);
 }
@@ -147,12 +159,12 @@ test("gitChanged: returns empty in non-git dir", async () => {
 test("rg: detects unsafe broad search roots", async () => {
     assert(isUnsafeBroadSearchRoot("/"), "filesystem root should be unsafe");
     assert(isUnsafeBroadSearchRoot(process.env.HOME || "/Users/kamil"), "home directory should be unsafe");
-    assert(!isUnsafeBroadSearchRoot("/Users/kamil/.pi/agent"), "nested project directory should be safe");
+    assert(!isUnsafeBroadSearchRoot(path.join(process.env.HOME || "/home", ".pi", "agent")), "nested project directory should be safe");
 });
 
 // TEST 9: rg function returns results for known query
 test("rg: finds Sherpa-related files", async () => {
-    const output = await rg("/Users/kamil/.pi/agent", "Sherpa");
+    const output = await rg(RG_FIXTURE, "Sherpa");
     assert(output.length > 0, "Should find Sherpa in files");
     assert(output.includes("Sherpa"), "Output should contain 'Sherpa'");
     assert(/:\d+:/.test(output), "Output should contain file:line format");
@@ -166,7 +178,7 @@ test("rg: returns empty for no matches", async () => {
 
 // TEST 11: rg limits to 30 lines
 test("rg: limits results to 30 lines", async () => {
-    const output = await rg("/Users/kamil/.pi/agent", "the");
+    const output = await rg(RG_FIXTURE, "the");
     const lines = output.split("\n").filter(l => l.trim());
     assert(lines.length <= 30, `Expected <=30 lines, got ${lines.length}`);
 });
